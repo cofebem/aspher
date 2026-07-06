@@ -140,6 +140,3 @@ Figures land in `doc/convergence_study/repro/`, per-grid caches in
 
 ---
 
-*To render this report as a PDF:*
-`pandoc REPORT.md -o REPORT.pdf` *(add `--pdf-engine=xelatex` if your TeX chokes
-on the en-dashes in the prose).*
