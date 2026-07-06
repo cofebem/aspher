@@ -18,47 +18,82 @@ import numpy as np
 import matplotlib.pyplot as plt
 import hmatrix_contact as hc
 import rfgen as rf
+import time
 
 # ── 2. size ───────────────────────────────────────────────────────────────────
-Ns = 1024          # grid is Ns x Ns; must be a power of two for backend="h2"
+Nmax = 4096 
+sampling = 1
+Ns = Nmax // sampling  # grid is Ns x Ns; must be a power of two for backend="h2"
 L = 1.0           # domain side length
-p_bar = 0.05      # applied (nominal) mean pressure, in units of E*
+p_bar = 0.002      # applied (nominal) mean pressure, in units of E*
 
-
-
-x = np.linspace(0,1,Ns)
-y = np.linspace(0,1,Ns)
-X,Y = np.meshgrid(x,y)
-
-surface = -((X-0.5)**2 + (Y-0.5)**2)
+rng = np.random.default_rng(seed=42)  # for reproducibility
 roughness = rf.selfaffine_field(
     dim=2,           # Dimension (1, 2, or 3)
-    N=Ns,           # Grid size per dimension
+    N=Nmax,           # Grid size per dimension
     Hurst=0.8,       # Hurst exponent ∈ [0, 1]
-    k_low=12/Ns,      # Lower wavenumber cutoff
-    k_high=128/Ns,      # Upper wavenumber cutoff (≤ 0.5 Nyquist)
+    k_low=12/Nmax,      # Lower wavenumber cutoff
+    k_high=500/Nmax,      # Upper wavenumber cutoff (≤ 0.5 Nyquist)
     plateau=False,   # Flat spectrum for k < k_low
     noise=True,      # True: filtered noise, False: ideal spectrum
-    rng=None,        # numpy.random.Generator for reproducibility
+    rng=rng,        # numpy.random.Generator for reproducibility
     verbose=False    # Print parameters
 )
-rms = 0.01
+rms = 0.002
 roughness *= rms / np.std(roughness)
 
-surface += roughness
+# Build the surface memory-leanly: a single Ns x Ns array via broadcasting
+# (no full meshgrid), in float32, and free the roughness field once folded in.
+# At Ns=16384 the meshgrid alone would be ~4 GiB; broadcasting avoids it.
+import gc
+xr = (np.linspace(0, 1, Ns, dtype=np.float32) - 0.5)
+surface = -(xr[None, :]**2 + xr[:, None]**2)          # paraboloid, one Ns x Ns
+surface += roughness[::sampling, ::sampling].astype(np.float32)
 surface -= np.max(surface)
-p_bar = 0.02
-N_load_steps = 3
+del roughness, xr
+gc.collect()
+# return the surface-generation temporaries to the OS before the (large) solve,
+# so their transient peak does not stack on top of the solver's footprint.
+try:
+    import ctypes
+    ctypes.CDLL("libc.so.6").malloc_trim(0)
+except Exception:
+    pass
+
+N_load_steps = 2
 plot_every = 1
 
 pressures = np.linspace(0,p_bar,N_load_steps,endpoint=True)
 # ── 4. apply pressure: solve the contact problem ──────────────────────────────
 # A rigid flat is pressed onto the rough surface, so the initial gap is -height.
-solver = hc.ContactSolver(grid_size=Ns, domain_size=L, E_star=1.0,
-                          backend="h2", q=6)
-for inc,p in enumerate(pressures[1:]):
-    res = solver.solve(gap=-surface, p_nominal=p, tol=1e-8, max_iter=5000)
+# (This solver object is only needed for the commented single-grid solve below;
+#  skip building it at Ns=16384 where it would waste ~14 GiB unused.)
+if Ns != 16384:
+    solver = hc.ContactSolver(grid_size=Ns, domain_size=L, E_star=1.0,
+                              backend="h2", q=6)
 
+# result = hc.solve_nested(grid_size=1024, gap=g0, p_nominal=0.05, coarsest=64, q=6)
+for inc,p in enumerate(pressures[1:]):
+    print("Pressure = ", p)
+    start = time.time()
+    # res = solver.solve(gap=-surface, p_nominal=p, tol=1e-8, max_iter=5000)
+    if Ns == 16384:
+        # memory-lean settings for the largest grid (~2.7e8 DOFs):
+        #  - single_precision: run the matvec + PCG in float (~half the RAM)
+        #  - light_result: skip the displacement/gap result arrays (2 x Ns^2)
+        #  - larger leaves (leaf_side=16), q=4
+        # The |q| preconditioner stays ON: single precision needs it to
+        # converge (the float solve stalls without it). It runs in float too,
+        # so its FFT stays memory-lean. The solve reaches a ~2e-6 float floor —
+        # plenty for the contact area.
+        res = hc.solve_nested(grid_size=Ns, gap=-surface, p_nominal=p,
+                              coarsest=64, q=4, leaf_side=16, precond=True,
+                              single_precision=True, light_result=True)
+    else:
+        res = hc.solve_nested(grid_size=Ns, gap=-surface, p_nominal=p,
+                              coarsest=64, q=6)
+    print("CPU time = ", time.time() - start," seconds")
+    
     # ── 5. contact area + plot ────────────────────────────────────────────────────
     if inc % plot_every == 0 or inc == pressures.shape[0]-2:
         pressure = np.asarray(res.pressure)          # (Ns, Ns)
@@ -85,6 +120,6 @@ for inc,p in enumerate(pressures[1:]):
         for a in ax:
             a.set_xticks([]); a.set_yticks([])
         fig.tight_layout()
-        out = os.path.join(os.path.dirname(__file__), f"Rough_contact_{inc}.png")
+        out = os.path.join(os.path.dirname(__file__), f"Rough_contact_nested_{inc}_Ns_{Ns}_Nmax_{Nmax}_p0_{p}.png")
         fig.savefig(out, dpi=600)
         print(f"saved figure -> {out}")
