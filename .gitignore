@@ -24,3 +24,11 @@ data/tamaas_n*/
 
 # convergence-study result cache (binary pickles, regenerable)
 doc/convergence_study/repro/cache/
+
+# curved (rough-Hertz) convergence study: keep SVG maps + caches local only
+doc/convergence_study/curved_converge/cache/
+doc/convergence_study/curved_converge/svg/
+doc/convergence_study/curved_converge/*.svg
+# parameter-exploration output dirs (local scratch)
+doc/convergence_study/curved/
+doc/convergence_study/curved_rms2e-4/
