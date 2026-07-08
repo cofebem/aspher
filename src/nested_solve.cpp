@@ -18,6 +18,7 @@ namespace hmc {
 static Eigen::VectorXd restrict_field(const Eigen::VectorXd& f, int Ns) {
     const int c = Ns / 2;
     Eigen::VectorXd out(c * c);
+#pragma omp parallel for schedule(static)
     for (int iy = 0; iy < c; ++iy)
         for (int ix = 0; ix < c; ++ix) {
             const int x0 = 2 * ix, y0 = 2 * iy;
@@ -31,6 +32,7 @@ static Eigen::VectorXd restrict_field(const Eigen::VectorXd& f, int Ns) {
 static Eigen::VectorXd prolong_field(const Eigen::VectorXd& pc, int Nc) {
     const int f = 2 * Nc;
     Eigen::VectorXd out(f * f);
+#pragma omp parallel for schedule(static)
     for (int iy = 0; iy < Nc; ++iy)
         for (int ix = 0; ix < Nc; ++ix) {
             const double v = pc(iy * Nc + ix);
@@ -81,15 +83,17 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         BoussinesqKernel kernel(n, L, E_star);
         H2Operator op(kernel, H2Params{np.leaf_side, np.q, 1});
         op.build();
-        auto mv = [&op](const Eigen::VectorXd& v) { return op.matvec(v); };
+        MatVecIntoT<double> mv = [&op](const Eigen::VectorXd& v,
+                                       Eigen::VectorXd& out) {
+            op.matvec_into(v, out);
+        };
 
         FourierPreconditioner fp(n);
-        Precond pc;
+        PrecondIntoT<double> pc;
         if (np.precond)
             pc = [&fp](const Eigen::VectorXd& g,
-                       const std::vector<std::uint8_t>& contact) {
-                return fp.apply(g, contact);
-            };
+                       const std::vector<std::uint8_t>& contact,
+                       Eigen::VectorXd& z) { fp.apply_into(g, contact, z); };
 
         const bool finest = (li + 1 == levels.size());
         double lvl_tol = finest ? tol : np.coarse_tol;
@@ -102,14 +106,16 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
 
         if (np.single_precision) {
             op.build_single_caches();
-            auto mvf = [&op](const Eigen::VectorXf& v) {
-                return op.matvec_single(v);
+            MatVecIntoT<float> mvf = [&op](const Eigen::VectorXf& v,
+                                           Eigen::VectorXf& out) {
+                op.matvec_single_into(v, out);
             };
-            PrecondT<float> pcf;
+            PrecondIntoT<float> pcf;
             if (np.precond)
                 pcf = [&fp](const Eigen::VectorXf& g,
-                            const std::vector<std::uint8_t>& contact) {
-                    return fp.apply_single(g, contact);
+                            const std::vector<std::uint8_t>& contact,
+                            Eigen::VectorXf& z) {
+                    fp.apply_single_into(g, contact, z);
                 };
             Eigen::VectorXf g0f = gap[li].cast<float>();
             gap[li].resize(0); // free the double gap once cast to float
@@ -119,8 +125,9 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                 mvf, g0f, static_cast<float>(p_bar), static_cast<float>(lvl_tol),
                 max_iter, use_pr, pcf, have_init ? &p0f : nullptr, light);
         } else {
-            res = solve_contact(mv, gap[li], p_bar, lvl_tol, max_iter, use_pr, pc,
-                                have_init ? &p_init : nullptr, light);
+            res = solve_contact_impl<double>(
+                mv, gap[li], p_bar, lvl_tol, max_iter, use_pr, pc,
+                have_init ? &p_init : nullptr, light);
             gap[li].resize(0);
         }
 

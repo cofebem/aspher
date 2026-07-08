@@ -59,12 +59,14 @@ int main() {
 
     // single-precision path (solve_contact_impl<float>): same solution to ~float
     // accuracy at a reachable tolerance.
-    hmc::MatVecT<float> opf = [&S](const Eigen::VectorXf& v) -> Eigen::VectorXf {
-        return (S * v.cast<double>()).cast<float>();
+    hmc::MatVecIntoT<float> opf = [&S](const Eigen::VectorXf& v,
+                                       Eigen::VectorXf& out) {
+        out = (S * v.cast<double>()).cast<float>();
     };
     Eigen::VectorXf g0f = g0.cast<float>();
     auto r3 = hmc::solve_contact_impl<float>(opf, g0f, float(p_bar), 5e-6f, 5000,
-                                             true, hmc::PrecondT<float>{}, nullptr);
+                                             true, hmc::PrecondIntoT<float>{},
+                                             nullptr);
     CHECK(r3.converged);
     const double relpf = (r3.pressure - r0.pressure).norm() / r0.pressure.norm();
     std::printf("single precision: %d it, relp vs double %.2e\n",

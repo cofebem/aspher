@@ -63,8 +63,8 @@ void H2Operator::build() {
         R_[c] = std::move(R);
     }
 
-    // ── Far interactions + coupling cache ──
-    far_by_target_.assign(nbox, {});
+    // ── Far interactions + coupling cache (CSR by target box) ──
+    far_off_.assign(nbox + 1, 0);
     std::unordered_map<std::int64_t, int> coupling_ids;
     for (int t = 0; t < nbox; ++t) {
         for (int s : tree_.interaction_list(t, p_.near_radius)) {
@@ -97,15 +97,16 @@ void H2Operator::build() {
             } else {
                 cid = it->second;
             }
-            far_by_target_[t].push_back({s, cid});
+            far_.push_back({s, cid});
             ++info_.n_far_interactions;
         }
+        far_off_[t + 1] = static_cast<std::int64_t>(far_.size());
     }
 
-    // ── Leaves + near interactions + near stencil cache ──
+    // ── Leaves + near interactions + near stencil cache (CSR by leaf) ──
     for (int b = 0; b < nbox; ++b)
         if (boxes[b].leaf) leaves_.push_back(b);
-    near_by_leaf_.assign(leaves_.size(), {});
+    near_off_.assign(leaves_.size() + 1, 0);
     std::unordered_map<std::int64_t, int> near_ids;
     for (int li = 0; li < static_cast<int>(leaves_.size()); ++li) {
         const int t = leaves_[li];
@@ -132,9 +133,10 @@ void H2Operator::build() {
             } else {
                 sid = it->second;
             }
-            near_by_leaf_[li].push_back({s, sid});
+            near_.push_back({s, sid});
             ++info_.n_near_interactions;
         }
+        near_off_[li + 1] = static_cast<std::int64_t>(near_.size());
     }
 
     // ── Statistics ──
@@ -155,7 +157,13 @@ void H2Operator::build() {
 }
 
 Eigen::VectorXd H2Operator::matvec(const Eigen::VectorXd& x) const {
-    return matvec_impl<double>(x, Wleaf_, R_, couplings_, near_stencils_);
+    Eigen::VectorXd y;
+    matvec_into(x, y);
+    return y;
+}
+
+void H2Operator::matvec_into(const Eigen::VectorXd& x, Eigen::VectorXd& y) const {
+    matvec_impl<double>(x, y, Wleaf_, R_, couplings_, near_stencils_, Mbuf_, Lbuf_);
 }
 
 void H2Operator::build_single_caches() const {
@@ -172,8 +180,16 @@ void H2Operator::build_single_caches() const {
 }
 
 Eigen::VectorXf H2Operator::matvec_single(const Eigen::VectorXf& x) const {
+    Eigen::VectorXf y;
+    matvec_single_into(x, y);
+    return y;
+}
+
+void H2Operator::matvec_single_into(const Eigen::VectorXf& x,
+                                    Eigen::VectorXf& y) const {
     build_single_caches();
-    return matvec_impl<float>(x, Wleaf_f_, R_f_, couplings_f_, near_stencils_f_);
+    matvec_impl<float>(x, y, Wleaf_f_, R_f_, couplings_f_, near_stencils_f_,
+                       Mbuf_f_, Lbuf_f_);
 }
 
 void H2Operator::print_statistics() const {

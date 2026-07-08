@@ -26,6 +26,16 @@ template <class Real>
 using PrecondT = std::function<VecT<Real>(const VecT<Real>& g,
                                           const std::vector<std::uint8_t>& contact)>;
 
+// Allocation-free variants used by the CG loop itself: the operator and the
+// preconditioner write into caller-owned buffers, so no N-sized temporary is
+// allocated per iteration (2 operator applies + 1 preconditioner apply).
+template <class Real>
+using MatVecIntoT = std::function<void(const VecT<Real>&, VecT<Real>&)>;
+template <class Real>
+using PrecondIntoT = std::function<void(const VecT<Real>& g,
+                                        const std::vector<std::uint8_t>& contact,
+                                        VecT<Real>& z)>;
+
 using MatVec = MatVecT<double>;
 
 // Optional preconditioner: z = M^-1 g, given the gradient g and the contact
@@ -44,10 +54,12 @@ using Precond = PrecondT<double>;
 // always returned in double regardless of the working precision.
 // light=true skips storing the displacement and gap fields (saves two N-sized
 // double arrays in the result); pressure and all scalars are still filled.
+// Takes the allocation-free (into-style) functors; solve_contact adapts the
+// by-value ones.
 template <class Real>
-ContactResult solve_contact_impl(const MatVecT<Real>& S, const VecT<Real>& g0,
+ContactResult solve_contact_impl(const MatVecIntoT<Real>& S, const VecT<Real>& g0,
                                  Real p_bar, Real tol, int max_iter, bool use_pr,
-                                 const PrecondT<Real>& precond,
+                                 const PrecondIntoT<Real>& precond,
                                  const VecT<Real>* p_init, bool light = false);
 
 ContactResult solve_contact(const MatVec& S, const Eigen::VectorXd& g0,
