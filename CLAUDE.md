@@ -322,8 +322,8 @@ Fix: use plain `\begin{enumerate}` and `\begin{itemize}` without optional argume
 | f32 solve Ns=4096 (precond, light, 2026-07) | 16.3 s, 26 it, peak RSS 1.73 GiB (incl. Python surface) |
 | FFT matvec vs dense (rel L2, double/float) | ~1×10⁻¹⁵ / ~1.4×10⁻⁷ (exact operator; test_fft) |
 | FFT matvec time Ns=1024/2048/4096 (vs H2 q=6; bench_fft.py) | 17/73/337 ms vs 27/110/331 ms → 1.60×/1.50×/0.98× (measured under desktop co-tenancy; ratios more reliable than absolutes) |
-| Nested solve Ns=4096 fft vs h2, double (p̄=0.002, seed 42) | 251 s/110 it vs 177 s/91 it, areas 0.005402 vs 0.005403 (different but both-valid PCG paths, agree to ~10⁻⁶ absolute; wall gap mostly the extra iterations at ~parity matvec) |
-| Nested solve Ns=4096 fft vs h2, float (same case) | 62 s/53 it vs 51 s/52 it, area 0.005406 both |
+| Nested solve Ns=4096 fft vs h2, double (p̄=0.002, seed 42) | 251 s/110 it vs 177 s/91 it, areas 0.005402 vs 0.005403 (different but both-valid PCG paths, agree to ~10⁻⁶ absolute; wall gap from BOTH the extra iterations at ~parity matvec AND load asymmetry — desktop co-tenancy, fft solves ran under heavier load; ratios indicative only) |
+| Nested solve Ns=4096 fft vs h2, float (same case) | 62 s/53 it vs 51 s/52 it, area 0.005406 both (desktop co-tenancy, fft runs under heavier load; ratios indicative only) |
 
 ---
 
