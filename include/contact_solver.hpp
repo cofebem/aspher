@@ -18,6 +18,8 @@ struct ContactResult {
     bool converged = false;
     double contact_fraction = 0.0;
     double mean_pressure = 0.0;
+    std::vector<double> error_history; // per-iteration complementarity error;
+                                        // empty unless record_history requested
 };
 
 template <class Real> using VecT = Eigen::Matrix<Real, Eigen::Dynamic, 1>;
@@ -60,13 +62,14 @@ template <class Real>
 ContactResult solve_contact_impl(const MatVecIntoT<Real>& S, const VecT<Real>& g0,
                                  Real p_bar, Real tol, int max_iter, bool use_pr,
                                  const PrecondIntoT<Real>& precond,
-                                 const VecT<Real>* p_init, bool light = false);
+                                 const VecT<Real>* p_init, bool light = false,
+                                 bool record_history = false);
 
 ContactResult solve_contact(const MatVec& S, const Eigen::VectorXd& g0,
                             double p_bar, double tol = 1e-8,
                             int max_iter = 5000, bool use_pr = true,
                             const Precond& precond = {},
                             const Eigen::VectorXd* p_init = nullptr,
-                            bool light = false);
+                            bool light = false, bool record_history = false);
 
 } // namespace hmc

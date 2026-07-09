@@ -9,7 +9,8 @@ template <class Real>
 ContactResult solve_contact_impl(const MatVecIntoT<Real>& S, const VecT<Real>& g0,
                                  Real p_bar, Real tol, int max_iter, bool use_pr,
                                  const PrecondIntoT<Real>& precond,
-                                 const VecT<Real>* p_init, bool light) {
+                                 const VecT<Real>* p_init, bool light,
+                                 bool record_history) {
     using Vec = VecT<Real>;
     const int N = static_cast<int>(g0.size());
     if (N == 0 || p_bar <= Real(0))
@@ -72,6 +73,7 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S, const VecT<Real>& g
             e += static_cast<double>(p(i)) * std::abs(static_cast<double>(g(i)));
         }
         res.error = e / (static_cast<double>(P_total) * static_cast<double>(g_scale));
+        if (record_history) res.error_history.push_back(res.error);
         if (res.error < static_cast<double>(tol)) {
             res.converged = true;
             break;
@@ -185,15 +187,15 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S, const VecT<Real>& g
 // explicit instantiations
 template ContactResult solve_contact_impl<double>(
     const MatVecIntoT<double>&, const VecT<double>&, double, double, int, bool,
-    const PrecondIntoT<double>&, const VecT<double>*, bool);
+    const PrecondIntoT<double>&, const VecT<double>*, bool, bool);
 template ContactResult solve_contact_impl<float>(
     const MatVecIntoT<float>&, const VecT<float>&, float, float, int, bool,
-    const PrecondIntoT<float>&, const VecT<float>*, bool);
+    const PrecondIntoT<float>&, const VecT<float>*, bool, bool);
 
 ContactResult solve_contact(const MatVec& S, const Eigen::VectorXd& g0,
                             double p_bar, double tol, int max_iter, bool use_pr,
                             const Precond& precond, const Eigen::VectorXd* p_init,
-                            bool light) {
+                            bool light, bool record_history) {
     MatVecIntoT<double> Si = [&S](const Eigen::VectorXd& x, Eigen::VectorXd& y) {
         y = S(x);
     };
@@ -203,7 +205,7 @@ ContactResult solve_contact(const MatVec& S, const Eigen::VectorXd& g0,
                         const std::vector<std::uint8_t>& contact,
                         Eigen::VectorXd& z) { z = precond(g, contact); };
     return solve_contact_impl<double>(Si, g0, p_bar, tol, max_iter, use_pr,
-                                      pi, p_init, light);
+                                      pi, p_init, light, record_history);
 }
 
 } // namespace hmc

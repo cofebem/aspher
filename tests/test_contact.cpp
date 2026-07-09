@@ -65,6 +65,20 @@ int main() {
     CHECK(pdiff < 1e-3);
     CHECK(std::abs(rd.objective / rh.objective - 1.0) < 1e-6);
 
+    // opt-in convergence history: off by default (no cost, no data)
+    CHECK(rd.error_history.empty());
+
+    // with record_history=true, the trace is non-empty and its last entry
+    // matches the reported final error (see the design spec for why this
+    // is checked instead of size() == iterations)
+    const auto rd_hist = hmc::solve_contact(dense_op, g0, p_bar, 1e-10, 4000,
+                                            true, hmc::Precond{}, nullptr,
+                                            false, true);
+    CHECK(!rd_hist.error_history.empty());
+    CHECK(std::abs(rd_hist.error_history.back() - rd_hist.error) < 1e-12);
+    std::printf("  error_history: %zu entries, last=%.3e\n",
+                rd_hist.error_history.size(), rd_hist.error_history.back());
+
     std::printf("test_contact: all checks passed\n");
     return 0;
 }
