@@ -1,12 +1,18 @@
-# Hcontact — H-Matrix BEM Solver for Rough-Surface Normal Contact
+# ASPHER — Accelerated SPectral and HiERarchical contact solver
+
+*(pronounced "asper", as in **asper**ity — or as the Latin* asper*, "rough")*
+
+> ***ad astra per ASPHERa*** — yes, the misspelling of *aspera* is entirely
+> deliberate: through roughness, to the stars.
 
 + **Author:** Claude Fable (foundation), Claude Opus 4.8
 + **Coordinator:** V.A. Yastrebov
 
-C++17 boundary-integral solver for frictionless normal contact of an elastic
-half-space, with a hierarchical-matrix (H-matrix) representation of the
-Boussinesq influence matrix and a Python interface. Built to the spec in
-`../HMATRIX_CONTACT_PROMPT.md`.
+Formerly **Hcontact**. C++17 boundary-integral solver for frictionless normal
+contact of an elastic half-space: exact Love/Boussinesq influence coefficients
+applied through hierarchical operators (H-matrix ACA and a matrix-free
+H²/bbFMM), a |q| spectral preconditioner (FFTW), nested-grid continuation and
+a mixed-precision Polonsky–Keer CG, with a Python interface.
 
 - **Kernel**: Love (1929) closed-form integration of the Boussinesq solution
   over square elements — exact for every entry, served from an O(N) lookup
@@ -31,13 +37,14 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=/usr/bin/g++
 cmake --build build -j && ctest --test-dir build
 ```
 
-The Python module `hmatrix_contact*.so` is placed in `python/`.
+The Python module `aspher*.so` is placed in `python/` (an
+`hmatrix_contact` import alias is kept for existing scripts).
 
 ## Usage
 
 ```python
 import numpy as np, sys; sys.path.insert(0, "python")
-import hmatrix_contact as hmc
+import aspher as hmc   # `import hmatrix_contact` still works (alias)
 
 solver = hmc.ContactSolver(grid_size=64, domain_size=1.0, E_star=1.0,
                            eta=2.0, aca_tol=1e-6, leaf_size=32)
@@ -123,7 +130,7 @@ Verified against Hertz theory while building the benchmark:
 
 ```
 include/, src/      boussinesq_kernel, cluster_tree, hmatrix, contact_solver
-python/bindings.cpp pybind11 module `hmatrix_contact` (.so lands here too)
+python/bindings.cpp pybind11 module `aspher` (.so lands here too; `hmatrix_contact` alias)
 tests/              C++ unit/integration tests (CTest) + tamaas_test.py
 compare_tamaas.py   benchmark vs Tamaas; tamaas_reference.py runs in fluidpaper
 doc/plans/          implementation plan

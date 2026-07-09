@@ -33,9 +33,9 @@
 \theoremstyle{remark}
 \newtheorem{remark}{Remark}
 
-\title{The black-box FMM ($\Htwo$) operator in Hcontact:\\[4pt]
+\title{The black-box FMM ($\Htwo$) operator in ASPHER:\\[4pt]
 a detailed derivation, design rationale, and validation}
-\author{Hcontact --- theory companion to \texttt{doc/theory/h2\_fmm.tex}}
+\author{ASPHER (formerly Hcontact) --- theory companion to \texttt{doc/theory/h2\_fmm.tex}}
 \date{2026-06-30}
 
 \begin{document}
@@ -45,7 +45,7 @@ a detailed derivation, design rationale, and validation}
 This document is the in-depth companion to the concise note
 \texttt{doc/theory/h2\_fmm.tex}. It explains, from first principles and at
 textbook depth, the matrix-free hierarchical operator (\code{backend="h2"})
-that Hcontact uses to apply the discrete Boussinesq half-space flexibility
+that ASPHER uses to apply the discrete Boussinesq half-space flexibility
 matrix $S$ without ever forming it. The operator is a black-box fast multipole
 method (bbFMM) in the sense of Fong and Darve~\cite{FongDarve2009}, built on
 tensor-product Chebyshev interpolation and specialised to the
@@ -73,7 +73,7 @@ $\Hmat$-matrix, and the FFT solver Tamaas; and limitations.
 \section{Introduction and reading guide}
 \label{sec:intro}
 
-Hcontact solves normal elastic contact between a rigid rough indenter and an
+ASPHER solves normal elastic contact between a rigid rough indenter and an
 elastic half-space. The numerical bottleneck is the repeated application of a
 dense, fully populated influence matrix $S\in\R^{N\times N}$, $N=N_s^2$, inside
 a projected conjugate-gradient (PCG) iteration. Forming $S$ explicitly is
@@ -231,7 +231,7 @@ $(\cdot)\ln(\cdot)$ groups of \eqref{eq:love}.
 
 \subsection{The self-term}
 
-For Hcontact's square elements $a=b=h/2$. Setting $x=y=0$ in \eqref{eq:love}
+For ASPHER's square elements $a=b=h/2$. Setting $x=y=0$ in \eqref{eq:love}
 gives the diagonal entry $S_{ii}$. All four corner distances equal
 $R_{\pm\pm}=\tfrac{h}{2}\sqrt2$, and each of the four logarithm arguments reduces
 to $(1+\sqrt2)/(\sqrt2-1)=(1+\sqrt2)^2$, so each term contributes
@@ -318,7 +318,7 @@ $\Htwo$/FMM (this document)        & $\Order(N)$         & $\Order(N)$ \\
 \label{tab:landscape}
 \end{table}
 
-\paragraph{Dense.} Exact, trivial to implement, and used in Hcontact only for
+\paragraph{Dense.} Exact, trivial to implement, and used in ASPHER only for
 small-$N$ tests (\code{assemble\_dense}, \code{boussinesq\_kernel.cpp:29--36}). It
 is the ground truth against which the $\Htwo$ apply is verified
 (Section~\ref{sec:accuracy}).
@@ -327,12 +327,12 @@ is the ground truth against which the $\Htwo$ apply is verified
 $S$ into admissible (well-separated) and inadmissible blocks; each admissible
 block $A_{ts}$ is compressed independently as a low-rank product
 $A_{ts}\approx U_{ts}V_{ts}^\top$ by adaptive cross
-approximation~\cite{Bebendorf2008,Hackbusch2015}. This works and was Hcontact's
+approximation~\cite{Bebendorf2008,Hackbusch2015}. This works and was ASPHER's
 previous backend, but for a \emph{translation-invariant} kernel it stores
 \emph{redundant bases}: many admissible blocks at one level share the same
 relative geometry and are therefore the \emph{same} matrix, yet each is
 approximated and stored separately. Memory is $\Order(N\log N)$ with a large
-constant (e.g.\ $6.2$\,GiB at $N_s=512$ in Hcontact). The $\Htwo$/FMM design
+constant (e.g.\ $6.2$\,GiB at $N_s=512$ in ASPHER). The $\Htwo$/FMM design
 exists precisely to remove this redundancy.
 
 \paragraph{FFT convolution.} Because $S$ is a (block-)Toeplitz convolution on a
@@ -416,7 +416,7 @@ $(l_x,l_y)$ (\code{h2\_operator.cpp:173--175, 239--247}).
 \label{sec:extent}
 
 For interpolation, each box is mapped affinely to the reference square
-$[-1,1]^2$. Hcontact uses the box's \emph{geometric extent} (its full side
+$[-1,1]^2$. ASPHER uses the box's \emph{geometric extent} (its full side
 $s\cdot h$ in physical units), not the bounding box of its element centres. The
 $k$-th element centre of a side-$s$ box maps to
 \begin{equation}
@@ -572,7 +572,7 @@ of interpolation nodes.
 \label{sec:cheb}
 
 The bbFMM realises \eqref{eq:degenerate} by interpolating $g$ in each argument at
-Chebyshev points. Hcontact uses the Chebyshev points of the first kind on
+Chebyshev points. ASPHER uses the Chebyshev points of the first kind on
 $[-1,1]$,
 \begin{equation}
   \xi_m = \cos\!\Big(\frac{(2m+1)\pi}{2q}\Big), \qquad m=0,\dots,q-1,
@@ -629,7 +629,7 @@ their own width, the kernel $g(\xx,\yy)=1/(\pi\Es\abs{\xx-\yy})$ extends
 analytically in each variable to an ellipse with $\rho>1$ bounded away from $1$
 by the separation ratio; the larger the separation, the larger $\rho$, and the
 faster the decay. The practical consequence is the geometric error reduction in
-$q$ measured for Hcontact: relative $L_2$ matvec error
+$q$ measured for ASPHER: relative $L_2$ matvec error
 $1.3\times10^{-4}$ at $q=4$ falling to $3.2\times10^{-6}$ at $q=6$
 (Section~\ref{sec:accuracy}), i.e.\ roughly a factor $40$ per two extra orders,
 the signature of a geometric rate.
@@ -1699,7 +1699,7 @@ near-full contact.
 \end{itemize}
 
 \section*{Summary}
-The Hcontact $\Htwo$/FMM operator applies the Boussinesq flexibility matrix in
+The ASPHER $\Htwo$/FMM operator applies the Boussinesq flexibility matrix in
 $\Order(N)$ time and memory, matrix-free, by combining (i) an exact short-range
 near field from the Love cell-integral lookup table; (ii) a tensor-product
 Chebyshev (bbFMM) far field with spectral accuracy in the order $q$; and (iii) a

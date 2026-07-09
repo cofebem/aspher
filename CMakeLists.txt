@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(hmatrix_contact CXX)
+project(aspher CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -26,7 +26,7 @@ find_library(FFTW3F_LIB fftw3f REQUIRED)
 find_library(FFTW3_OMP_LIB fftw3_omp)
 find_library(FFTW3F_OMP_LIB fftw3f_omp)
 
-add_library(hmatrix_contact_core STATIC
+add_library(aspher_core STATIC
   src/boussinesq_kernel.cpp
   src/cluster_tree.cpp
   src/hmatrix.cpp
@@ -37,23 +37,23 @@ add_library(hmatrix_contact_core STATIC
   src/fourier_precond.cpp
   src/nested_solve.cpp
 )
-target_include_directories(hmatrix_contact_core PUBLIC include ${FFTW3_INCLUDE_DIR})
-target_link_libraries(hmatrix_contact_core PUBLIC Eigen3::Eigen)
+target_include_directories(aspher_core PUBLIC include ${FFTW3_INCLUDE_DIR})
+target_link_libraries(aspher_core PUBLIC Eigen3::Eigen)
 if(FFTW3_OMP_LIB AND FFTW3F_OMP_LIB)
-  target_link_libraries(hmatrix_contact_core PUBLIC ${FFTW3_OMP_LIB} ${FFTW3F_OMP_LIB})
-  target_compile_definitions(hmatrix_contact_core PUBLIC HMC_FFTW_THREADS)
+  target_link_libraries(aspher_core PUBLIC ${FFTW3_OMP_LIB} ${FFTW3F_OMP_LIB})
+  target_compile_definitions(aspher_core PUBLIC HMC_FFTW_THREADS)
 endif()
-target_link_libraries(hmatrix_contact_core PUBLIC ${FFTW3_LIB} ${FFTW3F_LIB})
-target_compile_options(hmatrix_contact_core PRIVATE -Wall -Wextra)
-set_target_properties(hmatrix_contact_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(aspher_core PUBLIC ${FFTW3_LIB} ${FFTW3F_LIB})
+target_compile_options(aspher_core PRIVATE -Wall -Wextra)
+set_target_properties(aspher_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(OpenMP_CXX_FOUND)
-  target_link_libraries(hmatrix_contact_core PUBLIC OpenMP::OpenMP_CXX)
+  target_link_libraries(aspher_core PUBLIC OpenMP::OpenMP_CXX)
 endif()
 
 enable_testing()
 foreach(t kernel hmatrix contact h2 precond)
   add_executable(test_${t} tests/test_${t}.cpp)
-  target_link_libraries(test_${t} PRIVATE hmatrix_contact_core)
+  target_link_libraries(test_${t} PRIVATE aspher_core)
   target_compile_options(test_${t} PRIVATE -Wall -Wextra)
   add_test(NAME ${t} COMMAND test_${t})
 endforeach()
@@ -62,8 +62,8 @@ endforeach()
 #   -Dpybind11_DIR=$(conda run -n dolfinx-010 python -m pybind11 --cmakedir)
 find_package(pybind11 CONFIG QUIET)
 if(pybind11_FOUND AND EXISTS ${CMAKE_SOURCE_DIR}/python/bindings.cpp)
-  pybind11_add_module(hmatrix_contact python/bindings.cpp)
-  target_link_libraries(hmatrix_contact PRIVATE hmatrix_contact_core)
-  set_target_properties(hmatrix_contact PROPERTIES
+  pybind11_add_module(aspher python/bindings.cpp)
+  target_link_libraries(aspher PRIVATE aspher_core)
+  set_target_properties(aspher PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/python)
 endif()

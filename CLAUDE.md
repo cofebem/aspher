@@ -1,8 +1,14 @@
-# CLAUDE.md — Hcontact Project
+# CLAUDE.md — ASPHER Project
+
+**ASPHER** — *Accelerated SPectral and HiERarchical contact solver*
+(pronounced "asper", as in *asperity* / Latin *asper* = rough; formerly
+**Hcontact**). Motto: *ad astra per ASPHERa* (misspelling intentional).
 
 ## What This Is
 
-A C++17 H-matrix BEM contact solver with pybind11 Python bindings.
+A C++17 hierarchical (H-matrix / H2-FMM) BEM contact solver with pybind11 Python bindings.
+The Python module is `aspher` (built as `aspher.cpython-312-*.so` in `python/`);
+`import hmatrix_contact` still works via the `python/hmatrix_contact.py` alias shim.
 All paths below are relative to this repository's root.
 
 ---
@@ -15,7 +21,7 @@ All paths below are relative to this repository's root.
 | `dolfinx-010` | **pybind11 only**: used to get `pybind11_DIR` at cmake time, nothing else. |
 | `fluidpaper` | **Tamaas 2.8.1**: only for `tamaas_reference.py`. Do not use for building. |
 
-The Python `.so` module (`hmatrix_contact.cpython-312-*.so`) lands in `python/` and must be imported from there.
+The Python `.so` module (`aspher.cpython-312-*.so`) lands in `python/` and must be imported from there (`hmatrix_contact` remains as an alias).
 
 ---
 
@@ -115,8 +121,9 @@ Delete cache files to force recomputation.
 │   ├── nested_solve.cpp        # builds per-level kernels/H2/precond, restrict+inject
 │   └── contact_solver.cpp      # PCG with optional preconditioner + warm start; OpenMP O(N) passes, double-accumulated reductions
 ├── python/
-│   ├── bindings.cpp            # pybind11 module 'hmatrix_contact'
-│   └── hmatrix_contact.cpython-312-x86_64-linux-gnu.so  (built artifact)
+│   ├── bindings.cpp            # pybind11 module 'aspher'
+│   ├── hmatrix_contact.py      # backward-compat alias -> aspher
+│   └── aspher.cpython-312-x86_64-linux-gnu.so  (built artifact)
 ├── tests/
 │   ├── test_kernel.cpp         # self-term, symmetry, far-field, positivity
 │   ├── test_hmatrix.cpp        # cluster tree validity, ACA accuracy, compression
@@ -284,7 +291,7 @@ Fix: use plain `\begin{enumerate}` and `\begin{itemize}` without optional argume
 ```python
 import sys
 sys.path.insert(0, '/path/to/Hcontact/python')
-import hmatrix_contact as hc
+import aspher as hc   # `import hmatrix_contact` = alias
 import numpy as np
 
 solver = hc.ContactSolver(
@@ -340,7 +347,7 @@ layout = solver.block_layout()  # (n_blocks, 5) array: row_begin, row_size, col_
 apply mean pressure → contact area → plot). Run in `fenicsx-env`:
 
 ```python
-import numpy as np, hmatrix_contact as hc
+import numpy as np, aspher as hc
 Ns = 128                                  # power of two for backend="h2"
 surface = self_affine_surface(Ns, H=0.8, rms=0.02)        # height field
 solver  = hc.ContactSolver(grid_size=Ns, backend="h2", q=6)

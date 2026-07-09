@@ -231,9 +231,11 @@ PyResult py_solve_nested(
 
 } // namespace
 
-PYBIND11_MODULE(hmatrix_contact, m) {
-    m.doc() = "H-matrix BEM normal-contact solver for an elastic half-space "
-              "(Boussinesq kernel, Love element integration, Polonsky-Keer CG)";
+PYBIND11_MODULE(aspher, m) {
+    m.doc() = "ASPHER - Accelerated SPectral and HiERarchical contact solver. "
+              "BEM normal contact on an elastic half-space (Boussinesq kernel, "
+              "Love element integration, H-matrix/H2-FMM operators, "
+              "FFTW |q| preconditioner, Polonsky-Keer CG)";
 
     py::class_<PyResult>(m, "ContactResult")
         .def_property_readonly(

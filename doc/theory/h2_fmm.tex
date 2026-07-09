@@ -15,7 +15,7 @@
 \title{A matrix-free $\mathcal{H}^2$/FMM operator for the elastic
 half-space flexibility problem\\[2pt]
 \large strategy, design choices, and validation}
-\author{Hcontact}
+\author{ASPHER}
 \date{2026-06-27}
 
 \begin{document}
@@ -23,7 +23,7 @@ half-space flexibility problem\\[2pt]
 
 \begin{abstract}
 This note documents the matrix-free hierarchical operator
-(\texttt{backend="h2"}) used by Hcontact to apply the Boussinesq half-space
+(\texttt{backend="h2"}) used by ASPHER to apply the Boussinesq half-space
 flexibility matrix without ever forming it. The operator is a black-box
 fast multipole method (bbFMM) built on tensor-product Chebyshev
 interpolation. We explain why this design is preferred over a dense matrix
@@ -81,7 +81,7 @@ alone is $\approx 8.8$\,TB, so it is impossible; the classical
 $\mathcal{H}$-matrix needs several GB.}
 \end{table}
 
-The previous Hcontact backend was a classical $\mathcal{H}$-matrix~\cite{Hackbusch2015}:
+The previous ASPHER backend was a classical $\mathcal{H}$-matrix~\cite{Hackbusch2015}:
 a list of admissible blocks, each compressed independently as $A_{ts}\approx U_{ts}
 V_{ts}^\top$ by adaptive cross approximation (ACA). This works, but for a
 regular half-space kernel it stores \emph{redundant bases}: many blocks at

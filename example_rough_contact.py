@@ -16,7 +16,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "python"))
 import numpy as np
 import matplotlib.pyplot as plt
-import hmatrix_contact as hc
+import aspher as hc
 import rfgen as rf
 import time
 
