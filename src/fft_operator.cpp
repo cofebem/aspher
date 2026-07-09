@@ -75,9 +75,12 @@ void FFTOperator::build_single_caches() const {
 }
 
 // Zero-pad scatter -> fwd FFT -> pointwise kernel spectrum -> inv FFT ->
-// gather the Ns x Ns block at the origin. The previous call's inverse
-// transform wrote the whole padded grid, so the scatter refreshes every
-// entry (no stale padding).
+// gather the Ns x Ns block at the origin. The engine is bound with the
+// ny_active=Ns hint: fwd() treats padding lines [Ns, M) as zero without
+// reading them, and inv() only produces lines [0, Ns) — exactly the
+// scatter/gather footprint below — so the padding lines above Ns are left
+// permanently stale in G across calls, by design (never scattered, never
+// gathered, never read by fwd()).
 template <class S>
 void FFTOperator::matvec_impl(
     const Eigen::Matrix<S, Eigen::Dynamic, 1>& x,
@@ -93,21 +96,21 @@ void FFTOperator::matvec_impl(
         G.resize(M_, M_);
         C.resize(nh_, M_);
         eng = std::make_unique<fft::SquareR2C<S>>();
-        eng->bind(M_, G.data(), C.data());
+        // only the first Ns grid lines are ever nonzero (zero-padded
+        // convolution): fwd treats lines [Ns, M) as zero and inv only
+        // produces lines [0, Ns), so neither is scattered nor gathered here
+        eng->bind(M_, G.data(), C.data(), Ns_);
     }
     if (y.size() != N) y.resize(N);
 
-    // zero-pad scatter; column iy of G gets x-range [iy*Ns, (iy+1)*Ns)
+    // zero-pad scatter over the active lines; column iy of G gets x-range
+    // [iy*Ns, (iy+1)*Ns), the rest of the line is padding
 #pragma omp parallel for schedule(static)
-    for (int iy = 0; iy < M_; ++iy) {
+    for (int iy = 0; iy < Ns_; ++iy) {
         S* col = G.data() + static_cast<std::ptrdiff_t>(iy) * M_;
-        if (iy < Ns_) {
-            const S* xi = x.data() + static_cast<std::ptrdiff_t>(iy) * Ns_;
-            for (int ix = 0; ix < Ns_; ++ix) col[ix] = xi[ix];
-            for (int ix = Ns_; ix < M_; ++ix) col[ix] = S(0);
-        } else {
-            for (int ix = 0; ix < M_; ++ix) col[ix] = S(0);
-        }
+        const S* xi = x.data() + static_cast<std::ptrdiff_t>(iy) * Ns_;
+        for (int ix = 0; ix < Ns_; ++ix) col[ix] = xi[ix];
+        for (int ix = Ns_; ix < M_; ++ix) col[ix] = S(0);
     }
 
     eng->fwd();

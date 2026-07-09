@@ -145,7 +145,7 @@ template <> struct FFTW<float> {
 // ── pocketfft engine (default, BSD): slab-parallel decomposed transforms ────
 
 template <class S>
-inline void pfft_fwd(int n, int nh, const S* in, std::complex<S>* out) {
+inline void pfft_fwd(int n, int nh, int ny, const S* in, std::complex<S>* out) {
     using CS = std::complex<S>;
     const pocketfft::stride_t sg{static_cast<std::ptrdiff_t>(sizeof(S)),
                                  static_cast<std::ptrdiff_t>(sizeof(S)) * n};
@@ -155,17 +155,28 @@ inline void pfft_fwd(int n, int nh, const S* in, std::complex<S>* out) {
     {
         const int nt = nthreads_in_region();
         const int tid = thread_id();
-        // pass 1: r2c along ix, slab of iy lines per thread
-        const int y0 = static_cast<int>(std::int64_t(n) * tid / nt);
-        const int y1 = static_cast<int>(std::int64_t(n) * (tid + 1) / nt);
+        // pass 1: r2c along ix, slab of iy lines per thread — but only the
+        // first ny lines are (possibly) nonzero; the spectrum rows of the
+        // remaining lines are the transform of zeros, so they are zeroed
+        // directly instead of transformed (halves this pass in the
+        // zero-padded convolution case, ny = n/2)
+        const int y0 = static_cast<int>(std::int64_t(ny) * tid / nt);
+        const int y1 = static_cast<int>(std::int64_t(ny) * (tid + 1) / nt);
         if (y1 > y0)
             pocketfft::r2c({static_cast<std::size_t>(n),
                             static_cast<std::size_t>(y1 - y0)},
                            sg, sc, pocketfft::shape_t{0}, true,
                            in + std::size_t(y0) * n,
                            out + std::size_t(y0) * nh, S(1), 1);
+        // zero spectrum rows [ny, n): one contiguous span, split over threads
+        const std::int64_t z0 = std::int64_t(ny) * nh;
+        const std::int64_t zn = (std::int64_t(n) - ny) * nh;
+        const std::int64_t s0 = z0 + zn * tid / nt;
+        const std::int64_t s1 = z0 + zn * (tid + 1) / nt;
+        for (std::int64_t i = s0; i < s1; ++i) out[i] = CS(0);
 #pragma omp barrier
-        // pass 2: c2c along iy, slab of kx rows per thread, in place
+        // pass 2: c2c along iy, slab of kx rows per thread, in place (the
+        // spectrum is dense after pass 1 — nothing to prune here)
         const int k0 = static_cast<int>(std::int64_t(nh) * tid / nt);
         const int k1 = static_cast<int>(std::int64_t(nh) * (tid + 1) / nt);
         if (k1 > k0)
@@ -177,7 +188,7 @@ inline void pfft_fwd(int n, int nh, const S* in, std::complex<S>* out) {
 }
 
 template <class S>
-inline void pfft_inv(int n, int nh, std::complex<S>* in, S* out) {
+inline void pfft_inv(int n, int nh, int ny, std::complex<S>* in, S* out) {
     using CS = std::complex<S>;
     const pocketfft::stride_t sg{static_cast<std::ptrdiff_t>(sizeof(S)),
                                  static_cast<std::ptrdiff_t>(sizeof(S)) * n};
@@ -196,9 +207,10 @@ inline void pfft_inv(int n, int nh, std::complex<S>* in, S* out) {
                            sc, sc, pocketfft::shape_t{1}, false,
                            in + k0, in + k0, S(1), 1);
 #pragma omp barrier
-        // pass 2: c2r along ix, slab of iy lines per thread
-        const int y0 = static_cast<int>(std::int64_t(n) * tid / nt);
-        const int y1 = static_cast<int>(std::int64_t(n) * (tid + 1) / nt);
+        // pass 2: c2r along ix, slab of iy lines per thread — only the first
+        // ny lines are produced (the caller never reads the rest)
+        const int y0 = static_cast<int>(std::int64_t(ny) * tid / nt);
+        const int y1 = static_cast<int>(std::int64_t(ny) * (tid + 1) / nt);
         if (y1 > y0)
             pocketfft::c2r({static_cast<std::size_t>(n),
                             static_cast<std::size_t>(y1 - y0)},
@@ -214,6 +226,14 @@ inline void pfft_inv(int n, int nh, std::complex<S>* in, S* out) {
 // after the buffers are allocated (FFTW plans bind to the pointers, and
 // FFTW_MEASURE scribbles on the arrays during planning) and the buffers must
 // not be reallocated afterwards. Not thread-reentrant.
+//
+// bind() optionally takes ny_active — the number of leading grid lines that
+// matter: fwd() treats lines [ny_active, n) as zero regardless of content
+// (callers need not zero them), and inv() produces only lines
+// [0, ny_active), leaving the rest unspecified. This prunes ~half of the
+// line-direction passes for the zero-padded convolution (pocketfft engine);
+// the FFTW engine keeps full 2-D plans and instead zeroes the inactive
+// lines itself in fwd() to honour the same contract.
 template <class S>
 class SquareR2C {
 public:
@@ -227,9 +247,10 @@ public:
     SquareR2C(const SquareR2C&) = delete;
     SquareR2C& operator=(const SquareR2C&) = delete;
 
-    void bind(int n, S* g, std::complex<S>* c) {
+    void bind(int n, S* g, std::complex<S>* c, int ny_active = -1) {
         n_ = n;
         nh_ = n / 2 + 1;
+        ny_ = (ny_active < 0) ? n : ny_active;
         g_ = g;
         c_ = c;
 #ifdef HMC_USE_FFTW
@@ -240,23 +261,29 @@ public:
     }
     bool bound() const { return n_ > 0; }
 
-    void fwd() { // g -> c
+    void fwd() { // g -> c; lines [ny_, n_) of g treated as zero (not read)
 #ifdef HMC_USE_FFTW
+        if (ny_ < n_) { // full 2-D plan reads everything: zero inactive lines
+            S* z = g_ + std::size_t(ny_) * n_;
+            const std::int64_t zn = std::int64_t(n_ - ny_) * n_;
+#pragma omp parallel for schedule(static)
+            for (std::int64_t i = 0; i < zn; ++i) z[i] = S(0);
+        }
         FFTW<S>::execute(fwd_);
 #else
-        pfft_fwd<S>(n_, nh_, g_, c_);
+        pfft_fwd<S>(n_, nh_, ny_, g_, c_);
 #endif
     }
-    void inv() { // c -> g (destroys c)
+    void inv() { // c -> g (destroys c); only lines [0, ny_) of g produced
 #ifdef HMC_USE_FFTW
         FFTW<S>::execute(inv_);
 #else
-        pfft_inv<S>(n_, nh_, c_, g_);
+        pfft_inv<S>(n_, nh_, ny_, c_, g_);
 #endif
     }
 
 private:
-    int n_ = 0, nh_ = 0;
+    int n_ = 0, nh_ = 0, ny_ = 0;
     S* g_ = nullptr;
     std::complex<S>* c_ = nullptr;
 #ifdef HMC_USE_FFTW
