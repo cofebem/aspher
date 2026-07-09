@@ -93,10 +93,10 @@ Delete cache files to force recomputation.
 │   ├── hmatrix.hpp             # ACA low-rank blocks, matvec, HMatrixInfo
 │   ├── cheb_basis.hpp          # Chebyshev nodes + interpolation weights (bbFMM)
 │   ├── uniform_quadtree.hpp    # uniform box tree, neighbors, interaction lists
-│   ├── h2_operator.hpp         # matrix-free H2/FMM operator, H2Params, H2Info
-│   ├── fourier_precond.hpp     # |q| spectral preconditioner (Eigen FFT)
+│   ├── h2_operator.hpp         # matrix-free H2/FMM operator, H2Params, H2Info; matvec_into + persistent M/L scratch
+│   ├── fourier_precond.hpp     # |q| spectral preconditioner (half-spectrum r2c FFT, persistent scratch, apply_into)
 │   ├── nested_solve.hpp        # single-entry cascadic/FMG nested-grid solve
-│   └── contact_solver.hpp      # Polonsky-Keer PCG, ContactResult, MatVec, Precond
+│   └── contact_solver.hpp      # Polonsky-Keer PCG, ContactResult, MatVec(IntoT), Precond(IntoT)
 ├── src/
 │   ├── boussinesq_kernel.cpp
 │   ├── cluster_tree.cpp
@@ -106,7 +106,7 @@ Delete cache files to force recomputation.
 │   ├── h2_operator.cpp         # P2M/M2M/M2L/L2L/L2P + near field; cached operators
 │   ├── fourier_precond.cpp
 │   ├── nested_solve.cpp        # builds per-level kernels/H2/precond, restrict+inject
-│   └── contact_solver.cpp      # PCG with optional preconditioner + warm start
+│   └── contact_solver.cpp      # PCG with optional preconditioner + warm start; OpenMP O(N) passes, double-accumulated reductions
 ├── python/
 │   ├── bindings.cpp            # pybind11 module 'hmatrix_contact'
 │   └── hmatrix_contact.cpython-312-x86_64-linux-gnu.so  (built artifact)
@@ -126,7 +126,9 @@ Delete cache files to force recomputation.
 │   └── tamaas_meta.json
 ├── doc/
 │   ├── theory/
-│   │   └── pcg.tex             # PCG theory reference: CG, β formulas, line search, P-K, GPCG
+│   │   ├── pcg.tex             # PCG theory: CG, β formulas, line search, P-K, GPCG + §"Spectral Preconditioning and Finite-Precision Implementation" (2026-07 perf pass)
+│   │   ├── h2_fmm_detailed.tex # H2/bbFMM operator theory + preconditioner/nested-grid chapters
+│   │   └── references.bib      # shared bibliography (incl. Higham 2002, Chan-Golub-LeVeque 1983)
 │   ├── slides/
 │   │   ├── slides.tex          # main Beamer file (metropolis, 16:9, accent #2c7bb6)
 │   │   ├── sections/
@@ -198,7 +200,7 @@ Default β formula: **Polak-Ribière+** (`use_pr=true`); Fletcher-Reeves availab
 
 Key step: **overlap correction** `p_i -= τ·g_i` for nodes where p=0 and gap<0.
 This is in the 1999 paper but absent from informal pseudocode — omitting it breaks convergence on rough surfaces.
-Full algorithm with theory in `doc/theory/pcg.tex` (compile with `pdflatex`).
+Full algorithm with theory in `doc/theory/pcg.tex` (compile with `pdflatex`; run `bibtex` once for the bibliography). Its §"Spectral Preconditioning and Finite-Precision Implementation" documents the 2026-07 performance pass: half-spectrum FFT preconditioner application, double accumulation of all grid-length reductions under `Real=float` (naive float summation loses all digits at N≳4×10⁶ — this is what stalled the old float path), the centred vs expanded line-search denominator (catastrophic cancellation analysis), and the allocation-free into-style iteration. `doc/theory/h2_fmm_detailed.tex` carries the matching operator-side notes (persistent M/L scratch, CSR interaction lists).
 
 ---
 

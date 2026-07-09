@@ -1018,6 +1018,22 @@ $\Htwo$ apply is a \emph{symmetric} linear operator -- consistent with the SPD
 matrix $S$ it approximates, and required by the conjugate-gradient solver.
 \end{remark}
 
+\paragraph{Allocation-free application (July 2026).}
+The buffers of Table~\ref{tab:mem} -- the multipole and local coefficient
+tables, $2\,q^2 n_{\text{box}}$ scalars -- are stored as two flat
+$q^2\times n_{\text{box}}$ matrices owned by the operator and reused across
+applications; the original implementation reallocated them as
+$\sim\!2\,n_{\text{box}}$ individual small vectors on \emph{every} matvec,
+which at $N_s=16384$ ($n_{\text{box}}\approx1.4\times10^6$) meant millions of
+heap allocations per operator application. The per-box interaction lists are
+flattened to CSR (offset array $+$ one contiguous entry array), the per-leaf
+temporaries of P2M/L2P live in per-thread scratch inside the OpenMP regions,
+and \code{matvec\_into(x, y)} writes into a caller-owned output vector, so a
+steady-state matvec performs no heap allocation. Both precisions keep separate
+persistent scratch (\code{double}/\code{float}), sized lazily on first use;
+consequently a single \code{H2Operator} must not be applied from two threads
+concurrently.
+
 \subsection{Measured scaling}
 
 Table~\ref{tab:cputime} (from the concise note, \code{bench\_h2\_cputime.py},
@@ -1380,10 +1396,26 @@ $\Pi_{\mathcal A}$ restricts a field to $\mathcal A$ (zero elsewhere),
 $\mathcal F$ is the 2-D DFT, and $\bar z_{\mathcal A}$ is the mean of $z$ over
 $\mathcal A$. In words: mask the gradient to the contact set, apply the symbol by
 FFT, keep the result on the contact set, and subtract its contact-set mean. This
-is \code{FourierPreconditioner::apply} (\code{fourier\_precond.cpp:57--83}); the
-2-D transform is done as $1$-D Eigen FFTs over rows then columns
-(\code{:21--55}), and the final contact-mean removal (\code{:72--81}) is the
-discrete analogue of the $\mathbf q=0$ zeroing on the \emph{reduced} space.
+is \code{FourierPreconditioner::apply\_into} (\code{fourier\_precond.cpp}); the
+final contact-mean removal is the discrete analogue of the $\mathbf q=0$ zeroing
+on the \emph{reduced} space.
+
+Since the July 2026 implementation pass the transform exploits that the masked
+residual is \emph{real}: the $x$-direction runs as real-to-complex /
+complex-to-real 1-D FFTs, storing only the $n_h=N_s/2+1$ non-redundant $k_x$
+modes (the rest follow from Hermitian symmetry), and each stored $k_x$ line is
+processed in one fused sweep along $y$ --- forward complex FFT, multiplication
+by the real, even symbol $\abs{\mathbf k}$, inverse FFT --- before the
+complex-to-real pass returns to the grid. This halves the FFT work and shrinks
+the transform scratch from ${\approx}4N$ to ${\approx}2N$ reals ($N_s^2$ real
+$+\;n_hN_s$ complex). The scratch is owned by the \code{FourierPreconditioner}
+object and reused across CG iterations, and \code{apply\_into} writes into a
+caller-owned output buffer, so a preconditioner application performs no heap
+allocation in steady state; all passes are OpenMP-parallel with per-thread FFT
+plans. The finite-precision aspects (double accumulation of the reductions,
+the cancellation-safe line-search denominator) are documented in the companion
+reference \code{doc/theory/pcg.tex}, \S``Spectral Preconditioning and
+Finite-Precision Implementation''.
 
 \begin{remark}[Why masking is only an approximate diagonaliser]
 \label{rem:mask}
@@ -1441,20 +1473,31 @@ the direction $t=z+\beta t$ at \code{:80--81}; and the unchanged line search at
 \begin{proposition}[Exact reduction to the original solver]
 \label{prop:precond-none}
 With \code{precond} empty (\code{precond="none"}), the preconditioned solver
-produces the \emph{same} iterates as the original Polonsky--Keer PCG, to the last
-bit.
+executes the \emph{same algorithm} as the original Polonsky--Keer PCG: every
+iterate coincides in exact arithmetic.
 \end{proposition}
 \begin{proof}
-With no preconditioner the code sets $z_i=g_i$ on $\mathcal A$ and $0$ elsewhere
-(\code{contact\_solver.cpp:67--68}). Then $G=\langle g,g\rangle_{\mathcal A}$ and
+With no preconditioner the code sets $z_i=g_i$ on $\mathcal A$ and $0$ elsewhere.
+Then $G=\langle g,g\rangle_{\mathcal A}$ and
 $G_{\text{pr}}=\langle g,g-g_{\text{prev}}\rangle_{\mathcal A}$ are precisely the
 Fletcher--Reeves / Polak--Ribière$^+$ scalars of the unmodified algorithm, and
-$t=g+\beta t$ is the original direction. No other line is touched. Hence every
-arithmetic operation matches the original code path. (Verified numerically in
-\code{tests/test\_precond.cpp}, and as the \code{cpp}$=$\code{none} columns of
-Table~\ref{tab:precond-it}: the C++ baseline and the Python prototype agree
-exactly.)
+$t=g+\beta t$ is the original direction. No other step is touched. (Verified
+numerically in \code{tests/test\_precond.cpp}, and as the
+\code{cpp}$=$\code{none} columns of Table~\ref{tab:precond-it}.)
 \end{proof}
+
+\begin{remark}[Bit-reproducibility]
+Until June 2026 the reduction was also bit-for-bit: the unpreconditioned branch
+reproduced the historical solver's floating-point operations one by one. The
+July 2026 performance pass parallelised all $O(N)$ vector passes with OpenMP
+and accumulates the scalar reductions in \code{double} independent of the
+working precision, so the summation \emph{order} now depends on the thread
+count. The iterates therefore agree with the historical solver to rounding
+level rather than bitwise (measured pressure difference
+$9\times10^{-15}$ relative $L^2$ at $N_s=1024$, identical contact set); in
+single precision the double accumulation is a strict accuracy \emph{gain}
+(see \code{doc/theory/pcg.tex}).
+\end{remark}
 
 \subsection{Warm start and nested-grid (cascadic / FMG) continuation}
 \label{sec:nested}

@@ -30,6 +30,8 @@
 \newcommand{\bx}{\mathbf{x}}
 \newcommand{\by}{\mathbf{y}}
 \newcommand{\bZ}{\mathbf{Z}}
+\newcommand{\bz}{\mathbf{z}}
+\newcommand{\bM}{\mathbf{M}}
 \newcommand{\be}{\mathbf{e}}
 \newcommand{\bone}{\mathbf{1}}
 \newcommand{\bzero}{\mathbf{0}}
@@ -54,7 +56,7 @@
        \large Theory, Line Search Strategies, and Application\\
        to Elastic Contact Mechanics}
 \author{Hcontact project --- technical reference}
-\date{June 2026}
+\date{June 2026 --- revised July 2026 (preconditioning and finite-precision implementation)}
 \maketitle
 \tableofcontents
 
@@ -531,6 +533,214 @@ $\delta_{\mathrm{cg}} \leftarrow 0$\;
   $\bp \leftarrow \bp \cdot N\bar p\,/\!\sum_j p_j$\;\Comment*{enforce load balance}
 }
 \end{algorithm}
+
+% ---------------------------------------------------------
+\section{Spectral Preconditioning and Finite-Precision Implementation}
+\label{sec:impl}
+
+This section documents the solver-side measures (introduced June--July 2026)
+that make Algorithm~\ref{alg:pk} fast and robust at large $N$: the $|\mathbf q|$
+spectral preconditioner and its half-spectrum FFT application, mixed-precision
+execution with double accumulation of scalar reductions, the cancellation-safe
+form of the line-search denominator, and the allocation-free organisation of
+the iteration.  The operator-side theory (Chebyshev black-box FMM, translation
+caching) is covered in the companion document \texttt{h2\_fmm\_detailed.tex};
+here we treat only what changes \emph{inside} the P-K loop.
+
+\subsection{The $|\mathbf q|$ preconditioner in brief}
+\label{sec:impl-precond}
+
+The periodic Boussinesq operator has Fourier symbol
+$\widehat S(\mathbf q) \sim 2/(E^*|\mathbf q|)$, so its condition number on an
+$N_s \times N_s$ grid grows like $\kappa(\bS) \sim N_s$ and the P-K iteration
+count like $\sqrt{N_s}$.  The spectral preconditioner applies the inverse
+symbol: $\bz = \bM^{-1}\tilde\bg$ with
+$\widehat{M^{-1}}(\mathbf k) = |\mathbf k|$ (integer wavenumbers; the overall
+scale cancels in CG, and the $\mathbf k = \bzero$ mode is zeroed because the
+mean pressure is fixed by the equality constraint, not by CG).  Per iteration,
+\begin{equation}
+  \bz \;=\; \Pi_\calC\,\calF^{-1}\!\bigl[\,|\mathbf k|\;\calF[\,\Pi_\calC\,
+  \tilde\bg\,]\bigr] \;-\; \bar z_\calC\,\bone_\calC,
+  \label{eq:precond-apply}
+\end{equation}
+where $\Pi_\calC$ masks to the contact set and $\bar z_\calC$ is the contact
+mean.  Only the direction build changes: $G$, $G_{\mathrm{pr}}$ in
+\eqref{eq:Gk}--\eqref{eq:beta-pr-pk} become the $\bM$-inner products
+$\sum_{i\in\calC} z_i \tilde g_i$ and
+$\sum_{i\in\calC} z_i (\tilde g_i - \tilde g_i^{\mathrm{prev}})$, and the
+direction is $t_i = z_i + \beta t_i$ on $\calC$.  The exact line
+search~\eqref{eq:tau}, projection, overlap correction and load rescaling are
+untouched; with the preconditioner disabled ($\bz = \tilde\bg$ on $\calC$) the
+algorithm reduces to Algorithm~\ref{alg:pk} exactly.
+
+\subsection{Half-spectrum FFT application}
+\label{sec:impl-fft}
+
+The masked residual $\Pi_\calC\tilde\bg$ is real, so the two-dimensional
+transform in~\eqref{eq:precond-apply} is executed in real-to-complex
+(half-spectrum) form rather than as four full complex passes:
+\begin{enumerate}
+  \item \textbf{r2c along $x$}: one real 1-D FFT per grid line yields the
+        modes $k_x \in \{0, \ldots, N_s/2\}$, i.e.\ $n_h = N_s/2 + 1$ complex
+        columns instead of $N_s$ (the remaining modes are determined by
+        Hermitian symmetry).
+  \item \textbf{Fused pass along $y$}: for each stored $k_x$ the code gathers
+        the strided line, performs the forward complex FFT, multiplies by the
+        real, even symbol $|\mathbf k|$, and immediately performs the inverse
+        FFT --- forward transform, symbol, and inverse transform in a single
+        sweep over each line, so the half-spectrum panel is traversed once.
+  \item \textbf{c2r along $x$} back to the real field.
+\end{enumerate}
+Because the symbol is real and even, multiplying only the stored half-spectrum
+is consistent with the omitted conjugate half.  Relative to the previous
+implementation (full complex $N_s \times N_s$ transforms in both directions)
+this halves the FFT work and shrinks the scratch from $\approx 4N$ reals
+(real input, full complex spectrum, real output) to $\approx 2N$
+($N_s^2$ reals $+\;n_h N_s$ complex).  All scratch is owned by the
+\texttt{FourierPreconditioner} object and reused across iterations
+(Section~\ref{sec:impl-alloc}).  All passes are OpenMP-parallel with
+per-thread FFT plans.
+
+\subsection{Mixed precision and double accumulation of reductions}
+\label{sec:impl-precision}
+
+The solver is templated on the working precision
+(\texttt{solve\_contact\_impl<Real>}, \texttt{Real} $\in$
+\{\texttt{double}, \texttt{float}\}); in single precision the matvec, the FFT
+and all $N$-vectors are stored and streamed as \texttt{float}, roughly halving
+the memory footprint and --- since both the FMM matvec and the FFT are
+memory-bandwidth-bound --- the per-iteration wall time.
+
+Floating-point summation of $n$ terms carries the worst-case relative error
+bound~\cite{Higham2002}
+\begin{equation}
+  \Bigl|\,\mathrm{fl}\Bigl(\sum_{i=1}^{n} x_i\Bigr) - \sum_{i=1}^{n} x_i\,\Bigr|
+  \;\leq\; (n-1)\,u \sum_{i=1}^{n} |x_i| + O(u^2),
+  \label{eq:sum-bound}
+\end{equation}
+with unit roundoff $u$.  In single precision ($u \approx 6\times10^{-8}$) and
+$n = N = N_s^2$, the factor $(n-1)u$ reaches $0.25$ already at $N_s = 2048$
+and exceeds $1$ at $N_s = 4096$: the scalars that steer the iteration ---
+$G$, $G_{\mathrm{pr}}$, the line-search numerator and denominator, the mean
+shifts $\delta$, $\bar r_\calC$ and the load $\sum_i p_i$ --- computed as
+\texttt{float} sums are not guaranteed a single correct digit.  In practice
+the float solver did not diverge but \emph{stagnated}: the complementarity
+error ground along a noise floor while the stagnation guard counted
+$\sim 200$ fruitless iterations (e.g.\ 214 iterations at $N_s = 2048$ against
+21 for the double path on the same problem).
+
+The remedy is standard mixed precision: \emph{all grid-length scalar
+reductions accumulate in \texttt{double} regardless of the working precision},
+with each product cast up per term.  The bound~\eqref{eq:sum-bound} then holds
+with $u_d \approx 1.1\times10^{-16}$, giving $(n-1)u_d \lesssim 10^{-8}$ even
+at $N = 2.7\times10^{8}$ ($N_s = 16384$) --- far below the $O(u_f)$ noise
+already present in the float data, so the reductions are exact relative to
+their inputs.  The vectors stay in \texttt{float}; only $O(1)$ scalar
+accumulators are widened, so the bandwidth advantage is untouched.  Measured
+effect at $N_s = 2048$ (rough surface, nested solve): $214 \to 21$ iterations,
+$52.5 \to 3.4$\,s wall, and the float contact area now matches the double
+answer to $3\times10^{-4}$ relative (previously $3\times10^{-3}$).
+
+\subsection{Cancellation-safe line-search denominator}
+\label{sec:impl-cancel}
+
+The exact step~\eqref{eq:tau} requires
+\begin{equation}
+  D \;=\; \sum_{i\in\calC} (r_i - \bar r_\calC)\, t_i,
+  \qquad \bar r_\calC = \frac{1}{|\calC|}\sum_{i\in\calC} r_i .
+  \label{eq:den-centred}
+\end{equation}
+It is tempting to fuse this into a single pass using the algebraically
+equivalent expansion
+\begin{equation}
+  D \;=\; \underbrace{\sum_{i\in\calC} r_i t_i}_{A}
+        \;-\; \bar r_\calC \underbrace{\sum_{i\in\calC} t_i}_{B},
+  \label{eq:den-expanded}
+\end{equation}
+but \eqref{eq:den-expanded} is numerically treacherous: $A$ and
+$\bar r_\calC B$ are each of magnitude $O(\sum |r_i||t_i|)$ while their
+difference $D$ --- the \emph{mean-free} part of $\br$ against $\bt$ --- can be
+orders of magnitude smaller, since $\br = \bS\bt$ is dominated by its
+contact-set mean precisely when the direction $\bt$ approaches the
+long-wavelength modes that the rigid-body shift removes.  The subtraction then
+amplifies the rounding error of each term by the condition number
+\begin{equation}
+  \kappa_D = \frac{|A| + |\bar r_\calC B|}{|D|} \;\gg\; 1,
+\end{equation}
+which in single precision destroyed the step length $\tau$ and inflated the
+iteration count roughly six-fold when the fused form was tried.  This is the
+same phenomenon as the textbook one-pass variance formula versus the two-pass
+centred one~\cite{ChanGolubLeVeque1983}.  The implementation therefore keeps
+the \emph{centred} two-pass form~\eqref{eq:den-centred}: $\bar r_\calC$ is
+computed first, then each summand $(r_i - \bar r_\calC)t_i$ is formed with the
+mean already removed, so the summation bound~\eqref{eq:sum-bound} applies to
+the small quantity $D$ directly.  The extra $O(N)$ pass is negligible next to
+the two matvecs.
+
+\subsection{Allocation-free iteration and parallel loops}
+\label{sec:impl-alloc}
+
+One P-K iteration consists of two operator applications, at most one
+preconditioner application, and roughly ten $O(N)$ vector passes (masking,
+shifts, reductions, updates).  Two engineering rules keep this loop at memory
+bandwidth:
+
+\paragraph{No steady-state heap allocation.}
+The solver core takes \emph{into-style} functors
+\[
+  S : (\bx, \by) \mapsto \by = \bS\bx, \qquad
+  P : (\bg, \calC, \bz) \mapsto \bz = \bM^{-1}\bg,
+\]
+which write into caller-owned buffers, and reuses its state vectors
+($\bp, \bu, \bg, \bg^{\mathrm{prev}}, \bt, \br, \bz$) across all iterations.
+The $\mathcal H^2$ operator owns its multipole/local coefficient tables
+($2\,q^2 n_{\mathrm{box}}$ scalars, previously reallocated as
+$\sim\!2\,n_{\mathrm{box}}$ small vectors on \emph{every} matvec) and the
+preconditioner owns its FFT scratch of Section~\ref{sec:impl-fft}.  After the
+first iteration the loop performs no heap allocation at all.  This matters
+beyond allocator overhead: large blocks are served by \texttt{mmap} and
+returned to the kernel on free, so per-iteration reallocation forced the
+kernel to zero-fill and soft-fault hundreds of megabytes of pages every
+iteration at large $N_s$, and made peak RSS depend on allocator behaviour.
+(The public by-value interfaces are retained as thin adapters.)
+
+\paragraph{Parallel $O(N)$ passes.}
+All vector passes are OpenMP-parallel, with reductions accumulated in
+\texttt{double} (Section~\ref{sec:impl-precision}).  A consequence worth
+recording: parallel reduction changes the summation \emph{order}, so results
+are no longer bit-reproducible across thread counts --- the deviation is at
+the $O(u_d)$ rounding level (measured pressure difference $9\times10^{-15}$
+relative $L^2$ at $N_s = 1024$ against the serial implementation, with an
+identical contact set).
+
+\subsection{Measured impact}
+
+\begin{table}[ht]
+\centering
+\caption{Effect of the July 2026 implementation pass (20-core workstation,
+         rough self-affine surface, $\bar p = 0.005$, nested-grid solve with
+         the $|\mathbf q|$ preconditioner, $\mathcal H^2$ operator, $q = 6$).}
+\label{tab:impl}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Quantity & Before & After & Factor \\
+\midrule
+Nested solve, $N_s{=}1024$, double        & 2.59\,s (21 it) & 1.23\,s (21 it) & $2.1\times$ \\
+Nested solve, $N_s{=}2048$, float         & 52.5\,s (214 it, stalled) & 3.4\,s (21 it) & $15\times$ \\
+Float area error vs.\ double ($N_s{=}2048$) & $3\times10^{-3}$ & $3\times10^{-4}$ & $10\times$ \\
+Preconditioner scratch per apply          & $\approx 4N$ reals, reallocated & $\approx 2N$ reals, persistent & $2\times$ \\
+Double solution change ($N_s{=}1024$)     & --- & $9\times10^{-15}$ rel.\ $L^2$ & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+The single-precision path is only trustworthy \emph{with} the double
+accumulators and the centred denominator; its achievable complementarity
+error remains bounded by the float noise floor
+($\varepsilon_{\mathrm{tol}} \gtrsim 2\times10^{-6}$), which is enforced as a
+tolerance clamp, with a 200-iteration stagnation guard retained as a safety
+net.
 
 % ---------------------------------------------------------
 \section{GPCG: Gradient Projected Conjugate Gradient}
