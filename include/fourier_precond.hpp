@@ -2,14 +2,13 @@
 
 #include <Eigen/Dense>
 
-#ifdef HMC_USE_FFTW
-#include <fftw3.h>
-#endif
-
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace hmc {
+
+namespace fft { template <class S> class SquareR2C; }
 
 // Spectral preconditioner for the projected CG. The Boussinesq operator S has
 // Fourier symbol Ŝ(q) ∝ 1/|q|, so M⁻¹ with symbol ∝ |q| collapses κ(S) ∼ Ns to
@@ -21,7 +20,8 @@ namespace hmc {
 //
 // The 2-D transforms run in real half-spectrum form (only kx ∈ [0, Ns/2] is
 // stored; the unnormalised r2c+c2r round-trip scale Ns² is folded into the
-// symbol) through one of two engines, selected at build time:
+// symbol) through the shared engine in src/fft_engine.hpp
+// (hmc::fft::SquareR2C), selected at build time:
 //   * default: the bundled pocketfft (BSD-3-Clause, header-only, SIMD,
 //     multithreaded) — keeps binaries permissively licensed;
 //   * -DASPHER_USE_FFTW=ON: FFTW3 plans (slightly faster; FFTW is GPL, so
@@ -68,12 +68,11 @@ private:
     mutable Eigen::MatrixXf Gf_;
     mutable Eigen::MatrixXcf Cf_;
 
-#ifdef HMC_USE_FFTW
-    // FFTW plans, created on first use per precision and bound to the scratch
-    // pointers (so the scratch is never reallocated afterwards)
-    mutable fftw_plan fwd_d_ = nullptr, inv_d_ = nullptr;
-    mutable fftwf_plan fwd_f_ = nullptr, inv_f_ = nullptr;
-#endif
+    // FFT engine (FFTW plans / pocketfft size bookkeeping), created on first
+    // use per precision and bound to the scratch pointers (so the scratch is
+    // never reallocated afterwards)
+    mutable std::unique_ptr<fft::SquareR2C<double>> fft_d_;
+    mutable std::unique_ptr<fft::SquareR2C<float>> fft_f_;
 };
 
 } // namespace hmc
