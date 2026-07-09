@@ -68,6 +68,7 @@ add_library(aspher_core STATIC
   src/uniform_quadtree.cpp
   src/h2_operator.cpp
   src/fourier_precond.cpp
+  src/fft_operator.cpp
   src/nested_solve.cpp
 )
 target_include_directories(aspher_core PUBLIC include)
@@ -92,7 +93,7 @@ endif()
 
 if(NOT SKBUILD)
   enable_testing()
-  foreach(t kernel hmatrix contact h2 precond)
+  foreach(t kernel hmatrix contact h2 precond fft)
     add_executable(test_${t} tests/test_${t}.cpp)
     target_link_libraries(test_${t} PRIVATE aspher_core)
     target_compile_options(test_${t} PRIVATE -Wall -Wextra)
