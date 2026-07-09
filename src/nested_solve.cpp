@@ -119,6 +119,9 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         // coarse levels only need the pressure (for prolongation), so drop their
         // displacement/gap unconditionally; the finest honours light_result.
         const bool light = finest ? np.light_result : true;
+        // only the finest level's trace is meaningful (iterations is also
+        // finest-level-only); coarse levels never record history.
+        const bool record_history = finest && np.record_error_history;
 
         if (np.single_precision) {
             MatVecIntoT<float> mvf;
@@ -146,11 +149,12 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             if (have_init) p0f = p_init.cast<float>();
             res = solve_contact_impl<float>(
                 mvf, g0f, static_cast<float>(p_bar), static_cast<float>(lvl_tol),
-                max_iter, use_pr, pcf, have_init ? &p0f : nullptr, light);
+                max_iter, use_pr, pcf, have_init ? &p0f : nullptr, light,
+                record_history);
         } else {
             res = solve_contact_impl<double>(
                 mv, gap[li], p_bar, lvl_tol, max_iter, use_pr, pc,
-                have_init ? &p_init : nullptr, light);
+                have_init ? &p_init : nullptr, light, record_history);
             gap[li].resize(0);
         }
 
