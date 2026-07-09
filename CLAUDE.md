@@ -59,7 +59,9 @@ default; set `HMC_FFTW_MEASURE=1` at runtime to opt into measured plans.
 the same CMakeLists (its `SKBUILD` branch: no tests, no `-march=native`,
 installs `aspher*.so` + the `hmatrix_contact.py` alias into the wheel root).
 FFTW3 must be present on the build machine (fatal CMake error otherwise);
-Eigen falls back to FetchContent. License **GPL-3.0-or-later** (FFTW is GPL).
+Eigen falls back to FetchContent. License: **BSD-3-Clause** for the source;
+binary wheels that bundle GPL FFTW are governed by GPL (README note) — the
+sdist is clean BSD.
 
 ```bash
 # local wheel (compiler override needed on this machine, see conda gcc note):

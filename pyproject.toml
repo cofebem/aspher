@@ -7,7 +7,7 @@ name = "aspher"
 version = "0.1.0"
 description = "ASPHER — Accelerated SPectral and HiERarchical contact solver: BEM normal contact on an elastic half-space (exact Love/Boussinesq kernel, H-matrix and matrix-free H2/FMM operators, FFTW |q| spectral preconditioner, nested-grid mixed-precision Polonsky–Keer CG)"
 readme = "README.md"
-license = { text = "GPL-3.0-or-later" }
+license = { text = "BSD-3-Clause" }
 authors = [
   { name = "V.A. Yastrebov" },
   { name = "Claude (Anthropic)" },
@@ -21,7 +21,7 @@ dependencies = ["numpy>=1.22"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Science/Research",
-  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+  "License :: OSI Approved :: BSD License",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: C++",
   "Programming Language :: Python :: 3",

@@ -38,8 +38,11 @@ compiler misbehaves (see the conda note below), override it with
 `CMAKE_ARGS="-DCMAKE_CXX_COMPILER=/usr/bin/g++" pip install .`.
 Wheels are built without `-march=native` (portable); local dev builds keep it.
 
-Licensed **GPL-3.0-or-later** (linking FFTW, which is GPL, requires a
-GPL-compatible license for distributed binaries).
+**License**: the ASPHER source is **BSD-3-Clause**. Note that FFTW (a build
+dependency) is GPL: *binary* distributions that link or bundle FFTW — e.g.
+binary wheels — are governed by the GPL as a whole, while the sdist and the
+ASPHER code itself remain BSD. (A planned pocketfft-based backend would lift
+this constraint from the wheels.)
 
 ## Build (development)
 
