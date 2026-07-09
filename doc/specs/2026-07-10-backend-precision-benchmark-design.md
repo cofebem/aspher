@@ -71,9 +71,14 @@ not just endpoint iteration counts:
   array (empty when not requested); `solve_nested(..., record_error_history=
   False)` new kwarg threaded to `NestedParams`.
 - Test coverage: extend `tests/test_contact.cpp` with one case asserting
-  `error_history.size() == iterations` and `error_history.back() ==
-  result.error` (or within tolerance) when the flag is set, and that
-  `error_history` stays empty when it isn't. No new test file needed.
+  `!error_history.empty()` and `error_history.back() == result.error`
+  when the flag is set, and that `error_history` stays empty when it
+  isn't. (Not `size() == iterations`: the existing loop reports
+  `iterations = it`, the loop-counter value at break time, which is one
+  less than the number of error evaluations on the early-converged path
+  but equal to it on the max-iter-exhausted path — a pre-existing
+  off-by-one quirk between those two branches, not something this
+  feature should encode into a fragile test.) No new test file needed.
 
 ## 4. Scripts
 
