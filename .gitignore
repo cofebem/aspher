@@ -37,3 +37,6 @@ doc/convergence_study/curved_rms2e-4/
 dist/
 *.whl
 *.egg-info/
+
+# local reference screenshots (not part of the repo)
+extras/Screenshot*

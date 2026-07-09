@@ -1,6 +1,6 @@
 <p align="center">
   <img src="https://raw.githubusercontent.com/cofebem/aspher/main/extras/logo.png"
-       alt="ASPHER logo: through rough asperities, toward the star" width="180">
+       alt="ASPHER logo: through roughness, toward the star" width="180">
 </p>
 
 # ASPHER — Accelerated SPectral and HiERarchical contact solver
@@ -59,6 +59,20 @@ cmake --build build -j && ctest --test-dir build
 
 The Python module `aspher*.so` is placed in `python/` (an `hmatrix_contact`
 import alias is kept for existing scripts).
+
+### Release to PyPI (maintainers)
+
+```bash
+python -m pip install -U build twine
+python -m build --sdist          # -> dist/aspher-X.Y.Z.tar.gz
+python -m twine check dist/*
+python -m twine upload dist/aspher-*.tar.gz   # sdist only: PyPI rejects
+                                              # non-manylinux binary wheels
+```
+
+Bump `version` in `pyproject.toml` and `CITATION.cff` before releasing. The
+sdist is all-BSD (bundled pocketfft); binary wheels would need `cibuildwheel`
+(manylinux + `auditwheel`) and are a later step.
 
 ## Quick start
 
