@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/cofebem/aspher/main/extras/logo.png"
+       alt="ASPHER logo: through rough asperities, toward the star" width="180">
+</p>
+
 # ASPHER — Accelerated SPectral and HiERarchical contact solver
 
 *(pronounced "asper", as in **asper**ity — or as the Latin *asper*, "rough")*
