@@ -23,9 +23,27 @@ a mixed-precision Polonsky–Keer CG, with a Python interface.
 - **Contact solver**: Polonsky & Keer (Wear 231, 1999) projected CG with
   overlap correction and load normalisation.
 
-## Build
+## Install (pip)
 
-Requires Eigen 3.4, OpenMP, pybind11, CMake >= 3.18. On this machine the
+```bash
+pip install aspher            # once published on PyPI
+# or from a checkout / the sdist:
+pip install .
+```
+
+Building from source needs a C++17 compiler, CMake >= 3.18 and **FFTW3**
+(double + float, e.g. `apt install libfftw3-dev` or `conda install fftw`);
+Eigen is found on the system or fetched automatically. If the default
+compiler misbehaves (see the conda note below), override it with
+`CMAKE_ARGS="-DCMAKE_CXX_COMPILER=/usr/bin/g++" pip install .`.
+Wheels are built without `-march=native` (portable); local dev builds keep it.
+
+Licensed **GPL-3.0-or-later** (linking FFTW, which is GPL, requires a
+GPL-compatible license for distributed binaries).
+
+## Build (development)
+
+Requires Eigen 3.4, OpenMP, FFTW3, pybind11, CMake >= 3.18. On this machine the
 `fenicsx-env` conda env provides Eigen and Python, pybind11 comes from the
 `dolfinx-010` env, and the system `/usr/bin/g++` must be used (the conda gcc
 fails on `Python.h` + `<ctime>` interaction):
