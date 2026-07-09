@@ -1,14 +1,13 @@
 # ASPHER — Accelerated SPectral and HiERarchical contact solver
 
-*(pronounced "asper", as in **asper**ity — or as the Latin* asper*, "rough")*
+*(pronounced "asper", as in **asper**ity — or as the Latin *asper*, "rough")*
 
-> ***ad astra per ASPHERa*** — yes, the misspelling of *aspera* is entirely
-> deliberate: through roughness, to the stars.
+> ***ad astra per ASPHERa*** - through roughness, to the stars.
 
-+ **Author:** Claude Fable (foundation), Claude Opus 4.8
++ **Author:** Claude Fable (foundation), Claude Opus 4.8, chatGPT 5.5 (initial theory)
 + **Coordinator:** V.A. Yastrebov
 
-Formerly **Hcontact**. C++17 boundary-integral solver for frictionless normal
+C++17 boundary-integral solver for frictionless normal
 contact of an elastic half-space: exact Love/Boussinesq influence coefficients
 applied through hierarchical operators (H-matrix ACA and a matrix-free
 H²/bbFMM), a |q| spectral preconditioner (FFTW), nested-grid continuation and
