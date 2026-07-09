@@ -587,22 +587,26 @@ and a complex-to-real transform returns to the grid.  Relative to a full
 complex implementation this halves the FFT work and shrinks the scratch to
 $\approx 2N$ reals ($N_s^2$ reals $+\;n_h N_s$ complex).
 
-The transforms themselves run on \textbf{FFTW3} 2-D \texttt{r2c}/\texttt{c2r}
-plans (SIMD kernels, library-internal multithreading through the
-\texttt{fftw3\_omp}/\texttt{fftw3f\_omp} libraries, separate plans per
-precision).  FFTW's unnormalised round trip multiplies by $N_s^2$; this
-constant is folded into the stored symbol, so no separate scaling pass is
-needed.  Plans are created once per grid size and precision --- with
-\texttt{FFTW\_ESTIMATE} by default (instant planning; the environment
-variable \texttt{HMC\_FFTW\_MEASURE} opts into measured plans) --- and are
-bound to the object-owned scratch, which is reused across iterations
-(Section~\ref{sec:impl-alloc}); the mask scatter/gather passes remain
-OpenMP-parallel.  This replaced a hand-rolled composition of 1-D kissfft
-transforms (Eigen's \texttt{unsupported/FFT}); since kissfft has no SIMD
-kernels, the library swap gains a further $\approx 1.2\times$ end-to-end on
-a float nested solve at $N_s = 4096$ ($13.2 \to 10.9$\,s; $39.0 \to 37.5$\,s
-in double, where the two $\mathcal H^2$ matvecs dominate the iteration),
-with bit-identical iteration counts and contact areas.
+The transforms themselves run on one of two SIMD engines selected at build
+time.  The default is the bundled \textbf{pocketfft} (BSD-3-Clause,
+header-only; the engine behind NumPy's FFT): the 2-D transform is decomposed
+into a single-axis r2c/c2r along $x$ and an in-place complex pass along $y$,
+parallelised over slabs from inside one OpenMP region --- this deliberately
+avoids pocketfft's multi-axis c2r path (which copies the whole spectrum into
+an internal temporary) and its private \texttt{std::thread} pool (which
+contends with OpenMP's spin-waiting workers between the solver's parallel
+regions), and enables pocketfft's internal plan cache.  With
+\texttt{-DASPHER\_USE\_FFTW=ON} the engine is instead \textbf{FFTW3} 2-D
+\texttt{r2c}/\texttt{c2r} plans (separate plans per precision, created once
+and bound to the object-owned scratch; \texttt{FFTW\_ESTIMATE} by default,
+\texttt{HMC\_FFTW\_MEASURE} opts into measured plans, which do not pay for
+single solves).  Both engines run unnormalised, and the $N_s^2$ round-trip
+constant is folded into the stored symbol.  Both replaced a hand-rolled
+composition of 1-D kissfft transforms (Eigen's \texttt{unsupported/FFT},
+no SIMD kernels).  Measured on a rough nested solve at $N_s=4096$ (identical
+iteration counts and contact areas): FFTW $40.5$\,s double / $10.6$\,s
+float; pocketfft $47.2$\,s / $11.1$\,s ($+16\%$ / $+5\%$) --- the price of
+permissively licensed binaries, since FFTW is GPL.
 
 \subsection{Mixed precision and double accumulation of reductions}
 \label{sec:impl-precision}

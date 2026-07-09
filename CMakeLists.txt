@@ -40,19 +40,24 @@ if(NOT TARGET Eigen3::Eigen)
 endif()
 find_package(OpenMP)
 
-# FFTW3 (double + float) for the spectral preconditioner; the conda env
-# (fenicsx-env) ships headers and libs. The *_omp variants enable FFTW's
-# internal multithreading and are optional.
-find_path(FFTW3_INCLUDE_DIR fftw3.h)
-find_library(FFTW3_LIB fftw3)
-find_library(FFTW3F_LIB fftw3f)
-if(NOT FFTW3_INCLUDE_DIR OR NOT FFTW3_LIB OR NOT FFTW3F_LIB)
-  message(FATAL_ERROR "FFTW3 (double + float) is required: install it, e.g. "
-                      "'apt install libfftw3-dev' or 'conda install fftw', or "
-                      "point CMAKE_PREFIX_PATH at an FFTW installation.")
+# FFT engine for the spectral preconditioner. Default: the bundled pocketfft
+# (third_party/, BSD-3-Clause, header-only) — keeps binaries permissively
+# licensed. -DASPHER_USE_FFTW=ON switches to FFTW3 plans (slightly faster;
+# FFTW is GPL, so distributed binaries then carry GPL terms).
+option(ASPHER_USE_FFTW "Use FFTW3 (GPL) instead of bundled pocketfft (BSD)" OFF)
+if(ASPHER_USE_FFTW)
+  find_path(FFTW3_INCLUDE_DIR fftw3.h)
+  find_library(FFTW3_LIB fftw3)
+  find_library(FFTW3F_LIB fftw3f)
+  if(NOT FFTW3_INCLUDE_DIR OR NOT FFTW3_LIB OR NOT FFTW3F_LIB)
+    message(FATAL_ERROR "ASPHER_USE_FFTW=ON but FFTW3 (double + float) was "
+                        "not found: install it, e.g. 'apt install libfftw3-dev' "
+                        "or 'conda install fftw', or point CMAKE_PREFIX_PATH "
+                        "at an FFTW installation.")
+  endif()
+  find_library(FFTW3_OMP_LIB fftw3_omp)
+  find_library(FFTW3F_OMP_LIB fftw3f_omp)
 endif()
-find_library(FFTW3_OMP_LIB fftw3_omp)
-find_library(FFTW3F_OMP_LIB fftw3f_omp)
 
 add_library(aspher_core STATIC
   src/boussinesq_kernel.cpp
@@ -65,13 +70,20 @@ add_library(aspher_core STATIC
   src/fourier_precond.cpp
   src/nested_solve.cpp
 )
-target_include_directories(aspher_core PUBLIC include ${FFTW3_INCLUDE_DIR})
+target_include_directories(aspher_core PUBLIC include)
 target_link_libraries(aspher_core PUBLIC Eigen3::Eigen)
-if(FFTW3_OMP_LIB AND FFTW3F_OMP_LIB)
-  target_link_libraries(aspher_core PUBLIC ${FFTW3_OMP_LIB} ${FFTW3F_OMP_LIB})
-  target_compile_definitions(aspher_core PUBLIC HMC_FFTW_THREADS)
+if(ASPHER_USE_FFTW)
+  target_include_directories(aspher_core PUBLIC ${FFTW3_INCLUDE_DIR})
+  target_compile_definitions(aspher_core PUBLIC HMC_USE_FFTW)
+  if(FFTW3_OMP_LIB AND FFTW3F_OMP_LIB)
+    target_link_libraries(aspher_core PUBLIC ${FFTW3_OMP_LIB} ${FFTW3F_OMP_LIB})
+    target_compile_definitions(aspher_core PUBLIC HMC_FFTW_THREADS)
+  endif()
+  target_link_libraries(aspher_core PUBLIC ${FFTW3_LIB} ${FFTW3F_LIB})
+else()
+  target_include_directories(aspher_core SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/pocketfft)
 endif()
-target_link_libraries(aspher_core PUBLIC ${FFTW3_LIB} ${FFTW3F_LIB})
 target_compile_options(aspher_core PRIVATE -Wall -Wextra)
 set_target_properties(aspher_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(OpenMP_CXX_FOUND)

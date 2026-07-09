@@ -10,19 +10,27 @@
 C++17 boundary-integral solver for frictionless normal
 contact of an elastic half-space: exact Love/Boussinesq influence coefficients
 applied through hierarchical operators (H-matrix ACA and a matrix-free
-H²/bbFMM), a |q| spectral preconditioner (FFTW), nested-grid continuation and
+H²/bbFMM), a |q| spectral preconditioner, nested-grid continuation and
 a mixed-precision Polonsky–Keer CG, with a Python interface.
 
-- **Kernel**: Love (1929) closed-form integration of the Boussinesq solution
-  over square elements — exact for every entry, served from an O(N) lookup
-  table (translation invariance).
-- **H-matrix**: quad-tree cluster tree, Chebyshev admissibility
-  `min(diam) <= eta * dist`, partially pivoted ACA for admissible blocks,
-  dense leaves otherwise; OpenMP-parallel assembly and matvec.
-- **Contact solver**: Polonsky & Keer (Wear 231, 1999) projected CG with
-  overlap correction and load normalisation.
+The design combines an *exact* kernel with *fast, matrix-free* operators:
 
-## Install (pip)
+- **Kernel**: Love (1929) closed-form integration of the Boussinesq point
+  solution over square elements — exact for every influence coefficient,
+  served from an O(N) lookup table (translation invariance).
+- **Operator (default): matrix-free H²/FMM** — black-box fast multipole
+  method with Chebyshev interpolation (Fong & Darve 2009), all transfer and
+  coupling operators cached by translation invariance. **O(N) memory and
+  matvec**: 5.3 MiB at 512², ~13 B/DOF asymptotically; grids up to 16384²
+  (2.7×10⁸ DOFs) run on a 32 GiB workstation. A classical H-matrix (ACA)
+  backend and a dense backend are kept for validation and small grids.
+- **Solver**: Polonsky & Keer (1999) projected CG with overlap correction,
+  accelerated by a |q| spectral preconditioner (half-spectrum real FFT),
+  nested-grid (cascadic/FMG) continuation, warm starts, and an optional
+  single-precision mode with double-accumulated reductions — up to ~15×
+  faster than the cold double solve at equal contact-area accuracy.
+
+## Install
 
 ```bash
 pip install aspher            # once published on PyPI
@@ -30,128 +38,153 @@ pip install aspher            # once published on PyPI
 pip install .
 ```
 
-Building from source needs a C++17 compiler, CMake >= 3.18 and **FFTW3**
-(double + float, e.g. `apt install libfftw3-dev` or `conda install fftw`);
-Eigen is found on the system or fetched automatically. If the default
-compiler misbehaves (see the conda note below), override it with
+Building from source needs a C++17 compiler and CMake ≥ 3.18; Eigen is found
+on the system or fetched automatically, and the FFT engine (pocketfft) is
+bundled. If the default compiler misbehaves (see the conda note in
+CLAUDE.md), override it with
 `CMAKE_ARGS="-DCMAKE_CXX_COMPILER=/usr/bin/g++" pip install .`.
 Wheels are built without `-march=native` (portable); local dev builds keep it.
 
-**License**: the ASPHER source is **BSD-3-Clause**. Note that FFTW (a build
-dependency) is GPL: *binary* distributions that link or bundle FFTW — e.g.
-binary wheels — are governed by the GPL as a whole, while the sdist and the
-ASPHER code itself remain BSD. (A planned pocketfft-based backend would lift
-this constraint from the wheels.)
-
-## Build (development)
-
-Requires Eigen 3.4, OpenMP, FFTW3, pybind11, CMake >= 3.18. On this machine the
-`fenicsx-env` conda env provides Eigen and Python, pybind11 comes from the
-`dolfinx-010` env, and the system `/usr/bin/g++` must be used (the conda gcc
-fails on `Python.h` + `<ctime>` interaction):
+Development build (see `CLAUDE.md` for the environment specifics):
 
 ```bash
-conda activate fenicsx-env
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=/usr/bin/g++ \
-      -Dpybind11_DIR=$(conda run -n dolfinx-010 python -m pybind11 --cmakedir)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j && ctest --test-dir build
 ```
 
-The Python module `aspher*.so` is placed in `python/` (an
-`hmatrix_contact` import alias is kept for existing scripts).
+The Python module `aspher*.so` is placed in `python/` (an `hmatrix_contact`
+import alias is kept for existing scripts).
 
-## Usage
+## Quick start
 
 ```python
 import numpy as np, sys; sys.path.insert(0, "python")
-import aspher as hmc   # `import hmatrix_contact` still works (alias)
+import aspher as hc   # `import hmatrix_contact` still works (alias)
 
-solver = hmc.ContactSolver(grid_size=64, domain_size=1.0, E_star=1.0,
-                           eta=2.0, aca_tol=1e-6, leaf_size=32)
+# a rigid rough indenter pressed onto an elastic half-space: gap0 = -height
+Ns = 1024                       # power of two for the H2 operator
+gap = -surface.ravel()          # your (Ns, Ns) height field
 
-u = solver.matvec(np.ones(64 * 64))          # influence-matrix product
+# one-call nested-grid solve (coarse -> fine, preconditioned, warm-started)
+res = hc.solve_nested(grid_size=Ns, gap=gap, p_nominal=0.005,
+                      coarsest=64, q=6)
+print(res.contact_area, res.iterations, res.converged)
 
-result = solver.solve(gap=gap_array,          # (64, 64) or flat, >= 0,
-                      p_nominal=0.05,         # 0 at deepest indenter point
-                      tol=1e-8, max_iter=5000)
-result.pressure       # (64, 64), mean == p_nominal
-result.displacement   # (64, 64)
-result.gap            # (64, 64), >= 0, == 0 in contact
-result.contact_area   # fraction of elements in contact
-result.objective      # 1/2 p.u + p.g0
+# large grids: single precision + light result (~half the memory, ~3x faster)
+res = hc.solve_nested(grid_size=4096, gap=gap4k, p_nominal=0.005,
+                      single_precision=True, light_result=True)
 
-solver.hmatrix_info() # block counts, ranks, compression ratio
+# or the explicit operator interface (backend="h2" | "hmatrix" | "dense")
+solver = hc.ContactSolver(grid_size=Ns, backend="h2", q=6)
+res = solver.solve(gap, p_nominal=0.005, tol=1e-8, precond="fourier")
+res.pressure        # (Ns, Ns), mean == p_nominal
+res.contact_area    # Ac/A
 ```
 
-`ContactSolver(..., use_hmatrix=False)` assembles the dense matrix instead
-(useful for verification on small grids).
+`python example_rough_contact.py` runs an end-to-end rough-surface demo
+(self-affine surface → applied pressure → contact map).
 
-## Tests and benchmark
+## Performance highlights
 
-- `ctest --test-dir build` — kernel values vs analytics, H-matvec vs dense
-  (< 1e-5 at `aca_tol=1e-6`), H2-matvec vs dense (~3e-6 at `q=6`), Hertz
-  contact vs theory (a and p_max within 5%, actual ~1.6% / 0.2% on a 64-grid).
-- `python compare_tamaas.py` — rough-surface benchmark against Tamaas
-  (n=64, Hurst 0.8, seed 12345, p=0.05). The Tamaas reference runs
-  automatically in the `fluidpaper` env via `conda run`; cached in `data/`
-  (`--regen` to refresh). Result: contact fractions agree to 0.0005,
-  pressure fields to 3.3% L2.
-- `python bench_h2.py` — matrix-free **H2/FMM** backend vs the classical
-  H-matrix across grid sizes. At Ns=512 the H2 operator stores 5.3 MiB vs
-  6194 MiB (1169× less) and builds in 0.03 s vs 24 s, at ~7e-6 rel error.
-- `python bench_h2_memory.py [--plot]` — H2 memory scaling: O(N), ~13 B/DOF
-  asymptotically (51 MiB at Ns=2048 vs 128 TiB dense).
-- `python bench_h2_cputime.py` — CPU-time scaling of the rough-contact problem
-  from Ns=128 to 16384. Build and matvec are O(N); the 2.7e8-DOF operator
-  builds in 14 s, applies in 6 s, fits in 14 GiB (full solves listed to 1024).
-- `python experiments/bench_cpp_precond.py` — convergence acceleration:
-  `solve(precond="fourier")` and the single-entry nested-grid solve
-  `hc.solve_nested(grid_size, gap, p_nominal, ...)` vs the unpreconditioned
-  solver. At Ns=1024: 4× fewer iterations (180→45) and ~1.6× faster wall time,
-  identical solution (ΔArea 0, rel-L2 ~5e-7).
-- `hc.solve_nested(..., single_precision=True, light_result=True)` runs the
-  solve in `float` and drops the displacement/gap outputs, cutting the solver's
-  peak RAM by ~⅓ with the preconditioner on (Ns=4096: 2.31→1.57 GiB →
-  Ns=16384 ≈ 25 GiB, fits 32 GiB); solution matches the double solve to rel-L2
-  ~2e-5. Keep the preconditioner on (single precision needs it to converge; the
-  PCG has a stagnation guard so it stops at the float floor rather than spinning
-  to max_iter). At the largest grids the Python surface generation often
-  dominates memory — build it in float32 via broadcasting. See
-  `example_rough_contact.py` (Ns=16384). When `light_result=True`, the result's
-  `displacement`/`gap` are `None`.
-- `OMP_NUM_THREADS=1 python compare_tamaas_h2.py --max-n 512` — H2 vs Tamaas
-  dcfft FFT, accuracy and timing. Single-thread per-matvec is 0.78→0.69× the
-  FFT as Ns grows (O(N) vs O(N log N)); end-to-end solve ~1.5× faster;
-  pressure L2 ~3.3% (Tamaas near-field error).
-- `python example_rough_contact.py` — end-to-end rough-surface contact on the
-  H2 backend (self-affine surface → applied mean pressure → contact-area map),
-  writing `example_rough_contact.png`. Scales to Ns=1024 (N ≈ 10⁶, where a
-  dense matrix would need ≈ 8.8 TB): solves in ~50 s within ~0.2 GB RAM,
-  Ac/A ≈ 0.17.
+Measured on a 20-core workstation (fixed-band self-affine roughness):
 
-## Tamaas 2.8.1 findings (affect any "non-periodic" Tamaas comparison)
+| Quantity | Value |
+|---|---|
+| H² operator memory at Ns=2048 (4.2M DOFs) | 51 MiB (dense: 128 TiB) |
+| H² build / matvec at Ns=512 | 0.03 s / 9 ms (H-matrix: 24 s / 144 ms) |
+| Nested solve Ns=1024, double, tol 1e-8 | 1.2 s |
+| Nested solve Ns=4096, double, tol 1e-8 | ~40 s (50 it) |
+| Nested solve Ns=4096, float + light result | ~11 s (18 it, area matches double to 0.2%) |
+| Ns=16384 (2.7×10⁸ DOFs), float, 32 GiB node | ~25 GiB peak |
 
-Verified against Hertz theory while building the benchmark:
+## Tests and benchmarks
 
-1. `tm.PolonskyKeerRey` **ignores** `ModelFactory.registerNonPeriodic` unless
-   you also call `solver.setIntegralOperator("dcfft")` — otherwise it
-   silently solves the periodic problem (pressures bit-identical to a model
-   without the registration).
-2. The `dcfft` operator's effective modulus is **2 E²** instead of `E`:
-   Hertz with `E = 1` gives `p_max/p0 = 1.583 ≈ 2^(2/3)`; with
-   `E = 1/sqrt(2)` it matches theory to 0.1%. `tamaas_reference.py`
-   compensates accordingly.
-3. Its influence coefficients deviate from the exact Love values by
-   oscillating ±2–8% at 1–3 cell separations (Gibbs-like), which bounds the
-   achievable pressure-field agreement at roughly 3% L2 on a 64-grid rough
-   surface.
+- `ctest --test-dir build` — kernel vs analytics, H/H² matvec vs dense,
+  Hertz contact vs theory, preconditioner and mixed-precision consistency.
+- `python compare_tamaas.py` / `compare_tamaas_h2.py` — benchmark against
+  [Tamaas](https://gitlab.com/tamaas/tamaas): contact fractions agree to
+  0.0005, pressure fields to ~3.3% L2 — a bound set by Tamaas's dcfft
+  coefficients, not by ASPHER's operators; see
+  [doc/tamaas_findings.md](doc/tamaas_findings.md) for the three Tamaas
+  pitfalls anyone comparing against it should know.
+- `python bench_h2.py`, `bench_h2_memory.py`, `bench_h2_cputime.py` — H² vs
+  H-matrix and O(N) scaling sweeps up to Ns=16384.
+- `python experiments/bench_cpp_precond.py` — preconditioner + nested-grid
+  acceleration (e.g. 180→45 iterations at Ns=1024).
+
+## License
+
+The ASPHER source is **BSD-3-Clause** (see `LICENSE`).
+
+The spectral preconditioner's FFT runs, by default, on the bundled
+[pocketfft](https://github.com/mreineck/pocketfft) (BSD-3-Clause) — so the
+default build, including binary wheels, is permissively licensed throughout.
+Configuring with **`-DASPHER_USE_FFTW=ON`** switches to FFTW3 plans, which
+are slightly faster end-to-end (measured at Ns=4096: ~16% on a double
+solve, ~5% on a float solve, identical results) — but **FFTW is GPL**, so
+binaries built with that option are governed by the GPL as a whole. Choose
+per deployment:
+
+```bash
+CMAKE_ARGS="-DASPHER_USE_FFTW=ON" pip install .   # faster, GPL binaries
+pip install .                                      # default, all-BSD
+```
+
+## References
+
+The methods implemented here are described in:
+
+- J. Boussinesq, *Application des potentiels à l'étude de l'équilibre et du
+  mouvement des solides élastiques*, Gauthier-Villars, 1885 — half-space
+  point-load solution.
+- A.E.H. Love, "The stress produced in a semi-infinite solid by pressure on
+  part of the boundary", *Phil. Trans. R. Soc. A* 228 (1929) — exact element
+  integrals.
+- I.A. Polonsky, L.M. Keer, "A numerical method for solving rough contact
+  problems based on the multi-level multi-summation and conjugate gradient
+  techniques", *Wear* 231 (1999) 206–219 — the projected CG with overlap
+  correction.
+- W. Fong, E. Darve, "The black-box fast multipole method", *J. Comput.
+  Phys.* 228 (2009) 8712–8725 — the Chebyshev H²/FMM operator.
+- M. Bebendorf, *Hierarchical Matrices*, Springer, 2008; W. Hackbusch,
+  *Hierarchical Matrices: Algorithms and Analysis*, Springer, 2015 — the
+  H-matrix/ACA backend.
+- V.A. Yastrebov, G. Anciaux, J.-F. Molinari, "From infinitesimal to full
+  contact between rough surfaces: evolution of the contact area", *Int. J.
+  Solids Struct.* 52 (2015) 83–102 — rough-contact context and validation
+  methodology.
+- L. Frérot, G. Anciaux, V. Rey, S. Pham-Ba, J.-F. Molinari, "Tamaas: a
+  library for elastic-plastic contact of periodic rough surfaces", *J. Open
+  Source Softw.* 5(51) (2020) 2121 — the FFT-based solver used for
+  cross-validation.
+
+Solver theory (projected CG, spectral preconditioning, finite-precision
+implementation) is documented in `doc/theory/pcg.tex`; the H²/FMM operator in
+`doc/theory/h2_fmm_detailed.tex`.
+
+## Citing
+
+If ASPHER contributes to your research, please cite it (see also
+`CITATION.cff`, which GitHub renders as a "Cite this repository" button):
+
+```bibtex
+@software{aspher,
+  author  = {Yastrebov, Vladislav A. and {Claude (Anthropic)}},
+  title   = {{ASPHER}: Accelerated {SP}ectral and {H}i{ER}archical contact solver},
+  url     = {https://github.com/cofebem/aspher},
+  version = {0.1.0},
+  year    = {2026},
+}
+```
 
 ## Layout
 
 ```
-include/, src/      boussinesq_kernel, cluster_tree, hmatrix, contact_solver
-python/bindings.cpp pybind11 module `aspher` (.so lands here too; `hmatrix_contact` alias)
-tests/              C++ unit/integration tests (CTest) + tamaas_test.py
-compare_tamaas.py   benchmark vs Tamaas; tamaas_reference.py runs in fluidpaper
-doc/plans/          implementation plan
+include/, src/       kernel, cluster tree, H-matrix, H2/FMM operator,
+                     spectral preconditioner, nested solve, contact solver
+python/bindings.cpp  pybind11 module `aspher` (+ `hmatrix_contact` alias)
+third_party/         bundled pocketfft (BSD-3-Clause)
+tests/               C++ unit/integration tests (CTest) + tamaas_test.py
+doc/theory/          PCG and H2/FMM theory references (LaTeX)
+doc/tamaas_findings.md  Tamaas 2.8.1 pitfalls for non-periodic comparisons
 ```

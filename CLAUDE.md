@@ -44,12 +44,19 @@ breaking pybind11 header inclusion. System gcc 11.4 (`/usr/bin/g++`) works fine.
 **Why the explicit `pybind11_DIR`?**
 `fenicsx-env` has no pybind11. We borrow the cmake config from `dolfinx-010`.
 
-**FFTW3 is a build requirement (2026-07)**
-The spectral preconditioner uses FFTW's 2-D r2c/c2r plans. CMake finds
-`fftw3.h` + `libfftw3`/`libfftw3f` (REQUIRED) and the `*_omp` thread variants
-(optional, enable `HMC_FFTW_THREADS`) via `CMAKE_PREFIX_PATH` — `fenicsx-env`
-ships them, so the standard build command just works. `FFTW_ESTIMATE` plans by
-default; set `HMC_FFTW_MEASURE=1` at runtime to opt into measured plans.
+**FFT engine: bundled pocketfft by default, FFTW3 opt-in (2026-07)**
+The spectral preconditioner's transforms run on the vendored
+`third_party/pocketfft/pocketfft_hdronly.h` (BSD-3-Clause; keeps binaries
+all-BSD) — decomposed r2c/c2r + in-place c2c, parallelised over slabs inside
+one OpenMP region (pocketfft's own std::thread pool contends with OpenMP's
+spin-waiting workers, and its multi-axis c2r copies the whole spectrum —
+both deliberately avoided; `POCKETFFT_CACHE_SIZE` enabled).
+`-DASPHER_USE_FFTW=ON` switches to FFTW3 2-D plans (`HMC_USE_FFTW`): ~16%
+faster double / ~5% float end-to-end at Ns=4096, identical results, but FFTW
+is GPL so such binaries carry GPL terms. In FFTW mode CMake needs `fftw3.h`
++ `libfftw3`/`libfftw3f` (the `*_omp` variants enable `HMC_FFTW_THREADS`);
+`FFTW_ESTIMATE` plans by default, `HMC_FFTW_MEASURE=1` opts into measured
+plans (not worth it for single solves).
 
 ---
 
@@ -58,10 +65,9 @@ default; set `HMC_FFTW_MEASURE=1` at runtime to opt into measured plans.
 `pyproject.toml` + **scikit-build-core** build the pybind11 extension through
 the same CMakeLists (its `SKBUILD` branch: no tests, no `-march=native`,
 installs `aspher*.so` + the `hmatrix_contact.py` alias into the wheel root).
-FFTW3 must be present on the build machine (fatal CMake error otherwise);
-Eigen falls back to FetchContent. License: **BSD-3-Clause** for the source;
-binary wheels that bundle GPL FFTW are governed by GPL (README note) — the
-sdist is clean BSD.
+Default wheels are **all-BSD** (bundled pocketfft; no FFTW linkage); with
+`CMAKE_ARGS="-DASPHER_USE_FFTW=ON"` the binaries link GPL FFTW and carry GPL
+terms (README note). Eigen falls back to FetchContent.
 
 ```bash
 # local wheel (compiler override needed on this machine, see conda gcc note):
@@ -232,7 +238,7 @@ Default β formula: **Polak-Ribière+** (`use_pr=true`); Fletcher-Reeves availab
 - **Preallocated solve buffers (2026-07)**: the hot loop is allocation-free in steady state. `H2Operator` owns its multipole/local scratch (`Mbuf_`/`Lbuf_`, q²×nbox, lazily sized per precision — the old per-matvec `vector<VectorXd> M,L` was ~2·nbox small mallocs per apply) and exposes `matvec_into(x, y)`; `FourierPreconditioner` owns its grid/spectrum scratch and exposes `apply_into(g, contact, z)`; `solve_contact_impl` takes into-style functors (`MatVecIntoT`/`PrecondIntoT`) and reuses `u`/`r`/`z` across iterations (public `solve_contact` adapts the old by-value functors). One `H2Operator`/`FourierPreconditioner` must not be applied from two threads concurrently.
 - **mallopt in `solve_contact_nested`** (`M_MMAP_THRESHOLD`/`M_TRIM_THRESHOLD` = 128 KB): kept as a belt-and-braces guard, but with the preallocated buffers the per-iteration large-allocation traffic (and the mmap/munmap page-fault churn it caused) is gone from the steady-state loop.
 
-**Large-grid memory recipe** (memory-bound nodes, e.g. Ns=16384, N≈2.7×10⁸ on 32 GiB): `hc.solve_nested(Ns, gap, p_bar, coarsest=64, q=4, leaf_side=16, precond=True, single_precision=True, light_result=True)` → solve ≈ 100 B/DOF ≈ 27 GiB. On the Python side the surface generation (meshgrid + complex FFT temporaries) is often the real hog — build it in **float32 via broadcasting** (not `np.meshgrid`), `del` temporaries, and `ctypes.CDLL("libc.so.6").malloc_trim(0)` before the solve. See `example_rough_contact.py` (its `Ns==16384` branch). The FFT preconditioner (`fourier_precond.cpp`) runs (2026-07) on **FFTW3 2-D r2c/c2r plans** (SIMD kernels, FFTW-internal threading via `fftw3*_omp`): only the kx ∈ [0, Ns/2] half spectrum is stored, FFTW's Ns² round-trip scale is folded into the symbol, and the scratch (one real Ns×Ns + one complex (Ns/2+1)×Ns buffer, ≈2 N reals) plus the plans are object-owned and reused across iterations. The mask/scatter/gather passes stay OpenMP. **Run 16384 alone** — the killer is co-tenancy (any other heavy process OOMs it).
+**Large-grid memory recipe** (memory-bound nodes, e.g. Ns=16384, N≈2.7×10⁸ on 32 GiB): `hc.solve_nested(Ns, gap, p_bar, coarsest=64, q=4, leaf_side=16, precond=True, single_precision=True, light_result=True)` → solve ≈ 100 B/DOF ≈ 27 GiB. On the Python side the surface generation (meshgrid + complex FFT temporaries) is often the real hog — build it in **float32 via broadcasting** (not `np.meshgrid`), `del` temporaries, and `ctypes.CDLL("libc.so.6").malloc_trim(0)` before the solve. See `example_rough_contact.py` (its `Ns==16384` branch). The FFT preconditioner (`fourier_precond.cpp`) stores only the kx ∈ [0, Ns/2] half spectrum with the Ns² round-trip scale folded into the symbol; scratch (one real Ns×Ns + one complex (Ns/2+1)×Ns buffer, ≈2 N reals) is object-owned and reused across iterations, and the engine is pocketfft (default, BSD) or FFTW3 plans (`-DASPHER_USE_FFTW=ON`). The mask/scatter/gather passes stay OpenMP. **Run 16384 alone** — the killer is co-tenancy (any other heavy process OOMs it).
 - **Memory (measured, O(N) C++ solve):** `single_precision + light_result` cuts the solve by ~⅓ *with* the preconditioner on (Ns=4096: 2.31→1.57 GiB → Ns=16384 ≈ 25 GiB, fits a 32 GiB node); the float `|q|` FFT still has O(N) transients. Without the preconditioner the cut is ~½ (1.37→0.74) — but single precision **needs** the preconditioner to converge, so keep it on. At these sizes the Python **surface generation** (meshgrid + complex FFT temporaries) is often the real hog — build it in `float32` via broadcasting and free temporaries (see `example_rough_contact.py`).
 
 Key step: **overlap correction** `p_i -= τ·g_i` for nodes where p=0 and gap<0.
@@ -397,7 +403,7 @@ print(res.contact_area)                                   # Ac/A  (also contact.
 
 - **Larger grids (Ns > 512)**: ✅ largely solved by the `backend="h2"` operator — O(N) memory (5.3 MiB at Ns=512), so Ns=1024+ is now cheap. (H-matrix path still memory-bound; see below.)
 - **H2 follow-ups**: active-domain/masking sparsity (skip near/far work outside the contact zone via PCG active set); FFT backend for full-rectangle matvec (often simplest/fastest); rectangular grids (nx≠ny); leaf/q auto-tuning; PCG convergence + timing sweep of H2 at Ns≥1024.
-- ~~FFT preconditioner speed~~ ✅ done (2026-07): FFTW3 2-D r2c/c2r plans (SIMD + threaded), half-spectrum, object-owned scratch/plans. End-to-end at Ns=4096 rough solve: double 39.0→37.5 s, float 13.2→10.9 s (identical solutions). The FFT is now ~a small share of the iteration; the remaining big lever is the **FFT-convolution matvec backend** (`backend="fft"`, zero-padded exact-Love free-space convolution on the same FFTW plans) — est. 2–3× on the whole double iteration at Ns ≤ 8192, complementing (not replacing) H2 which stays the memory/geometry winner.
+- ~~FFT preconditioner speed~~ ✅ done (2026-07): half-spectrum transforms on pocketfft (default, BSD) or FFTW3 plans (opt-in, GPL; ~16%/~5% faster double/float end-to-end at Ns=4096), object-owned scratch/plans. The FFT is now a small share of the iteration; the remaining big lever is the **FFT-convolution matvec backend** (`backend="fft"`, zero-padded exact-Love free-space convolution on the same FFT engines) — est. 2–3× on the whole double iteration at Ns ≤ 8192, complementing (not replacing) H2 which stays the memory/geometry winner.
 - ~~Preallocate solve buffers~~ ✅ done (2026-07): `matvec_into`/`apply_into` + into-style functors in `solve_contact_impl`; the steady-state PCG loop makes no large allocations.
 - **Single-precision storage (H-matrix)**: Halves H-matrix (ACA) memory (replace `double` with `float` in HBlock.D/U/V). Not yet implemented. (The *H2* solve path already has a `single_precision` mode — see the PCG section.)
 - **ACA-GP improvement**: Current implementation gives only 5% rank reduction for the smooth Boussinesq kernel. The central-subset radius and random trial selection could be tuned further.
