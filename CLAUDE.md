@@ -53,6 +53,27 @@ default; set `HMC_FFTW_MEASURE=1` at runtime to opt into measured plans.
 
 ---
 
+## Packaging (PyPI)
+
+`pyproject.toml` + **scikit-build-core** build the pybind11 extension through
+the same CMakeLists (its `SKBUILD` branch: no tests, no `-march=native`,
+installs `aspher*.so` + the `hmatrix_contact.py` alias into the wheel root).
+FFTW3 must be present on the build machine (fatal CMake error otherwise);
+Eigen falls back to FetchContent. License **GPL-3.0-or-later** (FFTW is GPL).
+
+```bash
+# local wheel (compiler override needed on this machine, see conda gcc note):
+CMAKE_ARGS="-DCMAKE_CXX_COMPILER=/usr/bin/g++" python -m pip wheel . -w dist --no-deps
+```
+
+**PyPI upload caveat**: PyPI rejects plain `linux_x86_64` binary wheels — a
+locally built wheel is for local use only. Publish the **sdist**
+(`python -m build --sdist` → `twine upload dist/*.tar.gz`), and add
+manylinux wheels later via `cibuildwheel` (needs FFTW in the build image and
+`auditwheel repair` to vendor `libfftw3*.so` into the wheel).
+
+---
+
 ## Run Tests
 
 ```bash

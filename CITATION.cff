@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use ASPHER in your research, please cite it as below."
+title: "ASPHER: Accelerated SPectral and HiERarchical contact solver"
+abstract: >-
+  Boundary-element solver for frictionless normal contact of rough elastic
+  half-spaces: exact Love/Boussinesq influence coefficients applied through
+  hierarchical operators (H-matrix ACA and a matrix-free H2/bbFMM), an FFTW
+  |q| spectral preconditioner, nested-grid continuation and a mixed-precision
+  Polonsky-Keer projected conjugate gradient.
+authors:
+  - family-names: Yastrebov
+    given-names: Vladislav A.
+  - name: "Claude (Anthropic)"
+repository-code: "https://github.com/cofebem/aspher"
+license: GPL-3.0-or-later
+version: 0.1.0
+date-released: 2026-07-09
+keywords:
+  - contact mechanics
+  - rough surfaces
+  - boundary element method
+  - hierarchical matrices
+  - fast multipole method
+  - tribology
