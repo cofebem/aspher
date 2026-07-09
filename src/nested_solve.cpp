@@ -1,10 +1,12 @@
 #include "nested_solve.hpp"
 
 #include "boussinesq_kernel.hpp"
+#include "fft_operator.hpp"
 #include "fourier_precond.hpp"
 #include "h2_operator.hpp"
 
 #include <algorithm>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -67,6 +69,9 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
     if (levels.empty() || levels.back() != Ns)
         throw std::invalid_argument(
             "solve_contact_nested: Ns must equal coarsest * 2^k");
+    if (np.backend != "h2" && np.backend != "fft")
+        throw std::invalid_argument(
+            "solve_contact_nested: backend must be 'h2' or 'fft'");
 
     // restrict the fine gap down to every level
     std::vector<Eigen::VectorXd> gap(levels.size());
@@ -81,12 +86,23 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
     for (std::size_t li = 0; li < levels.size(); ++li) {
         const int n = levels[li];
         BoussinesqKernel kernel(n, L, E_star);
-        H2Operator op(kernel, H2Params{np.leaf_side, np.q, 1});
-        op.build();
-        MatVecIntoT<double> mv = [&op](const Eigen::VectorXd& v,
-                                       Eigen::VectorXd& out) {
-            op.matvec_into(v, out);
-        };
+        std::unique_ptr<H2Operator> h2;
+        std::unique_ptr<FFTOperator> fop;
+        MatVecIntoT<double> mv;
+        if (np.backend == "fft") {
+            fop = std::make_unique<FFTOperator>(kernel);
+            fop->build();
+            mv = [&fop](const Eigen::VectorXd& v, Eigen::VectorXd& out) {
+                fop->matvec_into(v, out);
+            };
+        } else {
+            h2 = std::make_unique<H2Operator>(kernel,
+                                              H2Params{np.leaf_side, np.q, 1});
+            h2->build();
+            mv = [&h2](const Eigen::VectorXd& v, Eigen::VectorXd& out) {
+                h2->matvec_into(v, out);
+            };
+        }
 
         FourierPreconditioner fp(n);
         PrecondIntoT<double> pc;
@@ -105,11 +121,18 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         const bool light = finest ? np.light_result : true;
 
         if (np.single_precision) {
-            op.build_single_caches();
-            MatVecIntoT<float> mvf = [&op](const Eigen::VectorXf& v,
-                                           Eigen::VectorXf& out) {
-                op.matvec_single_into(v, out);
-            };
+            MatVecIntoT<float> mvf;
+            if (fop) {
+                fop->build_single_caches();
+                mvf = [&fop](const Eigen::VectorXf& v, Eigen::VectorXf& out) {
+                    fop->matvec_single_into(v, out);
+                };
+            } else {
+                h2->build_single_caches();
+                mvf = [&h2](const Eigen::VectorXf& v, Eigen::VectorXf& out) {
+                    h2->matvec_single_into(v, out);
+                };
+            }
             PrecondIntoT<float> pcf;
             if (np.precond)
                 pcf = [&fp](const Eigen::VectorXf& g,

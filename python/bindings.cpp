@@ -6,6 +6,7 @@
 #include "boussinesq_kernel.hpp"
 #include "cluster_tree.hpp"
 #include "contact_solver.hpp"
+#include "fft_operator.hpp"
 #include "fourier_precond.hpp"
 #include "h2_operator.hpp"
 #include "hmatrix.hpp"
@@ -57,6 +58,9 @@ public:
             h2_ = std::make_unique<hmc::H2Operator>(
                 kernel_, hmc::H2Params{h2_leaf_side, q, near_radius});
             h2_->build();
+        } else if (backend_ == "fft") {
+            fft_ = std::make_unique<hmc::FFTOperator>(kernel_);
+            fft_->build();
         } else if (backend_ == "hmatrix") {
             tree_ = std::make_unique<hmc::ClusterTree>(grid_size, leaf_size);
             hmat_ = std::make_unique<hmc::HMatrix>(
@@ -66,12 +70,13 @@ public:
             dense_ = kernel_.assemble_dense();
         } else {
             throw std::invalid_argument("unknown backend: " + backend_ +
-                                        " (expected dense, hmatrix, or h2)");
+                                        " (expected dense, hmatrix, h2, or fft)");
         }
     }
 
     Eigen::VectorXd apply(const Eigen::VectorXd& p) const {
         if (backend_ == "h2") return h2_->matvec(p);
+        if (backend_ == "fft") return fft_->matvec(p);
         if (backend_ == "hmatrix") return hmat_->matvec(p);
         return dense_ * p;
     }
@@ -180,6 +185,19 @@ public:
                 double(s.bytes_total) / (8.0 * double(s.N) * double(s.N));
             return d;
         }
+        if (backend_ == "fft") {
+            fft_->print_statistics();
+            const auto s = fft_->info();
+            d["backend"] = "fft";
+            d["n"] = s.N;
+            d["padded_side"] = s.M;
+            d["bytes"] = s.bytes_total;
+            d["bytes_spectrum"] = static_cast<long long>(s.bytes_spectrum);
+            d["bytes_scratch"] = static_cast<long long>(s.bytes_scratch);
+            d["compression"] =
+                double(s.bytes_total) / (8.0 * double(s.N) * double(s.N));
+            return d;
+        }
         if (backend_ != "hmatrix") {
             d["dense"] = true;
             d["bytes"] = 8LL * kernel_.size() * kernel_.size();
@@ -205,6 +223,7 @@ private:
     std::unique_ptr<hmc::ClusterTree> tree_;
     std::unique_ptr<hmc::HMatrix> hmat_;
     std::unique_ptr<hmc::H2Operator> h2_;
+    std::unique_ptr<hmc::FFTOperator> fft_;
     Eigen::MatrixXd dense_;
 };
 
@@ -215,10 +234,11 @@ PyResult py_solve_nested(
     const py::array_t<double, py::array::c_style | py::array::forcecast>& gap,
     double p_nominal, double domain_size, double E_star, int coarsest, int q,
     int leaf_side, bool precond, double tol, double coarse_tol, int max_iter,
-    bool use_pr, bool single_precision, bool light_result) {
+    bool use_pr, bool single_precision, bool light_result,
+    const std::string& backend) {
     Eigen::VectorXd g0 = to_vector(gap, grid_size * grid_size);
     hmc::NestedParams np{coarsest, q, leaf_side, precond, coarse_tol,
-                         single_precision, light_result};
+                         single_precision, light_result, backend};
     PyResult out;
     out.Ns = grid_size;
     {
@@ -307,8 +327,10 @@ PYBIND11_MODULE(aspher, m) {
           py::arg("tol") = 1e-8, py::arg("coarse_tol") = 1e-4,
           py::arg("max_iter") = 20000, py::arg("use_pr") = true,
           py::arg("single_precision") = false, py::arg("light_result") = false,
+          py::arg("backend") = "h2",
           "Single-entry nested-grid (cascadic/FMG) contact solve: builds the "
           "coarse->fine hierarchy and H2 operators internally and warm-starts "
           "each level with the prolonged coarse pressure. grid_size must equal "
-          "coarsest * 2^k. Returns a ContactResult.");
+          "coarsest * 2^k. Returns a ContactResult. backend='h2' (O(N) memory) "
+          "or 'fft' (exact convolution, fastest at Ns<=8192).");
 }

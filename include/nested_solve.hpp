@@ -4,6 +4,8 @@
 
 #include <Eigen/Dense>
 
+#include <string>
+
 namespace hmc {
 
 struct NestedParams {
@@ -14,6 +16,7 @@ struct NestedParams {
     double coarse_tol = 1e-4; // cascadic: looser tolerance on coarse levels
     bool single_precision = false; // run each level's solve in float (~half RAM)
     bool light_result = false;     // skip displacement/gap in the result (~2 N arrays)
+    std::string backend = "h2";    // per-level operator: "h2" or "fft"
 };
 
 // Single-entry nested-grid (cascadic / full-multigrid) contact solve. Builds
