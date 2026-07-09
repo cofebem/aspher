@@ -578,28 +578,31 @@ algorithm reduces to Algorithm~\ref{alg:pk} exactly.
 
 The masked residual $\Pi_\calC\tilde\bg$ is real, so the two-dimensional
 transform in~\eqref{eq:precond-apply} is executed in real-to-complex
-(half-spectrum) form rather than as four full complex passes:
-\begin{enumerate}
-  \item \textbf{r2c along $x$}: one real 1-D FFT per grid line yields the
-        modes $k_x \in \{0, \ldots, N_s/2\}$, i.e.\ $n_h = N_s/2 + 1$ complex
-        columns instead of $N_s$ (the remaining modes are determined by
-        Hermitian symmetry).
-  \item \textbf{Fused pass along $y$}: for each stored $k_x$ the code gathers
-        the strided line, performs the forward complex FFT, multiplies by the
-        real, even symbol $|\mathbf k|$, and immediately performs the inverse
-        FFT --- forward transform, symbol, and inverse transform in a single
-        sweep over each line, so the half-spectrum panel is traversed once.
-  \item \textbf{c2r along $x$} back to the real field.
-\end{enumerate}
-Because the symbol is real and even, multiplying only the stored half-spectrum
-is consistent with the omitted conjugate half.  Relative to the previous
-implementation (full complex $N_s \times N_s$ transforms in both directions)
-this halves the FFT work and shrinks the scratch from $\approx 4N$ reals
-(real input, full complex spectrum, real output) to $\approx 2N$
-($N_s^2$ reals $+\;n_h N_s$ complex).  All scratch is owned by the
-\texttt{FourierPreconditioner} object and reused across iterations
-(Section~\ref{sec:impl-alloc}).  All passes are OpenMP-parallel with
-per-thread FFT plans.
+(half-spectrum) form rather than as full complex passes: the forward
+transform stores only the modes $k_x \in \{0, \ldots, N_s/2\}$, i.e.\ an
+$n_h \times N_s$ complex panel with $n_h = N_s/2 + 1$ (the remaining modes
+are determined by Hermitian symmetry), the real, even symbol $|\mathbf k|$
+is applied on that panel --- consistent with the omitted conjugate half ---
+and a complex-to-real transform returns to the grid.  Relative to a full
+complex implementation this halves the FFT work and shrinks the scratch to
+$\approx 2N$ reals ($N_s^2$ reals $+\;n_h N_s$ complex).
+
+The transforms themselves run on \textbf{FFTW3} 2-D \texttt{r2c}/\texttt{c2r}
+plans (SIMD kernels, library-internal multithreading through the
+\texttt{fftw3\_omp}/\texttt{fftw3f\_omp} libraries, separate plans per
+precision).  FFTW's unnormalised round trip multiplies by $N_s^2$; this
+constant is folded into the stored symbol, so no separate scaling pass is
+needed.  Plans are created once per grid size and precision --- with
+\texttt{FFTW\_ESTIMATE} by default (instant planning; the environment
+variable \texttt{HMC\_FFTW\_MEASURE} opts into measured plans) --- and are
+bound to the object-owned scratch, which is reused across iterations
+(Section~\ref{sec:impl-alloc}); the mask scatter/gather passes remain
+OpenMP-parallel.  This replaced a hand-rolled composition of 1-D kissfft
+transforms (Eigen's \texttt{unsupported/FFT}); since kissfft has no SIMD
+kernels, the library swap gains a further $\approx 1.2\times$ end-to-end on
+a float nested solve at $N_s = 4096$ ($13.2 \to 10.9$\,s; $39.0 \to 37.5$\,s
+in double, where the two $\mathcal H^2$ matvecs dominate the iteration),
+with bit-identical iteration counts and contact areas.
 
 \subsection{Mixed precision and double accumulation of reductions}
 \label{sec:impl-precision}

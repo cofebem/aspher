@@ -1401,21 +1401,23 @@ final contact-mean removal is the discrete analogue of the $\mathbf q=0$ zeroing
 on the \emph{reduced} space.
 
 Since the July 2026 implementation pass the transform exploits that the masked
-residual is \emph{real}: the $x$-direction runs as real-to-complex /
-complex-to-real 1-D FFTs, storing only the $n_h=N_s/2+1$ non-redundant $k_x$
-modes (the rest follow from Hermitian symmetry), and each stored $k_x$ line is
-processed in one fused sweep along $y$ --- forward complex FFT, multiplication
-by the real, even symbol $\abs{\mathbf k}$, inverse FFT --- before the
-complex-to-real pass returns to the grid. This halves the FFT work and shrinks
-the transform scratch from ${\approx}4N$ to ${\approx}2N$ reals ($N_s^2$ real
-$+\;n_hN_s$ complex). The scratch is owned by the \code{FourierPreconditioner}
-object and reused across CG iterations, and \code{apply\_into} writes into a
-caller-owned output buffer, so a preconditioner application performs no heap
-allocation in steady state; all passes are OpenMP-parallel with per-thread FFT
-plans. The finite-precision aspects (double accumulation of the reductions,
-the cancellation-safe line-search denominator) are documented in the companion
-reference \code{doc/theory/pcg.tex}, \S``Spectral Preconditioning and
-Finite-Precision Implementation''.
+residual is \emph{real}: it runs as \textbf{FFTW3} 2-D real-to-complex /
+complex-to-real plans, storing only the $n_h=N_s/2+1$ non-redundant $k_x$
+modes (the rest follow from Hermitian symmetry); the real, even symbol
+$\abs{\mathbf k}$ is applied on the half-spectrum panel, with FFTW's
+unnormalised $N_s^2$ round-trip factor folded into the stored symbol. This
+halves the FFT work relative to full complex transforms and keeps the
+transform scratch at ${\approx}2N$ reals ($N_s^2$ real $+\;n_hN_s$ complex).
+The plans (per precision, \code{FFTW\_ESTIMATE} by default; measured planning
+via \code{HMC\_FFTW\_MEASURE} does not pay for single solves) and the scratch
+are owned by the \code{FourierPreconditioner} object and reused across CG
+iterations, and \code{apply\_into} writes into a caller-owned output buffer,
+so a preconditioner application performs no heap allocation in steady state;
+the mask scatter/gather passes are OpenMP-parallel and the transforms use
+FFTW's internal threading. The finite-precision aspects (double accumulation
+of the reductions, the cancellation-safe line-search denominator) are
+documented in the companion reference \code{doc/theory/pcg.tex},
+\S``Spectral Preconditioning and Finite-Precision Implementation''.
 
 \begin{remark}[Why masking is only an approximate diagonaliser]
 \label{rem:mask}
