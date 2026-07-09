@@ -49,6 +49,17 @@ def test_solve_nested():
         assert relL2_sp < 1e-3, relL2_sp
         assert sp.displacement is None  # light_result: displacement not stored
 
+        # opt-in convergence history: off by default, populated on request
+        assert nest.error_history.size == 0
+        hist = hc.solve_nested(grid_size=Ns, gap=g0, p_nominal=P_BAR,
+                               coarsest=64, q=6, tol=1e-8,
+                               record_error_history=True)
+        assert hist.error_history.size > 0
+        assert abs(float(hist.error_history[-1]) - hist.error) < 1e-9, (
+            hist.error_history[-1], hist.error)
+        print(f"Ns={Ns}: error_history has {hist.error_history.size} entries, "
+              f"last={hist.error_history[-1]:.3e}")
+
 
 if __name__ == "__main__":
     test_solve_nested()

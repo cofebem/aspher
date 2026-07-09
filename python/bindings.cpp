@@ -235,10 +235,11 @@ PyResult py_solve_nested(
     double p_nominal, double domain_size, double E_star, int coarsest, int q,
     int leaf_side, bool precond, double tol, double coarse_tol, int max_iter,
     bool use_pr, bool single_precision, bool light_result,
-    const std::string& backend) {
+    const std::string& backend, bool record_error_history) {
     Eigen::VectorXd g0 = to_vector(gap, grid_size * grid_size);
     hmc::NestedParams np{coarsest, q, leaf_side, precond, coarse_tol,
-                         single_precision, light_result, backend};
+                         single_precision, light_result, backend,
+                         record_error_history};
     PyResult out;
     out.Ns = grid_size;
     {
@@ -281,6 +282,12 @@ PYBIND11_MODULE(aspher, m) {
         .def_property_readonly("iterations",
                                [](const PyResult& s) { return s.r.iterations; })
         .def_property_readonly("error", [](const PyResult& s) { return s.r.error; })
+        .def_property_readonly(
+            "error_history",
+            [](const PyResult& s) {
+                return py::array_t<double>(s.r.error_history.size(),
+                                           s.r.error_history.data());
+            })
         .def_property_readonly("converged",
                                [](const PyResult& s) { return s.r.converged; })
         .def("__repr__", [](const PyResult& s) {
@@ -327,10 +334,12 @@ PYBIND11_MODULE(aspher, m) {
           py::arg("tol") = 1e-8, py::arg("coarse_tol") = 1e-4,
           py::arg("max_iter") = 20000, py::arg("use_pr") = true,
           py::arg("single_precision") = false, py::arg("light_result") = false,
-          py::arg("backend") = "h2",
+          py::arg("backend") = "h2", py::arg("record_error_history") = false,
           "Single-entry nested-grid (cascadic/FMG) contact solve: builds the "
           "coarse->fine hierarchy and H2 operators internally and warm-starts "
           "each level with the prolonged coarse pressure. grid_size must equal "
           "coarsest * 2^k. Returns a ContactResult. backend='h2' (O(N) memory) "
-          "or 'fft' (exact convolution, fastest at Ns<=8192).");
+          "or 'fft' (exact convolution, fastest at Ns<=8192). "
+          "record_error_history=True fills .error_history with the finest "
+          "level's per-iteration complementarity error (off by default).");
 }
