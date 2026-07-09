@@ -259,8 +259,6 @@ public:
         inv_ = FFTW<S>::plan_c2r(n_, c_, g_);
 #endif
     }
-    bool bound() const { return n_ > 0; }
-
     void fwd() { // g -> c; lines [ny_, n_) of g treated as zero (not read)
 #ifdef HMC_USE_FFTW
         if (ny_ < n_) { // full 2-D plan reads everything: zero inactive lines

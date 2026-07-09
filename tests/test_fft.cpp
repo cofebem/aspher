@@ -39,8 +39,10 @@ static int test_matvec_exact() {
 }
 
 // matvec_into must reuse the object-owned scratch across calls and give the
-// same answer on the second call (stale-padding guard: the previous inverse
-// transform wrote the whole padded grid).
+// same answer on the second call. Guards the pruned-transform contract: with
+// the ny_active hint, inv() only writes lines [0, Ns) of the padded scratch,
+// so lines [Ns, M) stay stale/uninitialized by design between calls — a
+// repeat matvec must still reproduce the exact prior result.
 static int test_repeat_calls() {
     const int Ns = 32;
     hmc::BoussinesqKernel k(Ns, 1.0, 1.0);

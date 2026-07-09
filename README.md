@@ -149,7 +149,8 @@ PCG paths to the same solution).
 
 The ASPHER source is **BSD-3-Clause** (see `LICENSE`).
 
-The spectral preconditioner's FFT runs, by default, on the bundled
+The FFT transforms — the spectral preconditioner and the `backend="fft"`
+operator — run, by default, on the bundled
 [pocketfft](https://github.com/mreineck/pocketfft) (BSD-3-Clause) — so the
 default build, including binary wheels, is permissively licensed throughout.
 Configuring with **`-DASPHER_USE_FFTW=ON`** switches to FFTW3 plans, which

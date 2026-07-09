@@ -70,6 +70,9 @@ void FFTOperator::build() {
 
 void FFTOperator::build_single_caches() const {
     if (have_single_) return;
+    if (Kh_.size() == 0)
+        throw std::logic_error(
+            "FFTOperator::build_single_caches: build() not called");
     Kh_f_ = Kh_.cast<float>();
     have_single_ = true;
 }
