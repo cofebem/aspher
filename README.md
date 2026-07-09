@@ -27,8 +27,12 @@ The design combines an *exact* kernel with *fast, matrix-free* operators:
   method with Chebyshev interpolation (Fong & Darve 2009), all transfer and
   coupling operators cached by translation invariance. **O(N) memory and
   matvec**: 5.3 MiB at 512², ~13 B/DOF asymptotically; grids up to 16384²
-  (2.7×10⁸ DOFs) run on a 32 GiB workstation. A classical H-matrix (ACA)
-  backend and a dense backend are kept for validation and small grids.
+  (2.7×10⁸ DOFs) run on a 32 GiB workstation. An **exact FFT-convolution
+  operator** (`backend="fft"`, zero-padded Love-kernel convolution) equals
+  the dense matvec to roundoff (~10⁻¹⁵ rel L2) and is modestly faster than
+  H² at Ns ≤ 2048 (~1.5×), ≈parity at Ns=4096; H² remains preferred for
+  very large Ns. A classical H-matrix (ACA) backend and a dense backend
+  are kept for validation and small grids.
 - **Solver**: Polonsky & Keer (1999) projected CG with overlap correction,
   accelerated by a |q| spectral preconditioner (half-spectrum real FFT),
   nested-grid (cascadic/FMG) continuation, warm starts, and an optional
@@ -93,7 +97,7 @@ print(res.contact_area, res.iterations, res.converged)
 res = hc.solve_nested(grid_size=4096, gap=gap4k, p_nominal=0.005,
                       single_precision=True, light_result=True)
 
-# or the explicit operator interface (backend="h2" | "hmatrix" | "dense")
+# or the explicit operator interface (backend="h2" | "fft" | "hmatrix" | "dense")
 solver = hc.ContactSolver(grid_size=Ns, backend="h2", q=6)
 res = solver.solve(gap, p_nominal=0.005, tol=1e-8, precond="fourier")
 res.pressure        # (Ns, Ns), mean == p_nominal
@@ -115,6 +119,14 @@ Measured on a 20-core workstation (fixed-band self-affine roughness):
 | Nested solve Ns=4096, double, tol 1e-8 | ~40 s (50 it) |
 | Nested solve Ns=4096, float + light result | ~11 s (18 it, area matches double to 0.2%) |
 | Ns=16384 (2.7×10⁸ DOFs), float, 32 GiB node | ~25 GiB peak |
+| FFT matvec vs dense (rel L2, double / float) | ~1×10⁻¹⁵ / ~1.4×10⁻⁷ (exact operator) |
+| Matvec fft vs H² (q=6), Ns=1024 / 2048 / 4096 | 17 / 73 / 337 ms vs 27 / 110 / 331 ms (1.60× / 1.50× / 0.98×)* |
+| Nested solve Ns=4096, p̄=0.002, fft vs h2, double | 251 s (110 it) vs 177 s (91 it), areas agree to ~10⁻⁶* |
+| Nested solve Ns=4096, p̄=0.002, fft vs h2, float | 62 s (53 it) vs 51 s (52 it)* |
+
+\* `bench_fft.py`, measured under desktop co-tenancy; ratios more reliable
+than absolutes. The fft/h2 nested iteration counts differ (both are valid
+PCG paths to the same solution).
 
 ## Tests and benchmarks
 
@@ -128,6 +140,8 @@ Measured on a 20-core workstation (fixed-band self-affine roughness):
   pitfalls anyone comparing against it should know.
 - `python bench_h2.py`, `bench_h2_memory.py`, `bench_h2_cputime.py` — H² vs
   H-matrix and O(N) scaling sweeps up to Ns=16384.
+- `python bench_fft.py` — FFT-convolution backend vs H²: matvec sweep
+  (min-of-30) plus the four Ns=4096 nested solves (fft/h2 × double/float).
 - `python experiments/bench_cpp_precond.py` — preconditioner + nested-grid
   acceleration (e.g. 180→45 iterations at Ns=1024).
 

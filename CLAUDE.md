@@ -136,6 +136,7 @@ Delete cache files to force recomputation.
 │   ├── cheb_basis.hpp          # Chebyshev nodes + interpolation weights (bbFMM)
 │   ├── uniform_quadtree.hpp    # uniform box tree, neighbors, interaction lists
 │   ├── h2_operator.hpp         # matrix-free H2/FMM operator, H2Params, H2Info; matvec_into + persistent M/L scratch
+│   ├── fft_operator.hpp        # exact zero-padded Love-kernel FFT convolution (backend="fft")
 │   ├── fourier_precond.hpp     # |q| spectral preconditioner (half-spectrum r2c FFT, persistent scratch, apply_into)
 │   ├── nested_solve.hpp        # single-entry cascadic/FMG nested-grid solve
 │   └── contact_solver.hpp      # Polonsky-Keer PCG, ContactResult, MatVec(IntoT), Precond(IntoT)
@@ -146,6 +147,8 @@ Delete cache files to force recomputation.
 │   ├── cheb_basis.cpp
 │   ├── uniform_quadtree.cpp
 │   ├── h2_operator.cpp         # P2M/M2M/M2L/L2L/L2P + near field; cached operators
+│   ├── fft_engine.hpp          # shared square r2c/c2r engine (pocketfft/FFTW dispatch)
+│   ├── fft_operator.cpp        # kernel-spectrum build + scatter/FFT/multiply/gather matvec
 │   ├── fourier_precond.cpp
 │   ├── nested_solve.cpp        # builds per-level kernels/H2/precond, restrict+inject
 │   └── contact_solver.cpp      # PCG with optional preconditioner + warm start; OpenMP O(N) passes, double-accumulated reductions
@@ -157,12 +160,14 @@ Delete cache files to force recomputation.
 │   ├── test_kernel.cpp         # self-term, symmetry, far-field, positivity
 │   ├── test_hmatrix.cpp        # cluster tree validity, ACA accuracy, compression
 │   ├── test_contact.cpp        # Hertz: a_num/a=1.016, p_max/p0=0.998
+│   ├── test_fft.cpp            # FFT operator vs dense (roundoff), Hertz parity
 │   └── tamaas_test.py          # manual tamaas sanity check (fluidpaper env)
 ├── tamaas_reference.py         # runs in fluidpaper; saves data/ files
 ├── compare_tamaas.py           # runs in fenicsx-env; asserts L2 diff < 5%
 ├── visualize_hmatrix.py        # saves fig_hmatrix_blocks.pdf (blue=low-rank, red=dense)
 ├── leaf_size_bench.py          # sweep leaf sizes 8–128 for Ns=64/128
 ├── bench_pr.py                 # FR vs PR+ benchmark at Ns=64–512
+├── bench_fft.py                # fft vs h2: matvec sweep + Ns=4096 nested solves
 ├── data/
 │   ├── surface.npy             # self-affine surface (Ns=64, H=0.8, seed 12345)
 │   ├── tamaas_pressure.npy
@@ -224,6 +229,9 @@ Matrix-free black-box FMM (Chebyshev interpolation, Fong & Darve 2009). **No blo
 - **Accuracy**: rel L2 vs dense ≈ 1.3e-4 (q=4), 3e-6 (q=6); converges with q. Plugs into the same PCG (`MatVec` functor) — reproduces Hertz area/pressure exactly.
 - **Bench**: `bench_h2.py` (H2 vs H-matrix). At Ns=512: 5.3 MiB vs 6194 MiB (1169× less), build 0.03s vs 24s, matvec 8.9ms vs 144ms.
 - Spec/plan: `doc/specs/2026-06-27-h2-fmm-operator-design.md`, `doc/plans/2026-06-27-h2-fmm-operator.md`.
+
+### FFT-convolution operator (`backend="fft"`) — exact, O(N log N)
+Exact zero-padded (Hockney) circular convolution of the pressure with the Love element table on a (2Ns)² grid (`fft_operator.hpp/.cpp`, shared square r2c/c2r engine in `src/fft_engine.hpp` — pocketfft default, FFTW3 under `-DASPHER_USE_FFTW=ON`). **Matches the dense matvec to roundoff** (rel L2 ~1e-15 double, ~1.4e-7 float; no interpolation, no Gibbs — that exactness is its main value), unlike H2's ~1e-4 (q=4) interpolation error. ~10 N reals double scratch (kernel half-spectrum 2N + padded grid 4N + complex half-spectrum work 4N), object-owned and reused; single-precision caches via `build_single_caches`/`matvec_single_into` (same contract as H2). The padded transforms skip structurally-zero forward lines and unread inverse lines (2026-07 perf commit). **Measured performance** (bench_fft.py, 20-core, desktop co-tenancy — ratios more reliable than absolutes): matvec modestly faster than H2 (q=6) at Ns ≤ 2048 (1.6×/1.5× at 1024/2048), ≈parity at Ns=4096 (337 vs 331 ms) — the padded transforms are bandwidth-bound, not flop-bound, so the spec's 2–3× estimate did not materialise. H2 remains preferred for very large Ns (O(N) vs O(N log N), ~5× smaller working set). Available as `ContactSolver(backend="fft")` and `hc.solve_nested(..., backend="fft")`. Spec: `doc/specs/2026-07-09-fft-convolution-backend-design.md`.
 
 ### Polonsky–Keer (1999) PCG
 Projected CG for the QP `min ½p'Sp + p'g₀  s.t. p≥0, mean(p)=p_bar`.
@@ -312,6 +320,10 @@ Fix: use plain `\begin{enumerate}` and `\begin{itemize}` without optional argume
 | Nested solve Ns=1024 double, rough p̄=0.005 (2026-07 perf pass) | 2.59 → 1.23 s (21 it, identical pressure to 9×10⁻¹⁵) |
 | Nested solve Ns=2048 float, rough p̄=0.005 (2026-07 perf pass) | 52.5 s / 214 it → 3.4 s / 21 it (area now matches double to 3×10⁻⁴ rel) |
 | f32 solve Ns=4096 (precond, light, 2026-07) | 16.3 s, 26 it, peak RSS 1.73 GiB (incl. Python surface) |
+| FFT matvec vs dense (rel L2, double/float) | ~1×10⁻¹⁵ / ~1.4×10⁻⁷ (exact operator; test_fft) |
+| FFT matvec time Ns=1024/2048/4096 (vs H2 q=6; bench_fft.py) | 17/73/337 ms vs 27/110/331 ms → 1.60×/1.50×/0.98× (measured under desktop co-tenancy; ratios more reliable than absolutes) |
+| Nested solve Ns=4096 fft vs h2, double (p̄=0.002, seed 42) | 251 s/110 it vs 177 s/91 it, areas 0.005402 vs 0.005403 (different but both-valid PCG paths, agree to ~10⁻⁶ absolute; wall gap mostly the extra iterations at ~parity matvec) |
+| Nested solve Ns=4096 fft vs h2, float (same case) | 62 s/53 it vs 51 s/52 it, area 0.005406 both |
 
 ---
 
@@ -333,7 +345,7 @@ solver = hc.ContactSolver(
     use_hmatrix=True,   # False → dense (for testing)
     use_acagp=False,    # True → ACA-GP geometric pivot (5% lower rank, 2× slower)
     central_fraction=0.3, # ACA-GP central subset radius fraction
-    backend="",         # ""→hmatrix (or dense if use_hmatrix=False); "hmatrix"|"dense"|"h2"
+    backend="",         # ""→hmatrix (or dense if use_hmatrix=False); "hmatrix"|"dense"|"h2"|"fft"
     q=4,                # H2 only: Chebyshev order (r=q²); q=6 for ~3e-6 accuracy
     near_radius=1,      # H2 only: direct near field within this many leaf boxes
     h2_leaf_side=8,     # H2 only: square leaf side (power of two)
@@ -403,7 +415,9 @@ print(res.contact_area)                                   # Ac/A  (also contact.
 
 - **Larger grids (Ns > 512)**: ✅ largely solved by the `backend="h2"` operator — O(N) memory (5.3 MiB at Ns=512), so Ns=1024+ is now cheap. (H-matrix path still memory-bound; see below.)
 - **H2 follow-ups**: active-domain/masking sparsity (skip near/far work outside the contact zone via PCG active set); FFT backend for full-rectangle matvec (often simplest/fastest); rectangular grids (nx≠ny); leaf/q auto-tuning; PCG convergence + timing sweep of H2 at Ns≥1024.
-- ~~FFT preconditioner speed~~ ✅ done (2026-07): half-spectrum transforms on pocketfft (default, BSD) or FFTW3 plans (opt-in, GPL; ~16%/~5% faster double/float end-to-end at Ns=4096), object-owned scratch/plans. The FFT is now a small share of the iteration; the remaining big lever is the **FFT-convolution matvec backend** (`backend="fft"`) — full design agreed and written up in `doc/specs/2026-07-09-fft-convolution-backend-design.md` (exact zero-padded Love-kernel convolution, no Gibbs by construction, est. 2–3× per double iteration at Ns ≤ 8192, complements H2). **This is the next implementation task.**
+- ~~FFT preconditioner speed~~ ✅ done (2026-07): half-spectrum transforms on pocketfft (default, BSD) or FFTW3 plans (opt-in, GPL; ~16%/~5% faster double/float end-to-end at Ns=4096), object-owned scratch/plans. The FFT is now a small share of the iteration.
+- ~~FFT-convolution matvec backend (`backend="fft"`)~~ ✅ done (2026-07): exact zero-padded Love-kernel convolution per `doc/specs/2026-07-09-fft-convolution-backend-design.md`, plumbed into `ContactSolver` and `solve_nested`. **Measured outcome**: exactness is the headline (matches dense to ~1e-15 double / ~1.4e-7 float — no interpolation, no Gibbs); performance is modestly better than H2 at Ns ≤ 2048 (~1.5–1.6× matvec), ≈parity at Ns=4096 (measured under desktop load) — the padded transforms are bandwidth-bound, so the spec's flop-count 2–3× estimate did not materialise; H2 remains preferred for very large Ns.
+- **FFTW-engine pruned transforms (many-plan decomposition)** — the pocketfft path skips structurally-zero forward lines and unread inverse lines in the operator's padded transforms; the FFTW path still runs full 2-D plans there.
 - ~~Preallocate solve buffers~~ ✅ done (2026-07): `matvec_into`/`apply_into` + into-style functors in `solve_contact_impl`; the steady-state PCG loop makes no large allocations.
 - **Single-precision storage (H-matrix)**: Halves H-matrix (ACA) memory (replace `double` with `float` in HBlock.D/U/V). Not yet implemented. (The *H2* solve path already has a `single_precision` mode — see the PCG section.)
 - **ACA-GP improvement**: Current implementation gives only 5% rank reduction for the smooth Boussinesq kernel. The central-subset radius and random trial selection could be tuned further.
