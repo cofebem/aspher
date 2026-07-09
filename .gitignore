@@ -18,7 +18,7 @@ __pycache__/
 !doc/slides/figures/*.pdf
 
 # local figures
-./*.png
+/*.png
 
 # generated example / benchmark output
 example_rough_contact.png
