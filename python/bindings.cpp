@@ -235,7 +235,8 @@ PyResult py_solve_nested(
     double p_nominal, double domain_size, double E_star, int coarsest, int q,
     int leaf_side, bool precond, double tol, double coarse_tol, int max_iter,
     bool use_pr, bool single_precision, bool light_result,
-    const std::string& backend, bool record_error_history) {
+    const std::string& backend, bool record_error_history, bool active_set,
+    double active_delta, int active_halo, int active_max_rounds) {
     const py::ssize_t expected =
         static_cast<py::ssize_t>(grid_size) * grid_size;
     if (gap.size() != expected)
@@ -250,6 +251,10 @@ PyResult py_solve_nested(
     hmc::NestedParams np{coarsest, q, leaf_side, precond, coarse_tol,
                          single_precision, light_result, backend,
                          record_error_history};
+    np.active_set = active_set;
+    np.active_delta = active_delta;
+    np.active_halo = active_halo;
+    np.active_max_rounds = active_max_rounds;
     PyResult out;
     out.Ns = grid_size;
     {
@@ -300,6 +305,11 @@ PYBIND11_MODULE(aspher, m) {
             })
         .def_property_readonly("converged",
                                [](const PyResult& s) { return s.r.converged; })
+        .def_property_readonly(
+            "active_rounds", [](const PyResult& s) { return s.r.active_rounds; })
+        .def_property_readonly(
+            "active_fallback",
+            [](const PyResult& s) { return s.r.active_fallback; })
         .def("__repr__", [](const PyResult& s) {
             std::ostringstream os;
             os << "<ContactResult: " << (s.r.converged ? "converged" : "NOT converged")
@@ -345,11 +355,18 @@ PYBIND11_MODULE(aspher, m) {
           py::arg("max_iter") = 20000, py::arg("use_pr") = true,
           py::arg("single_precision") = false, py::arg("light_result") = false,
           py::arg("backend") = "h2", py::arg("record_error_history") = false,
+          py::arg("active_set") = false, py::arg("active_delta") = 0.05,
+          py::arg("active_halo") = 2, py::arg("active_max_rounds") = 5,
           "Single-entry nested-grid (cascadic/FMG) contact solve: builds the "
           "coarse->fine hierarchy and H2 operators internally and warm-starts "
           "each level with the prolonged coarse pressure. grid_size must equal "
           "coarsest * 2^k. Returns a ContactResult. backend='h2' (O(N) memory) "
           "or 'fft' (exact convolution, fastest at Ns<=8192). "
           "record_error_history=True fills .error_history with the finest "
-          "level's per-iteration complementarity error (off by default).");
+          "level's per-iteration complementarity error (off by default). "
+          "active_set=True (h2 only) solves the finest level restricted to a "
+          "candidate set (dilated coarse contact + coarse gap < "
+          "active_delta*scale) through the masked H2 matvec, with per-round "
+          "full-grid verification and a full-solve fallback after "
+          "active_max_rounds (see .active_rounds/.active_fallback).");
 }

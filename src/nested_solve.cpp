@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #ifdef __GLIBC__
@@ -48,6 +50,199 @@ static Eigen::VectorXd prolong_field(const Eigen::VectorXd& pc, int Nc) {
     return out;
 }
 
+// Chebyshev (square) dilation of a grid mask by radius r: separable max
+// filter, horizontal then vertical pass. Slightly more generous than the
+// prototype's cross-shaped dilation — the safe direction for candidate sets.
+static void dilate_mask(std::vector<std::uint8_t>& m, int Ns, int r) {
+    if (r <= 0) return;
+    std::vector<std::uint8_t> tmp(m.size());
+#pragma omp parallel for schedule(static)
+    for (int iy = 0; iy < Ns; ++iy) {
+        const std::uint8_t* row = m.data() + static_cast<std::ptrdiff_t>(iy) * Ns;
+        std::uint8_t* out = tmp.data() + static_cast<std::ptrdiff_t>(iy) * Ns;
+        for (int ix = 0; ix < Ns; ++ix) {
+            std::uint8_t v = 0;
+            const int x1 = std::min(Ns - 1, ix + r);
+            for (int x = std::max(0, ix - r); x <= x1 && !v; ++x) v = row[x];
+            out[ix] = v;
+        }
+    }
+#pragma omp parallel for schedule(static)
+    for (int iy = 0; iy < Ns; ++iy) {
+        std::uint8_t* out = m.data() + static_cast<std::ptrdiff_t>(iy) * Ns;
+        const int y1 = std::min(Ns - 1, iy + r);
+        for (int ix = 0; ix < Ns; ++ix) {
+            std::uint8_t v = 0;
+            for (int y = std::max(0, iy - r); y <= y1 && !v; ++y)
+                v = tmp[static_cast<std::ptrdiff_t>(y) * Ns + ix];
+            out[ix] = v;
+        }
+    }
+}
+
+// Finest-level active-set solve (plan doc/plans/2026-07-10-active-set-solver.md
+// M2): candidate set from the coarse level, restricted Polonsky-Keer through
+// the masked H2 matvec, full-grid verification per round, violation-extension,
+// and a full-solve fallback after active_max_rounds. p_init_d (the prolonged
+// coarse pressure) is consumed. coarse_gap is the NEXT-TO-FINEST level's gap
+// field ((Ns/2)² entries), sampled by injection — the prolonged fine-grid
+// copy is never materialised (an N-sized array at Ns=16384 is 2.1 GiB).
+template <class Real>
+static ContactResult active_finest(const H2Operator& h2,
+                                   const FourierPreconditioner* fp,
+                                   Eigen::Ref<const VecT<Real>> g0,
+                                   double p_bar, double lvl_tol, int max_iter,
+                                   bool use_pr, const NestedParams& np, int Ns,
+                                   Eigen::VectorXd& p_init_d,
+                                   const Eigen::VectorXd& coarse_gap,
+                                   bool record_history, bool light) {
+    using Vec = VecT<Real>;
+    constexpr bool is_double = std::is_same_v<Real, double>;
+    const int N = Ns * Ns;
+    const int Nc2 = Ns / 2;
+
+    const double gmax = static_cast<double>(g0.maxCoeff());
+    const double gmin = static_cast<double>(g0.minCoeff());
+    const double g_scale = (gmax > gmin) ? gmax - gmin : 1.0;
+    const double delta = np.active_delta * g_scale;
+    // violation threshold mirrors the prototype: negative gap outside C
+    // beyond the solve tolerance × the gap scale
+    const double vthresh = -lvl_tol * g_scale;
+
+    // candidate set C = dilate(prolonged coarse contact) ∪ {coarse gap < δ}
+    std::vector<std::uint8_t> cmask(N, 0);
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < N; ++i) cmask[i] = (p_init_d(i) > 0.0) ? 1 : 0;
+    dilate_mask(cmask, Ns, np.active_halo);
+#pragma omp parallel for schedule(static)
+    for (int iy = 0; iy < Ns; ++iy) {
+        const double* gc =
+            coarse_gap.data() + static_cast<std::ptrdiff_t>(iy / 2) * Nc2;
+        std::uint8_t* cm = cmask.data() + static_cast<std::ptrdiff_t>(iy) * Ns;
+        for (int ix = 0; ix < Ns; ++ix)
+            if (gc[ix / 2] < delta) cm[ix] = 1;
+    }
+
+    // warm start in working precision; the driver's double array is consumed
+    Vec p0;
+    if constexpr (is_double) p0 = std::move(p_init_d);
+    else p0 = p_init_d.cast<float>();
+    p_init_d.resize(0);
+
+    PrecondIntoT<Real> pc;
+    if (fp) {
+        pc = [fp](const Vec& g, const std::vector<std::uint8_t>& contact,
+                  Vec& z) {
+            if constexpr (is_double) fp->apply_into(g, contact, z);
+            else fp->apply_single_into(g, contact, z);
+        };
+    }
+
+    ContactResult res;
+    std::vector<double> hist;
+    std::vector<std::uint8_t> viol(N);
+    std::vector<int> idxv;
+    Vec ufull(N);
+    int it_total = 0, rounds = 0;
+    bool certified = false;
+
+    while (rounds < np.active_max_rounds) {
+        ++rounds;
+        const H2Mask mask = h2.build_mask(cmask);
+        idxv.clear();
+        for (int i = 0; i < N; ++i)
+            if (cmask[i]) idxv.push_back(i);
+
+        MatVecIntoT<Real> mv = [&h2, &mask](const Vec& x, Vec& y) {
+            if constexpr (is_double) h2.matvec_masked_into(x, y, mask, &mask);
+            else h2.matvec_masked_single_into(x, y, mask, &mask);
+        };
+        res = solve_contact_active_impl<Real>(
+            mv, g0, static_cast<Real>(p_bar), static_cast<Real>(lvl_tol),
+            max_iter, use_pr, pc, idxv, &p0, record_history);
+        it_total += res.iterations;
+        if (record_history)
+            hist.insert(hist.end(), res.error_history.begin(),
+                        res.error_history.end());
+
+        // verification: one masked-source, full-target matvec + gap scan
+        Vec pr; // working-precision pressure (unused when Real = double)
+        if constexpr (is_double) {
+            h2.matvec_masked_into(res.pressure, ufull, mask, nullptr);
+        } else {
+            pr = res.pressure.template cast<Real>();
+            h2.matvec_masked_single_into(pr, ufull, mask, nullptr);
+        }
+        const double a = res.approach;
+        long nviol = 0;
+#pragma omp parallel for schedule(static) reduction(+ : nviol)
+        for (int i = 0; i < N; ++i) {
+            std::uint8_t v = 0;
+            if (!cmask[i] &&
+                static_cast<double>(ufull(i)) + static_cast<double>(g0(i)) - a <
+                    vthresh)
+                v = 1;
+            viol[i] = v;
+            nviol += v;
+        }
+        if (nviol == 0) {
+            certified = true;
+            break;
+        }
+        // extend C with the dilated violations and resume warm-started
+        dilate_mask(viol, Ns, np.active_halo);
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < N; ++i)
+            if (viol[i]) cmask[i] = 1;
+        if constexpr (is_double) p0 = std::move(res.pressure);
+        else p0 = std::move(pr);
+    }
+
+    if (!certified) {
+        // safety net: the candidate set never certified — run the standard
+        // full solve, warm-started from the last restricted iterate
+        MatVecIntoT<Real> mvf = [&h2](const Vec& x, Vec& y) {
+            if constexpr (is_double) h2.matvec_into(x, y);
+            else h2.matvec_single_into(x, y);
+        };
+        // p0 holds the last restricted solution: the loop only exits
+        // uncertified through the violations branch, which reassigns p0
+        // (res.pressure may already be moved-from at this point)
+        Vec pf = std::move(p0);
+        // Seed the (dilated) violating points into the warm start's contact
+        // set. The full solver's complementarity error Σ p|g| is blind to
+        // p=0 ∧ g<0 points, so a warm start that is converged on the old
+        // candidate set but penetrating outside it would "converge" at
+        // iteration 0 with the penetration unfixed. With pressure there,
+        // those points join the active set from the start; the seed's scale
+        // is irrelevant to correctness (any p ≥ 0 iterate is a valid start).
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < N; ++i)
+            if (viol[i] && pf(i) <= Real(0)) pf(i) = static_cast<Real>(p_bar);
+        res = solve_contact_impl<Real>(mvf, g0, static_cast<Real>(p_bar),
+                                       static_cast<Real>(lvl_tol), max_iter,
+                                       use_pr, pc, &pf, light, record_history);
+        it_total += res.iterations;
+        if (record_history)
+            hist.insert(hist.end(), res.error_history.begin(),
+                        res.error_history.end());
+        res.active_fallback = true;
+    } else if (!light) {
+        // full displacement/gap fields from the final verification matvec
+        res.displacement = ufull.template cast<double>();
+        Eigen::VectorXd gp(N);
+        const double a = res.approach;
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < N; ++i)
+            gp(i) = static_cast<double>(ufull(i)) + static_cast<double>(g0(i)) - a;
+        res.gap = std::move(gp);
+    }
+    res.active_rounds = rounds;
+    res.iterations = it_total;
+    if (record_history) res.error_history = std::move(hist);
+    return res;
+}
+
 ContactResult solve_contact_nested(int Ns, double L, double E_star,
                                    Eigen::Ref<const Eigen::VectorXd> g0,
                                    double p_bar,
@@ -74,6 +269,16 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
     if (np.backend != "h2" && np.backend != "fft")
         throw std::invalid_argument(
             "solve_contact_nested: backend must be 'h2' or 'fft'");
+    if (np.active_set) {
+        if (np.backend != "h2")
+            throw std::invalid_argument(
+                "solve_contact_nested: active_set requires backend='h2' "
+                "(masked matvec)");
+        if (levels.size() < 2)
+            throw std::invalid_argument(
+                "solve_contact_nested: active_set needs a coarse level "
+                "(Ns > coarsest)");
+    }
 
     // restrict the fine gap down to the coarse levels only: the finest level
     // solves directly on the caller-owned g0 view, so no N-sized copy is made
@@ -87,6 +292,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
     }
 
     Eigen::VectorXd p_init;
+    Eigen::VectorXd coarse_gap; // next-to-finest gap field (active_set only)
     bool have_init = false;
     ContactResult res;
 
@@ -128,14 +334,35 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         // float arithmetic cannot drive the complementarity error below ~1e-6,
         // so clamp the requested tolerance to a reachable floor in that mode.
         if (np.single_precision) lvl_tol = std::max(lvl_tol, 2e-6);
-        // coarse levels only need the pressure (for prolongation), so drop their
-        // displacement/gap unconditionally; the finest honours light_result.
-        const bool light = finest ? np.light_result : true;
+        // coarse levels only need the pressure (for prolongation), so drop
+        // their displacement/gap; the finest honours light_result. Exception:
+        // the active-set candidate set needs the next-to-finest gap field
+        // ((Ns/2)²-sized, ~N/4 — negligible next to the finest solve).
+        const bool keep_gap = np.active_set && (li + 2 == levels.size());
+        const bool light = finest ? np.light_result : !keep_gap;
         // only the finest level's trace is meaningful (iterations is also
         // finest-level-only); coarse levels never record history.
         const bool record_history = finest && np.record_error_history;
 
-        if (np.single_precision) {
+        if (finest && np.active_set) {
+            // restricted (active-set) solve on the candidate set built from
+            // the coarse contact + gap; p_init/coarse_gap are consumed
+            const FourierPreconditioner* fpp = np.precond ? &fp : nullptr;
+            if (np.single_precision) {
+                h2->build_single_caches();
+                Eigen::VectorXf g0f = glvl.cast<float>();
+                res = active_finest<float>(*h2, fpp, g0f, p_bar, lvl_tol,
+                                           max_iter, use_pr, np, n, p_init,
+                                           coarse_gap, record_history,
+                                           np.light_result);
+            } else {
+                res = active_finest<double>(*h2, fpp, glvl, p_bar, lvl_tol,
+                                            max_iter, use_pr, np, n, p_init,
+                                            coarse_gap, record_history,
+                                            np.light_result);
+            }
+            coarse_gap.resize(0);
+        } else if (np.single_precision) {
             MatVecIntoT<float> mvf;
             if (fop) {
                 fop->build_single_caches();
@@ -182,6 +409,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         if (!finest) {
             p_init = prolong_field(res.pressure, n);
             have_init = true;
+            if (keep_gap) coarse_gap = std::move(res.gap);
         }
     }
     return res;

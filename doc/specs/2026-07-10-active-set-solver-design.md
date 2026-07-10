@@ -1,7 +1,7 @@
 # Active-set contact solver (masked H2 + restricted PK) — design
 
-Status: M1 implemented and gate-passed 2026-07-10; M2/M3 per
-`doc/plans/2026-07-10-active-set-solver.md`.
+Status: M1 implemented and gate-passed 2026-07-10; M2 implemented and
+cross-checked 2026-07-10; M3 per `doc/plans/2026-07-10-active-set-solver.md`.
 Basis: prototype GO in `experiments/active_set_results.md` (restricted
 Polonsky–Keer on gap-proximity candidate sets recovers the exact solution in
 one verification round; the |q| preconditioner stays; candidate sets must
@@ -73,19 +73,60 @@ or twice per solve, not per iteration.
 At Ns=16384 f64 this projects per-iteration operator cost 12.0 s → 0.11 s
 (restricted), matching the prototype cost model's 0.05–0.15 s estimate.
 
-## 3. Active-set driver (M2) and O(N_c) memory (M3)
+## 3. Active-set driver (M2) — implemented
 
-See the plan for the milestone specifications; this section will be updated
-as they land.
+`solve_contact_active_impl<Real>` (`src/contact_solver.cpp`): the identical
+Polonsky–Keer algorithm (PR+, centred line-search denominator, overlap
+correction, load renormalisation, double-accumulated reductions, stagnation
+guard) with every per-iteration O(N) loop driven by the candidate index list
+(`for j: i = idx[j]`). The pressure iterate is exactly zero off the candidate
+set; the load constraint stays global (mean over the full grid = p̄). The
+operator is the masked matvec (src = tgt = C); its output is stale off the
+candidate leaves and is never read there. `FourierPreconditioner::apply_into`
+is used unchanged: it reads the gradient only on the contact mask (⊂ C) and
+zeroes its output elsewhere, so stale entries never leak. The result is
+always light; the driver fills displacement/gap from its verification
+matvec. The validated `solve_contact_impl` is untouched (default path stays
+bit-for-bit, checked by the ref_solve identity protocol).
 
-Key M2 decisions carried from the prototype:
-- candidate set C = dilate_halo(prolonged coarse contact) ∪ {prolonged
-  coarse gap < δ}, δ = `active_delta` × level gap scale, default 0.05 and
-  deliberately generous: δ too tight can pass full-grid verification while
-  boundary pressures are subtly wrong (0.5–0.9% error) — the certificate can
-  be clean while the active set is wrong;
-- the |q| preconditioner stays, applied full-grid (restriction does not
-  improve conditioning: contact islands span the domain);
-- verification = one masked-source/full-target matvec + gap scan; extend C
-  with dilated violations, re-solve warm-started; after `active_max_rounds`
-  fall back to the standard full solve.
+Driver (`active_finest<Real>` in `src/nested_solve.cpp`, behind
+`NestedParams{active_set, active_delta=0.05, active_halo=2,
+active_max_rounds=5}`, Python-plumbed through `hc.solve_nested`):
+1. coarse levels unchanged; the next-to-finest level keeps its gap field
+   ((Ns/2)², sampled by injection — the prolonged fine copy is never
+   materialised);
+2. C = dilate_halo(prolonged coarse contact) ∪ {coarse gap < δ},
+   δ = `active_delta` × fine gap scale (max−min), deliberately generous: a
+   tight δ can pass verification while boundary pressures are subtly wrong
+   (prototype Q2);
+3. restricted solve on C, warm start = prolonged coarse pressure (consumed);
+4. verification: one masked-source/full-target matvec + gap scan (violation:
+   gap < −tol·scale outside C, the prototype criterion); violations are
+   dilated into C and the solve resumes warm-started; after
+   `active_max_rounds` uncertified rounds → full-solve fallback
+   (`ContactResult.active_fallback`; `active_rounds` reports the count).
+
+**Fallback subtlety (found by the δ-too-tight regression test)**: the PK
+complementarity error Σ p|g| is blind to p=0 ∧ g<0 points, so a fallback
+warm start that is converged on the old C but penetrating outside it makes
+the full solve "converge" at iteration 0 with the penetration unfixed
+(1.5e-2 pressure error observed). The driver therefore seeds the dilated
+violating points with p̄ in the warm start — they join the active set from
+iteration 0, and the full solve (exact for any p ≥ 0 start) proceeds
+normally (measured: rel-L2 2.8e-6 vs reference, ΔArea 0 — normal
+different-path scatter at tol 1e-8).
+
+Verification (2026-07-10, `tests/test_active.cpp` M2 section + Python):
+- Ns=256 rough multi-scale surface: active vs standard nested — ΔArea 0,
+  rel-L2 1.2e-14 (f64, 1 round) / 1.7e-4 vs f64 (f32, 1 round), clean
+  certificates; fallback regression (δ=0, halo=0, 1 round) triggers and
+  still returns correct pressures.
+- Ns=1024 cross-check against `experiments/active_set_proto.py` (seed-42
+  surface, p̄=0.002, tol 1e-8): area 0.00759 == prototype; finest 51
+  iterations vs the prototype's restricted-fourier 56–57 (ours warm-started,
+  ~15% cut expected); 1 round, rel-L2 3e-14 vs standard nested; wall
+  2.54 → 1.05 s (2.4×) already at Ns=1024.
+
+## 4. O(N_c) memory (M3)
+
+See the plan; this section will be updated as it lands.

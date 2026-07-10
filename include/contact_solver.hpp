@@ -20,6 +20,10 @@ struct ContactResult {
     double mean_pressure = 0.0;
     std::vector<double> error_history; // per-iteration complementarity error;
                                         // empty unless record_history requested
+    int active_rounds = 0;      // active-set driver: verification rounds used
+                                // (0 = standard full-grid solve)
+    bool active_fallback = false; // active-set driver gave up after
+                                  // active_max_rounds and ran the full solve
 };
 
 template <class Real> using VecT = Eigen::Matrix<Real, Eigen::Dynamic, 1>;
@@ -81,5 +85,33 @@ ContactResult solve_contact(const MatVec& S, const Eigen::VectorXd& g0,
                             const Precond& precond = {},
                             const Eigen::VectorXd* p_init = nullptr,
                             bool light = false, bool record_history = false);
+
+// Active-set (restricted) Polonsky-Keer: the same algorithm as
+// solve_contact_impl, but every per-iteration O(N) loop runs over the
+// candidate index list idx (flat grid indices, each in [0, N)). The pressure
+// iterate is kept exactly zero outside idx for the whole solve, so this
+// solves the QP restricted to the candidate set; the load constraint stays
+// global (mean over the FULL grid = p_bar). Contracts:
+//  - S is expected to be the masked matvec with src = tgt = candidate mask:
+//    its output is only ever read at idx entries (u/r are stale elsewhere).
+//  - precond (optional) receives the full-grid gradient and the contact mask
+//    (a subset of idx); FourierPreconditioner::apply_into reads g only at
+//    masked entries and zeroes z elsewhere, so the stale entries never leak.
+//  - p_init, when non-null, is CONSUMED (storage freed right after its idx
+//    entries are gathered); values outside idx are discarded.
+// The result is always light (no displacement/gap fields: the operator
+// output is not valid off the candidate leaves) — the caller computes full
+// fields from its verification matvec. iterations/error/approach/objective/
+// contact_fraction/mean_pressure are filled as usual; pressure is the
+// full-grid field (zero off idx).
+template <class Real>
+ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
+                                        Eigen::Ref<const VecT<Real>> g0,
+                                        Real p_bar, Real tol, int max_iter,
+                                        bool use_pr,
+                                        const PrecondIntoT<Real>& precond,
+                                        const std::vector<int>& idx,
+                                        VecT<Real>* p_init,
+                                        bool record_history = false);
 
 } // namespace hmc

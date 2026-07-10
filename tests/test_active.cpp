@@ -1,14 +1,23 @@
-// Active-set solver tests, milestone M1: masked H2 matvec exactness.
+// Active-set solver tests.
 //
-// Contract under test (h2_operator.hpp): for x supported on the src mask,
-// matvec_masked_into equals the unmasked matvec BIT-FOR-BIT on tgt-occupied
-// leaves — skipped terms are exact zeros and kept terms keep their summation
-// order. Each masked call runs on a fresh H2Operator so the shared M/L
-// scratch holds garbage, not correct values left by a previous unmasked
-// apply: a pass that wrongly reads a skipped column fails loudly.
+// M1 — masked H2 matvec exactness (h2_operator.hpp): for x supported on the
+// src mask, matvec_masked_into equals the unmasked matvec BIT-FOR-BIT on
+// tgt-occupied leaves — skipped terms are exact zeros and kept terms keep
+// their summation order. Each masked call runs on a fresh H2Operator so the
+// shared M/L scratch holds garbage, not correct values left by a previous
+// unmasked apply: a pass that wrongly reads a skipped column fails loudly.
+//
+// M2 — active-set nested driver equivalence (nested_solve.hpp): on a rough
+// multi-scale surface the active_set=true solve must reproduce the standard
+// nested solve (equal area, tiny pressure difference) with a clean
+// certificate, in both precisions; and a deliberately broken candidate set
+// (delta=0, halo=0, one round) must trigger the full-solve fallback and
+// still return the correct pressures rather than silently-wrong ones.
 #include "boussinesq_kernel.hpp"
 #include "h2_operator.hpp"
+#include "nested_solve.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -72,6 +81,34 @@ int count_mismatches(const Vec& a, const Vec& b,
     for (int i = 0; i < a.size(); ++i)
         if (where[i] && a(i) != b(i)) ++bad;
     return bad;
+}
+
+// Deterministic rough multi-scale gap: superposed cosines with random phases
+// and directions, amplitudes k^-(1+H), wavenumbers up to the fine Nyquist so
+// the coarse nested levels cannot see the smallest asperities (the orphan-
+// island regime that makes the candidate-set gap threshold necessary).
+Eigen::VectorXd rough_gap(int Ns, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> uang(0.0, 2.0 * M_PI);
+    Eigen::VectorXd h = Eigen::VectorXd::Zero(static_cast<long>(Ns) * Ns);
+    const double H = 0.8;
+    for (double kmag = 1.0; kmag <= Ns / 2; kmag *= 1.35) {
+        for (int rep = 0; rep < 4; ++rep) {
+            const double th = uang(rng), phi = uang(rng);
+            const double kx = kmag * std::cos(th), ky = kmag * std::sin(th);
+            const double amp = std::pow(kmag, -(1.0 + H));
+            for (int iy = 0; iy < Ns; ++iy)
+                for (int ix = 0; ix < Ns; ++ix)
+                    h(static_cast<long>(iy) * Ns + ix) +=
+                        amp * std::cos(2.0 * M_PI *
+                                           (kx * (ix + 0.5) + ky * (iy + 0.5)) /
+                                           Ns +
+                                       phi);
+        }
+    }
+    h.array() -= h.mean();
+    h *= 0.02 / std::sqrt(h.squaredNorm() / h.size()); // rms 0.02
+    return -h; // gap of a rigid flat against the surface
 }
 
 } // namespace
@@ -174,5 +211,79 @@ int main() {
     }
 
     std::printf("test_active (M1): all passed\n");
+
+    // ── M2: active-set nested driver equivalence ─────────────────────────────
+    {
+        const int Nr = 256;
+        const double pbar = 0.005, tol = 1e-8;
+        const Eigen::VectorXd gap = rough_gap(Nr, 42);
+
+        hmc::NestedParams np_std;
+        np_std.coarsest = 64;
+        auto r0 = hmc::solve_contact_nested(Nr, 1.0, 1.0, gap, pbar, tol,
+                                            20000, true, np_std);
+        CHECK(r0.converged);
+
+        hmc::NestedParams np_act = np_std;
+        np_act.active_set = true;
+        auto r1 = hmc::solve_contact_nested(Nr, 1.0, 1.0, gap, pbar, tol,
+                                            20000, true, np_act);
+        CHECK(r1.converged);
+        CHECK(!r1.active_fallback); // clean certificate
+        CHECK(r1.active_rounds >= 1 && r1.active_rounds <= 2);
+        const double rel =
+            (r1.pressure - r0.pressure).norm() / r0.pressure.norm();
+        std::printf("active f64: std %d it | active %d it, %d rounds, "
+                    "relL2 %.2e, dArea %.2e\n",
+                    r0.iterations, r1.iterations, r1.active_rounds, rel,
+                    std::abs(r1.contact_fraction - r0.contact_fraction));
+        CHECK(rel <= 1e-6);
+        CHECK(std::abs(r1.contact_fraction - r0.contact_fraction) <= 1e-6);
+        // full result fields present (not light) and consistent
+        CHECK(r1.displacement.size() == r0.displacement.size());
+        CHECK(r1.gap.size() == r0.gap.size());
+        CHECK((r1.gap - r0.gap).norm() <= 1e-6 * (r0.gap.norm() + 1.0));
+
+        // float precision: same solution to float accuracy, clean certificate
+        hmc::NestedParams np_actf = np_act;
+        np_actf.single_precision = true;
+        auto r2 = hmc::solve_contact_nested(Nr, 1.0, 1.0, gap, pbar, tol,
+                                            20000, true, np_actf);
+        CHECK(r2.converged);
+        CHECK(!r2.active_fallback);
+        const double relf =
+            (r2.pressure - r0.pressure).norm() / r0.pressure.norm();
+        std::printf("active f32: %d it, %d rounds, relL2 vs f64 %.2e\n",
+                    r2.iterations, r2.active_rounds, relf);
+        CHECK(relf <= 1e-3);
+        CHECK(std::abs(r2.contact_fraction - r0.contact_fraction) <= 2e-3);
+
+        // delta-too-tight regression: a candidate set with no gap threshold
+        // and no halo misses points; with a single round allowed the driver
+        // must fall back to the full solve — and still return the right
+        // pressures — rather than certify a wrong active set.
+        hmc::NestedParams np_bad = np_act;
+        np_bad.active_delta = 0.0;
+        np_bad.active_halo = 0;
+        np_bad.active_max_rounds = 1;
+        auto r3 = hmc::solve_contact_nested(Nr, 1.0, 1.0, gap, pbar, tol,
+                                            20000, true, np_bad);
+        CHECK(r3.converged);
+        CHECK(r3.active_fallback); // the broken candidate set was caught
+        const double rel3 =
+            (r3.pressure - r0.pressure).norm() / r0.pressure.norm();
+        std::printf("active fallback: triggered, %d it total, relL2 %.2e, "
+                    "dArea %.2e\n",
+                    r3.iterations, rel3,
+                    std::abs(r3.contact_fraction - r0.contact_fraction));
+        // the fallback takes a different iterate path than the reference, so
+        // boundary pixels scatter at the solver-tolerance scale (~1e-6, same
+        // order as the validated none-vs-fourier path difference); the broken
+        // pre-fix state returned 1.5e-2
+        CHECK(rel3 <= 1e-4);
+        CHECK(std::abs(r3.contact_fraction - r0.contact_fraction) <= 1e-4);
+    }
+
+    std::printf("test_active (M2): all passed\n");
     return 0;
 }
