@@ -17,6 +17,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace py = pybind11;
 
@@ -244,8 +245,9 @@ PyResult py_solve_nested(
     out.Ns = grid_size;
     {
         py::gil_scoped_release release;
-        out.r = hmc::solve_contact_nested(grid_size, domain_size, E_star, g0,
-                                          p_nominal, tol, max_iter, use_pr, np);
+        out.r = hmc::solve_contact_nested(grid_size, domain_size, E_star,
+                                          std::move(g0), p_nominal, tol,
+                                          max_iter, use_pr, np);
     }
     return out;
 }

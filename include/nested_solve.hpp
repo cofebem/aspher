@@ -26,8 +26,12 @@ struct NestedParams {
 // H2 operator and the |q| preconditioner, warm-started by injecting the
 // previous (coarser) pressure. Returns the finest-level ContactResult (its
 // .iterations is the finest-level count). Ns must equal coarsest * 2^k.
+// g0 is taken by value and moved into the finest-level slot internally (not
+// copied): at Ns=16384 double precision a redundant extra N-sized copy here
+// was one of the things standing between fitting and OOMing on a 32 GiB
+// node. Callers that can give up their own copy should std::move(g0) in.
 ContactResult solve_contact_nested(int Ns, double L, double E_star,
-                                   const Eigen::VectorXd& g0, double p_bar,
+                                   Eigen::VectorXd g0, double p_bar,
                                    double tol = 1e-8, int max_iter = 20000,
                                    bool use_pr = true,
                                    const NestedParams& np = {});

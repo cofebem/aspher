@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #ifdef __GLIBC__
@@ -48,7 +49,7 @@ static Eigen::VectorXd prolong_field(const Eigen::VectorXd& pc, int Nc) {
 }
 
 ContactResult solve_contact_nested(int Ns, double L, double E_star,
-                                   const Eigen::VectorXd& g0, double p_bar,
+                                   Eigen::VectorXd g0, double p_bar,
                                    double tol, int max_iter, bool use_pr,
                                    const NestedParams& np) {
     if (static_cast<int>(g0.size()) != Ns * Ns)
@@ -73,9 +74,11 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         throw std::invalid_argument(
             "solve_contact_nested: backend must be 'h2' or 'fft'");
 
-    // restrict the fine gap down to every level
+    // restrict the fine gap down to every level. g0 is moved (not copied)
+    // into the finest slot: at Ns=16384 double, that's one fewer N-sized
+    // (2.1 GiB) array alive at once.
     std::vector<Eigen::VectorXd> gap(levels.size());
-    gap.back() = g0;
+    gap.back() = std::move(g0);
     for (int i = static_cast<int>(levels.size()) - 2; i >= 0; --i)
         gap[i] = restrict_field(gap[i + 1], levels[i + 1]);
 
