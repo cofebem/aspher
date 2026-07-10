@@ -61,12 +61,18 @@ using Precond = PrecondT<double>;
 // g0 is a read-only view (Eigen::Ref): the caller keeps ownership and no
 // N-sized copy is made — at Ns=16384 double the gap is a 2.1 GiB array, and
 // the nested solve passes the Python-owned numpy buffer straight through.
+// p_init, when non-null, is CONSUMED: its storage is moved into the solver's
+// pressure iterate at initialization and *p_init is left moved-from (only
+// reassign or destroy it afterwards). This keeps the warm-start vector (a
+// full N-sized array, 2.1 GiB at Ns=16384 double) from sitting idle beside
+// its own copy for the whole solve. solve_contact preserves the
+// non-consuming const-pointer contract by copying.
 template <class Real>
 ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
                                  Eigen::Ref<const VecT<Real>> g0,
                                  Real p_bar, Real tol, int max_iter, bool use_pr,
                                  const PrecondIntoT<Real>& precond,
-                                 const VecT<Real>* p_init, bool light = false,
+                                 VecT<Real>* p_init, bool light = false,
                                  bool record_history = false);
 
 ContactResult solve_contact(const MatVec& S, const Eigen::VectorXd& g0,

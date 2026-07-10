@@ -160,7 +160,14 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             // double buffer is caller-owned and stays alive)
             if (!finest) gap[li].resize(0);
             Eigen::VectorXf p0f;
-            if (have_init) p0f = p_init.cast<float>();
+            if (have_init) {
+                p0f = p_init.cast<float>();
+                // free the double warm start once cast: it would otherwise sit
+                // idle (2.1 GiB at Ns=16384) through the whole float solve.
+                // p0f itself is consumed by solve_contact_impl (moved into the
+                // pressure iterate), so neither copy outlives initialization.
+                p_init.resize(0);
+            }
             res = solve_contact_impl<float>(
                 mvf, g0f, static_cast<float>(p_bar), static_cast<float>(lvl_tol),
                 max_iter, use_pr, pcf, have_init ? &p0f : nullptr, light,

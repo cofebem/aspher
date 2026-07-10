@@ -12,7 +12,7 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
                                  Eigen::Ref<const VecT<Real>> g0,
                                  Real p_bar, Real tol, int max_iter, bool use_pr,
                                  const PrecondIntoT<Real>& precond,
-                                 const VecT<Real>* p_init, bool light,
+                                 VecT<Real>* p_init, bool light,
                                  bool record_history) {
     using Vec = VecT<Real>;
     const int N = static_cast<int>(g0.size());
@@ -27,9 +27,16 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
     if (p_init) {
         if (static_cast<int>(p_init->size()) != N)
             throw std::invalid_argument("solve_contact: p_init size mismatch");
-        p = p_init->cwiseMax(Real(0));
+        // consume the warm start: its storage becomes the pressure iterate,
+        // so the caller's N-sized array doesn't sit idle beside its own copy
+        // for the whole solve (see the header contract).
+        p = std::move(*p_init);
+        p = p.cwiseMax(Real(0)); // in-place, coefficient-wise
         const Real s = p.sum();
-        p = (s > Real(0)) ? (p * (P_total / s)).eval() : Vec::Constant(N, p_bar);
+        if (s > Real(0))
+            p *= P_total / s;
+        else
+            p.setConstant(p_bar);
     } else {
         p = Vec::Constant(N, p_bar);
     }
@@ -198,10 +205,10 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
 // explicit instantiations
 template ContactResult solve_contact_impl<double>(
     const MatVecIntoT<double>&, Eigen::Ref<const VecT<double>>, double, double,
-    int, bool, const PrecondIntoT<double>&, const VecT<double>*, bool, bool);
+    int, bool, const PrecondIntoT<double>&, VecT<double>*, bool, bool);
 template ContactResult solve_contact_impl<float>(
     const MatVecIntoT<float>&, Eigen::Ref<const VecT<float>>, float, float,
-    int, bool, const PrecondIntoT<float>&, const VecT<float>*, bool, bool);
+    int, bool, const PrecondIntoT<float>&, VecT<float>*, bool, bool);
 
 ContactResult solve_contact(const MatVec& S, const Eigen::VectorXd& g0,
                             double p_bar, double tol, int max_iter, bool use_pr,
@@ -215,8 +222,14 @@ ContactResult solve_contact(const MatVec& S, const Eigen::VectorXd& g0,
         pi = [&precond](const Eigen::VectorXd& g,
                         const std::vector<std::uint8_t>& contact,
                         Eigen::VectorXd& z) { z = precond(g, contact); };
+    // the impl consumes its p_init; copy to preserve this function's
+    // non-consuming const-pointer contract (the copy simply becomes the
+    // solver's pressure iterate — no extra array at peak).
+    Eigen::VectorXd p0;
+    if (p_init) p0 = *p_init;
     return solve_contact_impl<double>(Si, g0, p_bar, tol, max_iter, use_pr,
-                                      pi, p_init, light, record_history);
+                                      pi, p_init ? &p0 : nullptr, light,
+                                      record_history);
 }
 
 } // namespace hmc
