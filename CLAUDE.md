@@ -60,28 +60,6 @@ plans (not worth it for single solves).
 
 ---
 
-## Packaging (PyPI)
-
-`pyproject.toml` + **scikit-build-core** build the pybind11 extension through
-the same CMakeLists (its `SKBUILD` branch: no tests, no `-march=native`,
-installs `aspher*.so` + the `hmatrix_contact.py` alias into the wheel root).
-Default wheels are **all-BSD** (bundled pocketfft; no FFTW linkage); with
-`CMAKE_ARGS="-DASPHER_USE_FFTW=ON"` the binaries link GPL FFTW and carry GPL
-terms (README note). Eigen falls back to FetchContent.
-
-```bash
-# local wheel (compiler override needed on this machine, see conda gcc note):
-CMAKE_ARGS="-DCMAKE_CXX_COMPILER=/usr/bin/g++" python -m pip wheel . -w dist --no-deps
-```
-
-**PyPI upload caveat**: PyPI rejects plain `linux_x86_64` binary wheels — a
-locally built wheel is for local use only. Publish the **sdist**
-(`python -m build --sdist` → `twine upload dist/*.tar.gz`), and add
-manylinux wheels later via `cibuildwheel` (needs FFTW in the build image and
-`auditwheel repair` to vendor `libfftw3*.so` into the wheel).
-
----
-
 ## Run Tests
 
 ```bash
@@ -90,104 +68,6 @@ ctest --test-dir build --output-on-failure
 build/test_kernel
 build/test_hmatrix
 build/test_contact
-```
-
----
-
-## Tamaas Comparison
-
-```bash
-# Step 1: generate reference in fluidpaper env (run from repo root)
-conda activate fluidpaper
-python tamaas_reference.py
-# Writes: data/{surface.npy, tamaas_pressure.npy, tamaas_meta.json}
-
-# Step 2: compare (fenicsx-env, internally calls tamaas_reference.py via conda run)
-conda activate fenicsx-env
-python compare_tamaas.py
-```
-
----
-
-## Generate Conference Slides
-
-```bash
-conda activate fenicsx-env
-cd doc/slides
-python generate_figures.py          # writes figures/ and cache/
-export PATH=/home/vyastrebov/DISTR/TEXLIVE2020/bin/x86_64-linux:$PATH
-pdflatex slides.tex && pdflatex slides.tex   # two passes for references
-```
-
-Figures are cached in `cache/` (hertz.npz, rough_pressure.npy, timing.json).
-Delete cache files to force recomputation.
-
----
-
-## File Layout
-
-```
-.
-├── CMakeLists.txt
-├── include/
-│   ├── boussinesq_kernel.hpp   # Love (1929) element formula, O(1) lookup table
-│   ├── cluster_tree.hpp        # quad-tree, perm/iperm, Box struct
-│   ├── hmatrix.hpp             # ACA low-rank blocks, matvec, HMatrixInfo
-│   ├── cheb_basis.hpp          # Chebyshev nodes + interpolation weights (bbFMM)
-│   ├── uniform_quadtree.hpp    # uniform box tree, neighbors, interaction lists
-│   ├── h2_operator.hpp         # matrix-free H2/FMM operator, H2Params, H2Info; matvec_into + persistent M/L scratch
-│   ├── fft_operator.hpp        # exact zero-padded Love-kernel FFT convolution (backend="fft")
-│   ├── fourier_precond.hpp     # |q| spectral preconditioner (half-spectrum r2c FFT, persistent scratch, apply_into)
-│   ├── nested_solve.hpp        # single-entry cascadic/FMG nested-grid solve
-│   └── contact_solver.hpp      # Polonsky-Keer PCG, ContactResult, MatVec(IntoT), Precond(IntoT)
-├── src/
-│   ├── boussinesq_kernel.cpp
-│   ├── cluster_tree.cpp
-│   ├── hmatrix.cpp             # OpenMP-parallel ACA/ACA-GP fill + matvec + SVD recompress
-│   ├── cheb_basis.cpp
-│   ├── uniform_quadtree.cpp
-│   ├── h2_operator.cpp         # P2M/M2M/M2L/L2L/L2P + near field; cached operators
-│   ├── fft_engine.hpp          # shared square r2c/c2r engine (pocketfft/FFTW dispatch)
-│   ├── fft_operator.cpp        # kernel-spectrum build + scatter/FFT/multiply/gather matvec
-│   ├── fourier_precond.cpp
-│   ├── nested_solve.cpp        # builds per-level kernels/H2/precond, restrict+inject
-│   └── contact_solver.cpp      # PCG with optional preconditioner + warm start; OpenMP O(N) passes, double-accumulated reductions
-├── python/
-│   ├── bindings.cpp            # pybind11 module 'aspher'
-│   ├── hmatrix_contact.py      # backward-compat alias -> aspher
-│   └── aspher.cpython-312-x86_64-linux-gnu.so  (built artifact)
-├── tests/
-│   ├── test_kernel.cpp         # self-term, symmetry, far-field, positivity
-│   ├── test_hmatrix.cpp        # cluster tree validity, ACA accuracy, compression
-│   ├── test_contact.cpp        # Hertz: a_num/a=1.016, p_max/p0=0.998
-│   ├── test_fft.cpp            # FFT operator vs dense (roundoff), Hertz parity
-│   └── tamaas_test.py          # manual tamaas sanity check (fluidpaper env)
-├── tamaas_reference.py         # runs in fluidpaper; saves data/ files
-├── compare_tamaas.py           # runs in fenicsx-env; asserts L2 diff < 5%
-├── visualize_hmatrix.py        # saves fig_hmatrix_blocks.pdf (blue=low-rank, red=dense)
-├── leaf_size_bench.py          # sweep leaf sizes 8–128 for Ns=64/128
-├── bench_pr.py                 # FR vs PR+ benchmark at Ns=64–512
-├── bench_fft.py                # fft vs h2: matvec sweep + Ns=4096 nested solves
-├── data/
-│   ├── surface.npy             # self-affine surface (Ns=64, H=0.8, seed 12345)
-│   ├── tamaas_pressure.npy
-│   └── tamaas_meta.json
-├── doc/
-│   ├── theory/
-│   │   ├── pcg.tex             # PCG theory: CG, β formulas, line search, P-K, GPCG + §"Spectral Preconditioning and Finite-Precision Implementation" (2026-07 perf pass)
-│   │   ├── h2_fmm_detailed.tex # H2/bbFMM operator theory + preconditioner/nested-grid chapters
-│   │   └── references.bib      # shared bibliography (incl. Higham 2002, Chan-Golub-LeVeque 1983)
-│   ├── slides/
-│   │   ├── slides.tex          # main Beamer file (metropolis, 16:9, accent #2c7bb6)
-│   │   ├── sections/
-│   │   │   ├── hmatrix.tex     # §1: 5 slides — N² cost, quad-tree, ACA, matvec, kernel
-│   │   │   ├── hertz.tex       # §2: 4 slides — geometry, analytic, BEM+PKR, validation
-│   │   │   ├── rough.tex       # §3: 4 slides — roughness, QP, full P-K, result
-│   │   │   └── performance.tex # §4: 4 slides — memory, timing, Tamaas comparison, conclusions
-│   │   ├── generate_figures.py # generates all 9 PDF figures; pure-Python H-matrix partitioner
-│   │   ├── figures/            # generated PDF figures (gitignored)
-│   │   └── cache/              # cached solve results (gitignored)
-│   └── specs/                  # design specs (2026-06-*.md)
 ```
 
 ---
@@ -245,6 +125,7 @@ Default β formula: **Polak-Ribière+** (`use_pr=true`); Fletcher-Reeves availab
 - **Stagnation guard** (`solve_contact_impl`): if the complementarity error plateaus for 200 iterations (float noise floor), stop and report `converged` instead of spinning to `max_iter`. With the double accumulators (2026-07) the float path normally reaches its clamped tol directly, so this is now a safety net rather than the usual float exit path.
 - **Preallocated solve buffers (2026-07)**: the hot loop is allocation-free in steady state. `H2Operator` owns its multipole/local scratch (`Mbuf_`/`Lbuf_`, q²×nbox, lazily sized per precision — the old per-matvec `vector<VectorXd> M,L` was ~2·nbox small mallocs per apply) and exposes `matvec_into(x, y)`; `FourierPreconditioner` owns its grid/spectrum scratch and exposes `apply_into(g, contact, z)`; `solve_contact_impl` takes into-style functors (`MatVecIntoT`/`PrecondIntoT`) and reuses `u`/`r`/`z` across iterations (public `solve_contact` adapts the old by-value functors). One `H2Operator`/`FourierPreconditioner` must not be applied from two threads concurrently.
 - **mallopt in `solve_contact_nested`** (`M_MMAP_THRESHOLD`/`M_TRIM_THRESHOLD` = 128 KB): kept as a belt-and-braces guard, but with the preallocated buffers the per-iteration large-allocation traffic (and the mmap/munmap page-fault churn it caused) is gone from the steady-state loop.
+- **Zero-copy gap path (2026-07)**: `solve_contact_nested` and `solve_contact_impl` take `g0` as `Eigen::Ref<const ...>`; `py_solve_nested` passes an `Eigen::Map` view of the numpy buffer straight through (the finest level solves on it directly, only coarse restrictions ~N/3 are materialised). Plus `res.pressure = std::move(p)` when `Real=double` (the end-of-solve copy was the peak-RSS moment). Together −2 N-sized double arrays at peak on the double path: measured 2272→2017 MB at Ns=4096, −4.3 GiB at Ns=16384 — h2-double at 16384 was ~2 GiB short post-9929c60 and is worth a fresh-reboot retest (`16k_test.py`). Float path unchanged (its peak is in-solve, after the double gap is freed). Beware: a caller passing a non-C-contiguous or non-float64 array still gets a forcecast temporary (correct, just not zero-copy).
 
 **Large-grid memory recipe** (memory-bound nodes, e.g. Ns=16384, N≈2.7×10⁸ on 32 GiB): `hc.solve_nested(Ns, gap, p_bar, coarsest=64, q=4, leaf_side=16, precond=True, single_precision=True, light_result=True)` → solve ≈ 100 B/DOF ≈ 27 GiB. On the Python side the surface generation (meshgrid + complex FFT temporaries) is often the real hog — build it in **float32 via broadcasting** (not `np.meshgrid`), `del` temporaries, and `ctypes.CDLL("libc.so.6").malloc_trim(0)` before the solve. See `example_rough_contact.py` (its `Ns==16384` branch). The FFT preconditioner (`fourier_precond.cpp`) stores only the kx ∈ [0, Ns/2] half spectrum with the Ns² round-trip scale folded into the symbol; scratch (one real Ns×Ns + one complex (Ns/2+1)×Ns buffer, ≈2 N reals) is object-owned and reused across iterations, and the engine is pocketfft (default, BSD) or FFTW3 plans (`-DASPHER_USE_FFTW=ON`). The mask/scatter/gather passes stay OpenMP. **Run 16384 alone** — the killer is co-tenancy (any other heavy process OOMs it).
 - **Memory (measured, O(N) C++ solve):** `single_precision + light_result` cuts the solve by ~⅓ *with* the preconditioner on (Ns=4096: 2.31→1.57 GiB → Ns=16384 ≈ 25 GiB, fits a 32 GiB node); the float `|q|` FFT still has O(N) transients. Without the preconditioner the cut is ~½ (1.37→0.74) — but single precision **needs** the preconditioner to converge, so keep it on. At these sizes the Python **surface generation** (meshgrid + complex FFT temporaries) is often the real hog — build it in `float32` via broadcasting and free temporaries (see `example_rough_contact.py`).
@@ -399,15 +280,6 @@ print(res.contact_area)                                   # Ac/A  (also contact.
 
 `python example_rough_contact.py` writes `example_rough_contact.png`
 (surface | pressure | contact-area panels).
-
----
-
-## Slides Quick Reference
-
-- 18 content slides + title = 19 frames (compiles to ~22 pages with progress bar)
-- Theme: metropolis, aspect 16:9, accent blue `#2c7bb6`
-- 9 figures: `fig_hmatrix_blocks`, `fig_kernel_decay`, `fig_hertz_geometry`, `fig_hertz_validation`, `fig_surface`, `fig_rough_result`, `fig_memory_scaling`, `fig_timing_scaling`, `fig_tamaas_comparison`
-- Section order: §1 H-matrix solver → §2 Hertz → §3 Rough surface → §4 Performance
 
 ---
 

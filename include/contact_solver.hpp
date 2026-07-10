@@ -58,8 +58,12 @@ using Precond = PrecondT<double>;
 // double arrays in the result); pressure and all scalars are still filled.
 // Takes the allocation-free (into-style) functors; solve_contact adapts the
 // by-value ones.
+// g0 is a read-only view (Eigen::Ref): the caller keeps ownership and no
+// N-sized copy is made — at Ns=16384 double the gap is a 2.1 GiB array, and
+// the nested solve passes the Python-owned numpy buffer straight through.
 template <class Real>
-ContactResult solve_contact_impl(const MatVecIntoT<Real>& S, const VecT<Real>& g0,
+ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
+                                 Eigen::Ref<const VecT<Real>> g0,
                                  Real p_bar, Real tol, int max_iter, bool use_pr,
                                  const PrecondIntoT<Real>& precond,
                                  const VecT<Real>* p_init, bool light = false,

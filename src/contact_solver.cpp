@@ -2,11 +2,14 @@
 
 #include <cmath>
 #include <stdexcept>
+#include <type_traits>
+#include <utility>
 
 namespace hmc {
 
 template <class Real>
-ContactResult solve_contact_impl(const MatVecIntoT<Real>& S, const VecT<Real>& g0,
+ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
+                                 Eigen::Ref<const VecT<Real>> g0,
                                  Real p_bar, Real tol, int max_iter, bool use_pr,
                                  const PrecondIntoT<Real>& precond,
                                  const VecT<Real>* p_init, bool light,
@@ -171,7 +174,6 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S, const VecT<Real>& g
     }
     alpha = static_cast<Real>(nc ? gsum / nc : 0.0);
 
-    res.pressure = p.template cast<double>();
     if (!light) {
         res.displacement = u.template cast<double>();
         res.gap = (g.array() - alpha).template cast<double>();
@@ -181,16 +183,25 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S, const VecT<Real>& g
     res.iterations = it;
     res.contact_fraction = double(nc) / N;
     res.mean_pressure = static_cast<double>(p.mean());
+    // p is dead past this point: move it into the result when Real=double
+    // instead of copying — the end-of-solve moment (all CG vectors + the
+    // preconditioner scratch still allocated) is the peak RSS of the whole
+    // solve, and the copy added an extra N-sized array (2.1 GiB at Ns=16384)
+    // right there.
+    if constexpr (std::is_same_v<Real, double>)
+        res.pressure = std::move(p);
+    else
+        res.pressure = p.template cast<double>();
     return res;
 }
 
 // explicit instantiations
 template ContactResult solve_contact_impl<double>(
-    const MatVecIntoT<double>&, const VecT<double>&, double, double, int, bool,
-    const PrecondIntoT<double>&, const VecT<double>*, bool, bool);
+    const MatVecIntoT<double>&, Eigen::Ref<const VecT<double>>, double, double,
+    int, bool, const PrecondIntoT<double>&, const VecT<double>*, bool, bool);
 template ContactResult solve_contact_impl<float>(
-    const MatVecIntoT<float>&, const VecT<float>&, float, float, int, bool,
-    const PrecondIntoT<float>&, const VecT<float>*, bool, bool);
+    const MatVecIntoT<float>&, Eigen::Ref<const VecT<float>>, float, float,
+    int, bool, const PrecondIntoT<float>&, const VecT<float>*, bool, bool);
 
 ContactResult solve_contact(const MatVec& S, const Eigen::VectorXd& g0,
                             double p_bar, double tol, int max_iter, bool use_pr,

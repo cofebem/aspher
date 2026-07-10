@@ -17,7 +17,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <utility>
 
 namespace py = pybind11;
 
@@ -237,7 +236,17 @@ PyResult py_solve_nested(
     int leaf_side, bool precond, double tol, double coarse_tol, int max_iter,
     bool use_pr, bool single_precision, bool light_result,
     const std::string& backend, bool record_error_history) {
-    Eigen::VectorXd g0 = to_vector(gap, grid_size * grid_size);
+    const py::ssize_t expected =
+        static_cast<py::ssize_t>(grid_size) * grid_size;
+    if (gap.size() != expected)
+        throw std::invalid_argument("array has " + std::to_string(gap.size()) +
+                                    " entries, expected " +
+                                    std::to_string(expected));
+    // zero-copy view of the numpy buffer: the gap is never copied C++-side
+    // (2.1 GiB at Ns=16384 double). The py::array parameter keeps the buffer
+    // alive across the GIL-released call; forcecast only materialises a
+    // temporary when the input is not already a C-contiguous float64 array.
+    Eigen::Map<const Eigen::VectorXd> g0(gap.data(), expected);
     hmc::NestedParams np{coarsest, q, leaf_side, precond, coarse_tol,
                          single_precision, light_result, backend,
                          record_error_history};
@@ -245,9 +254,8 @@ PyResult py_solve_nested(
     out.Ns = grid_size;
     {
         py::gil_scoped_release release;
-        out.r = hmc::solve_contact_nested(grid_size, domain_size, E_star,
-                                          std::move(g0), p_nominal, tol,
-                                          max_iter, use_pr, np);
+        out.r = hmc::solve_contact_nested(grid_size, domain_size, E_star, g0,
+                                          p_nominal, tol, max_iter, use_pr, np);
     }
     return out;
 }

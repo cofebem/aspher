@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
-#include <utility>
 #include <vector>
 
 #ifdef __GLIBC__
@@ -18,7 +17,8 @@
 namespace hmc {
 
 // 2x2 block-average restriction: fine (Ns x Ns) -> coarse (Ns/2 x Ns/2).
-static Eigen::VectorXd restrict_field(const Eigen::VectorXd& f, int Ns) {
+static Eigen::VectorXd restrict_field(Eigen::Ref<const Eigen::VectorXd> f,
+                                      int Ns) {
     const int c = Ns / 2;
     Eigen::VectorXd out(c * c);
 #pragma omp parallel for schedule(static)
@@ -49,7 +49,8 @@ static Eigen::VectorXd prolong_field(const Eigen::VectorXd& pc, int Nc) {
 }
 
 ContactResult solve_contact_nested(int Ns, double L, double E_star,
-                                   Eigen::VectorXd g0, double p_bar,
+                                   Eigen::Ref<const Eigen::VectorXd> g0,
+                                   double p_bar,
                                    double tol, int max_iter, bool use_pr,
                                    const NestedParams& np) {
     if (static_cast<int>(g0.size()) != Ns * Ns)
@@ -74,13 +75,16 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         throw std::invalid_argument(
             "solve_contact_nested: backend must be 'h2' or 'fft'");
 
-    // restrict the fine gap down to every level. g0 is moved (not copied)
-    // into the finest slot: at Ns=16384 double, that's one fewer N-sized
-    // (2.1 GiB) array alive at once.
-    std::vector<Eigen::VectorXd> gap(levels.size());
-    gap.back() = std::move(g0);
-    for (int i = static_cast<int>(levels.size()) - 2; i >= 0; --i)
-        gap[i] = restrict_field(gap[i + 1], levels[i + 1]);
+    // restrict the fine gap down to the coarse levels only: the finest level
+    // solves directly on the caller-owned g0 view, so no N-sized copy is made
+    // (at Ns=16384 double that's a 2.1 GiB array; the coarse levels total ~N/3).
+    const int ncoarse = static_cast<int>(levels.size()) - 1;
+    std::vector<Eigen::VectorXd> gap(ncoarse);
+    if (ncoarse > 0) {
+        gap[ncoarse - 1] = restrict_field(g0, Ns);
+        for (int i = ncoarse - 2; i >= 0; --i)
+            gap[i] = restrict_field(gap[i + 1], levels[i + 1]);
+    }
 
     Eigen::VectorXd p_init;
     bool have_init = false;
@@ -115,6 +119,11 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                        Eigen::VectorXd& z) { fp.apply_into(g, contact, z); };
 
         const bool finest = (li + 1 == levels.size());
+        // finest level reads the caller-owned g0 directly; coarse levels own
+        // their restricted copy (freed right after their solve).
+        Eigen::Ref<const Eigen::VectorXd> glvl =
+            finest ? Eigen::Ref<const Eigen::VectorXd>(g0)
+                   : Eigen::Ref<const Eigen::VectorXd>(gap[li]);
         double lvl_tol = finest ? tol : np.coarse_tol;
         // float arithmetic cannot drive the complementarity error below ~1e-6,
         // so clamp the requested tolerance to a reachable floor in that mode.
@@ -146,8 +155,10 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                             Eigen::VectorXf& z) {
                     fp.apply_single_into(g, contact, z);
                 };
-            Eigen::VectorXf g0f = gap[li].cast<float>();
-            gap[li].resize(0); // free the double gap once cast to float
+            Eigen::VectorXf g0f = glvl.cast<float>();
+            // free the coarse double gap once cast to float (the finest-level
+            // double buffer is caller-owned and stays alive)
+            if (!finest) gap[li].resize(0);
             Eigen::VectorXf p0f;
             if (have_init) p0f = p_init.cast<float>();
             res = solve_contact_impl<float>(
@@ -156,9 +167,9 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                 record_history);
         } else {
             res = solve_contact_impl<double>(
-                mv, gap[li], p_bar, lvl_tol, max_iter, use_pr, pc,
+                mv, glvl, p_bar, lvl_tol, max_iter, use_pr, pc,
                 have_init ? &p_init : nullptr, light, record_history);
-            gap[li].resize(0);
+            if (!finest) gap[li].resize(0);
         }
 
         if (!finest) {
