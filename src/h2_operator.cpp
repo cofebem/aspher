@@ -166,6 +166,65 @@ void H2Operator::matvec_into(const Eigen::VectorXd& x, Eigen::VectorXd& y) const
     matvec_impl<double>(x, y, Wleaf_, R_, couplings_, near_stencils_, Mbuf_, Lbuf_);
 }
 
+// OR-propagate leaf occupancy to the ancestors. Boxes are stored level by
+// level (children after their parent), so one reverse sweep suffices.
+static void propagate_up(const std::vector<H2Box>& boxes,
+                         std::vector<std::uint8_t>& occ) {
+    for (int b = static_cast<int>(boxes.size()) - 1; b > 0; --b)
+        if (occ[b]) occ[boxes[b].parent] = 1;
+}
+
+H2Mask H2Operator::build_mask(const std::vector<std::uint8_t>& grid_mask) const {
+    const auto& boxes = tree_.boxes();
+    H2Mask m;
+    m.box_occ.assign(boxes.size(), 0);
+    const int ll = tree_.leaf_level();
+    const int nls = Ns_ / ls_; // leaf boxes per side
+    // scan each leaf's elements with early exit (race-free; O(N) worst case)
+#pragma omp parallel for schedule(dynamic, 8)
+    for (int by = 0; by < nls; ++by)
+        for (int bx = 0; bx < nls; ++bx) {
+            const int ix0 = bx * ls_, iy0 = by * ls_;
+            bool occ = false;
+            for (int ly = 0; ly < ls_ && !occ; ++ly)
+                for (int lx = 0; lx < ls_; ++lx)
+                    if (grid_mask[(iy0 + ly) * Ns_ + ix0 + lx]) {
+                        occ = true;
+                        break;
+                    }
+            if (occ) m.box_occ[tree_.box_id(ll, bx, by)] = 1;
+        }
+    propagate_up(boxes, m.box_occ);
+    return m;
+}
+
+H2Mask H2Operator::build_mask(const int* idx, std::size_t n) const {
+    H2Mask m;
+    m.box_occ.assign(tree_.boxes().size(), 0);
+    const int ll = tree_.leaf_level();
+    for (std::size_t k = 0; k < n; ++k) {
+        const int ix = idx[k] % Ns_, iy = idx[k] / Ns_;
+        m.box_occ[tree_.box_id(ll, ix / ls_, iy / ls_)] = 1;
+    }
+    propagate_up(tree_.boxes(), m.box_occ);
+    return m;
+}
+
+void H2Operator::matvec_masked_into(const Eigen::VectorXd& x, Eigen::VectorXd& y,
+                                    const H2Mask& src, const H2Mask* tgt) const {
+    matvec_masked_impl<double>(x, y, src, tgt, Wleaf_, R_, couplings_,
+                               near_stencils_, Mbuf_, Lbuf_);
+}
+
+void H2Operator::matvec_masked_single_into(const Eigen::VectorXf& x,
+                                           Eigen::VectorXf& y,
+                                           const H2Mask& src,
+                                           const H2Mask* tgt) const {
+    build_single_caches();
+    matvec_masked_impl<float>(x, y, src, tgt, Wleaf_f_, R_f_, couplings_f_,
+                              near_stencils_f_, Mbuf_f_, Lbuf_f_);
+}
+
 void H2Operator::build_single_caches() const {
     if (have_single_) return;
     Wleaf_f_ = Wleaf_.cast<float>();
