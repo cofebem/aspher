@@ -127,6 +127,83 @@ Verification (2026-07-10, `tests/test_active.cpp` M2 section + Python):
   ~15% cut expected); 1 round, rel-L2 3e-14 vs standard nested; wall
   2.54 → 1.05 s (2.4×) already at Ns=1024.
 
-## 4. O(N_c) memory (M3)
+## 4. O(N_c) memory (M3) — implemented
 
-See the plan; this section will be updated as it lands.
+The active-set driver now works entirely on **compressed slot-blocked
+vectors**: `H2Mask` carries an occupied-leaf → slot map, and a compressed
+vector stores each occupied leaf's ls² elements contiguously
+(`slot·ls² + ly·ls + lx`; ~2–4 N_c entries for contact-like masks).
+
+- `H2Operator::matvec_masked_compressed_into` (+float): P2M and the near
+  field read the slot blocks directly (an `Eigen::Map` of the block — the
+  compressed layout removes the strided grid gathers), sharing the
+  M2M/M2L/L2L passes with the grid-masked matvec (extracted verbatim into
+  `masked_upward/coupling/downward`). Bit-for-bit identical to the grid
+  masked matvec (asserted in test_active, both precisions). The M/L scratch
+  stays full-size — it is O(N/ls²·q²) (~0.36 GiB at Ns=16384, q=4, ls=16)
+  and the verification pass needs all target locals anyway.
+- `H2Operator::matvec_masked_stream(_single)`: the verification pass —
+  full-target matvec whose L2P+near output is computed per target leaf into
+  an ls² tile and handed to a thread-safe sink, never materialising an
+  N-sized u. Bit-for-bit identical to the grid masked tgt=all matvec.
+- `FourierPreconditioner::apply_into_indexed(_single)`: scatters the
+  compressed contact-masked residual into the owned full FFT grid (zeroed
+  per apply; the full-grid FFT is the documented M3 trade-off), transforms,
+  gathers back compressed. Matches the full-grid apply to roundoff (the
+  contact-mean reduction order differs; measured 3.5e-18). Plus
+  `release_scratch()`: the driver frees the ~4N-real FFT scratch after the
+  last CG iteration, before the final full-grid pressure scatter.
+- `solve_contact_active_impl` is unchanged algorithmically — it is
+  index-driven and size-agnostic, so it runs on compressed vectors as-is;
+  it only gained `N_grid` and `g_scale` parameters because the load
+  constraint (P = p̄·N_grid) and the error normalisation are physical-grid
+  quantities that can no longer be inferred from the (compressed) g0.
+- Driver: candidate mask and violation mask stay full-grid uint8 (N bytes
+  each); the warm start is remapped slot-block-wise when the candidate set
+  is extended (old slots are a subset of the new ones); the fallback path
+  scatters to the full grid and runs the standard solve (it is the
+  memory-disaster escape hatch, not the normal route); non-light results
+  re-stream the tiles into the displacement/gap arrays.
+
+Measured (co-tenant workstation, seed-42 rough surface, p̄=0.002, tol 1e-8,
+q=4, ls=16, light result, RSS sampled during the solve only):
+
+| case | standard nested | active-set nested |
+|---|---|---|
+| Ns=4096 f64 wall / iters / area | 172.9 s / 91 / 0.005403 | **46.5 s / 91 / 0.005403** (3.7×, 1 round) |
+| Ns=4096 f64 solve-peak RSS | 1593 MB | **841 MB** (1.9×) |
+
+(The Ns=4096 standard numbers match the recorded bench_fft.py reference
+177 s / 91 it / 0.005403.) Ns=16384 measurements below.
+
+**Ns=16384 co-tenant A/B (2026-07-10, full-band k^-1.8 float32-generated
+surface, p̄=0.002, area ≈ 0.0047 — 10× the rfgen study surface's contact, so
+a HARDER case than the official baseline; solve-phase RSS, load ~15):**
+
+| case | wall | iters | area | solve-peak RSS |
+|---|---|---|---|---|
+| standard f32 | 1444.9 s | 86 | 0.004704 | 18.28 GiB |
+| **active f32** | **308.0 s (4.7×)** | 89 | 0.004705 | **10.94 GiB (1.67×)** |
+| active f64 | 1458.2 s | 210 (tol 1e-8) | 0.004683 | 12.50 GiB |
+| standard f64 | — cannot run (>24 GiB, OOM on this 31 GiB machine co-tenant) | | | |
+
+All active runs: 1 verification round, no fallback. The f64 row is the
+enabler result: double precision to tol 1e-8 at Ns=16384 in 12.5 GiB on a
+surface with 10× the study contact. The plan's formal M3 targets (≤ ~8 GiB
+and ≥5× vs the 1168 s baseline, rfgen surface, fresh-reboot protocol) still
+need the official user-protocol run —
+`bench_backend_precision_study.py --backend h2 --precision double
+--ns 16384 --active-set`; on that 10×-sparser contact the candidate set and
+compressed state shrink accordingly, so the projection is favourable.
+
+**δ-scale sensitivity (measured 2026-07-10, full-band k^-1.8 surface,
+p̄=0.002)**: the default `active_delta=0.05` is defined against the level gap
+scale (max−min), which is ~5·rms on this surface → δ ≈ 0.25·rms. The
+coarse-gap-below-δ fraction is then 6.2% of the grid (|C| ≈ 9·N_c at contact
+0.67%), vs 3.4% at δ=0.10·rms and 1.8% at δ=0.03·rms — the prototype's
+validated range gives |C| ≈ 3–5·N_c. The generous default is intentional
+(prototype Q2: a tight δ can produce a CLEAN certificate with 0.5–0.9%
+pressure error — that failure is invisible, whereas a fat candidate set only
+costs memory/time and is tunable via `active_delta`); on memory-critical
+runs with rich spectra, `active_delta≈0.02` (≈0.1·rms here) roughly halves
+the compressed state at the prototype-validated safety margin.

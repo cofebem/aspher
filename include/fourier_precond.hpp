@@ -54,6 +54,29 @@ public:
                            const std::vector<std::uint8_t>& contact,
                            Eigen::VectorXf& z) const;
 
+    // Indexed (compressed) variants for the O(N_c) active-set solve: gc,
+    // contact_c and zc are compressed vectors whose entry k lives at flat
+    // grid index grid_index[k] (all indices distinct). The masked residual is
+    // scattered into the owned Ns×Ns grid (zeroed first — the FFT grid stays
+    // full-size, the documented M3 trade-off), transformed as usual, and
+    // gathered back at the same indices; the contact mean is removed over the
+    // compressed contact set. Matches apply_into on the same data up to the
+    // reduction summation order (zmean), i.e. to roundoff, not bit-for-bit.
+    void apply_into_indexed(const Eigen::VectorXd& gc,
+                            const std::vector<std::uint8_t>& contact_c,
+                            const std::vector<int>& grid_index,
+                            Eigen::VectorXd& zc) const;
+    void apply_single_into_indexed(const Eigen::VectorXf& gc,
+                                   const std::vector<std::uint8_t>& contact_c,
+                                   const std::vector<int>& grid_index,
+                                   Eigen::VectorXf& zc) const;
+
+    // Free the owned grid/spectrum scratch (~4N reals per precision in use)
+    // and the FFT engines. Safe at any point; the next apply reallocates
+    // lazily. The active-set driver calls this after the last CG iteration so
+    // the end-of-solve pressure scatter does not stack on top of it.
+    void release_scratch() const;
+
 private:
     int Ns_, nh_; // nh_ = Ns/2 + 1 stored kx modes
     // (nh x Ns) symbol |k|/Ns² at (kx, ky): wavenumber magnitude with the

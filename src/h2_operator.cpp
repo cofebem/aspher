@@ -174,6 +174,17 @@ static void propagate_up(const std::vector<H2Box>& boxes,
         if (occ[b]) occ[boxes[b].parent] = 1;
 }
 
+// Assign consecutive slot ids to the occupied leaves, in leaf order.
+static void build_slots(H2Mask& m, int leaf_begin, int nleaf) {
+    m.leaf_slot.assign(nleaf, -1);
+    m.slot_leaf.clear();
+    for (int li = 0; li < nleaf; ++li)
+        if (m.box_occ[leaf_begin + li]) {
+            m.leaf_slot[li] = static_cast<int>(m.slot_leaf.size());
+            m.slot_leaf.push_back(li);
+        }
+}
+
 H2Mask H2Operator::build_mask(const std::vector<std::uint8_t>& grid_mask) const {
     const auto& boxes = tree_.boxes();
     H2Mask m;
@@ -195,6 +206,7 @@ H2Mask H2Operator::build_mask(const std::vector<std::uint8_t>& grid_mask) const 
             if (occ) m.box_occ[tree_.box_id(ll, bx, by)] = 1;
         }
     propagate_up(boxes, m.box_occ);
+    build_slots(m, tree_.level_begin(ll), static_cast<int>(leaves_.size()));
     return m;
 }
 
@@ -207,7 +219,23 @@ H2Mask H2Operator::build_mask(const int* idx, std::size_t n) const {
         m.box_occ[tree_.box_id(ll, ix / ls_, iy / ls_)] = 1;
     }
     propagate_up(tree_.boxes(), m.box_occ);
+    build_slots(m, tree_.level_begin(ll), static_cast<int>(leaves_.size()));
     return m;
+}
+
+std::vector<int> H2Operator::slot_grid_indices(const H2Mask& mask) const {
+    const auto& boxes = tree_.boxes();
+    const int ns = mask.nslots();
+    std::vector<int> gi(static_cast<std::size_t>(ns) * ls2_);
+#pragma omp parallel for schedule(static)
+    for (int s = 0; s < ns; ++s) {
+        const H2Box& b = boxes[leaves_[mask.slot_leaf[s]]];
+        int* out = gi.data() + static_cast<std::ptrdiff_t>(s) * ls2_;
+        for (int ly = 0; ly < ls_; ++ly)
+            for (int lx = 0; lx < ls_; ++lx)
+                out[ly * ls_ + lx] = (b.iy0 + ly) * Ns_ + b.ix0 + lx;
+    }
+    return gi;
 }
 
 void H2Operator::matvec_masked_into(const Eigen::VectorXd& x, Eigen::VectorXd& y,
@@ -223,6 +251,38 @@ void H2Operator::matvec_masked_single_into(const Eigen::VectorXf& x,
     build_single_caches();
     matvec_masked_impl<float>(x, y, src, tgt, Wleaf_f_, R_f_, couplings_f_,
                               near_stencils_f_, Mbuf_f_, Lbuf_f_);
+}
+
+void H2Operator::matvec_masked_compressed_into(const Eigen::VectorXd& xc,
+                                               Eigen::VectorXd& yc,
+                                               const H2Mask& mask) const {
+    matvec_masked_compressed_impl<double>(xc, yc, mask, Wleaf_, R_, couplings_,
+                                          near_stencils_, Mbuf_, Lbuf_);
+}
+
+void H2Operator::matvec_masked_compressed_single_into(const Eigen::VectorXf& xc,
+                                                      Eigen::VectorXf& yc,
+                                                      const H2Mask& mask) const {
+    build_single_caches();
+    matvec_masked_compressed_impl<float>(xc, yc, mask, Wleaf_f_, R_f_,
+                                         couplings_f_, near_stencils_f_,
+                                         Mbuf_f_, Lbuf_f_);
+}
+
+void H2Operator::matvec_masked_stream(
+    const Eigen::VectorXd& xc, const H2Mask& src,
+    const std::function<void(int, int, const double*)>& sink) const {
+    matvec_masked_stream_impl<double>(xc, src, sink, Wleaf_, R_, couplings_,
+                                      near_stencils_, Mbuf_, Lbuf_);
+}
+
+void H2Operator::matvec_masked_stream_single(
+    const Eigen::VectorXf& xc, const H2Mask& src,
+    const std::function<void(int, int, const float*)>& sink) const {
+    build_single_caches();
+    matvec_masked_stream_impl<float>(xc, src, sink, Wleaf_f_, R_f_,
+                                     couplings_f_, near_stencils_f_, Mbuf_f_,
+                                     Lbuf_f_);
 }
 
 void H2Operator::build_single_caches() const {

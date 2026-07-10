@@ -6,6 +6,7 @@
 #include "h2_operator.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
@@ -81,12 +82,14 @@ static void dilate_mask(std::vector<std::uint8_t>& m, int Ns, int r) {
 }
 
 // Finest-level active-set solve (plan doc/plans/2026-07-10-active-set-solver.md
-// M2): candidate set from the coarse level, restricted Polonsky-Keer through
-// the masked H2 matvec, full-grid verification per round, violation-extension,
-// and a full-solve fallback after active_max_rounds. p_init_d (the prolonged
-// coarse pressure) is consumed. coarse_gap is the NEXT-TO-FINEST level's gap
-// field ((Ns/2)² entries), sampled by injection — the prolonged fine-grid
-// copy is never materialised (an N-sized array at Ns=16384 is 2.1 GiB).
+// M2 driver + M3 O(N_c) state): candidate set from the coarse level,
+// restricted Polonsky-Keer on COMPRESSED slot-blocked vectors through the
+// compressed masked H2 matvec, streamed full-grid verification per round
+// (per-leaf tiles, no N-sized u), violation-extension, and a full-solve
+// fallback after active_max_rounds. p_init_d (the prolonged coarse pressure)
+// is consumed. coarse_gap is the NEXT-TO-FINEST level's gap field ((Ns/2)²
+// entries), sampled by injection — the prolonged fine-grid copy is never
+// materialised (an N-sized array at Ns=16384 is 2.1 GiB).
 template <class Real>
 static ContactResult active_finest(const H2Operator& h2,
                                    const FourierPreconditioner* fp,
@@ -123,92 +126,156 @@ static ContactResult active_finest(const H2Operator& h2,
             if (gc[ix / 2] < delta) cm[ix] = 1;
     }
 
-    // warm start in working precision; the driver's double array is consumed
-    Vec p0;
-    if constexpr (is_double) p0 = std::move(p_init_d);
-    else p0 = p_init_d.cast<float>();
+    // ── O(N_c) compressed state (M3): everything below works on slot-blocked
+    // vectors of nslots·ls² entries; no N-sized Real vector is allocated on
+    // the certified path (cmask/viol are N bytes, the FFT preconditioner
+    // keeps its full grid — the documented trade-offs).
+    const int ls2 = h2.info().leaf_side * h2.info().leaf_side;
+
+    H2Mask mask = h2.build_mask(cmask);
+    std::vector<int> gi = h2.slot_grid_indices(mask); // slot entry → grid index
+    std::ptrdiff_t S = static_cast<std::ptrdiff_t>(gi.size());
+
+    // compressed gap, candidate positions
+    Vec g0c(S);
+    std::vector<int> cidx;
+    auto gather_level = [&] {
+        g0c.resize(S);
+#pragma omp parallel for schedule(static)
+        for (std::ptrdiff_t k = 0; k < S; ++k) g0c(k) = g0(gi[k]);
+        cidx.clear();
+        for (std::ptrdiff_t k = 0; k < S; ++k)
+            if (cmask[gi[k]]) cidx.push_back(static_cast<int>(k));
+    };
+    gather_level();
+
+    // compressed warm start; the driver's full double array is consumed here
+    Vec p0(S);
+#pragma omp parallel for schedule(static)
+    for (std::ptrdiff_t k = 0; k < S; ++k)
+        p0(k) = static_cast<Real>(p_init_d(gi[k]));
     p_init_d.resize(0);
 
     PrecondIntoT<Real> pc;
     if (fp) {
-        pc = [fp](const Vec& g, const std::vector<std::uint8_t>& contact,
-                  Vec& z) {
-            if constexpr (is_double) fp->apply_into(g, contact, z);
-            else fp->apply_single_into(g, contact, z);
+        pc = [fp, &gi](const Vec& g, const std::vector<std::uint8_t>& contact,
+                       Vec& z) {
+            if constexpr (is_double) fp->apply_into_indexed(g, contact, gi, z);
+            else fp->apply_single_into_indexed(g, contact, gi, z);
         };
     }
 
     ContactResult res;
     std::vector<double> hist;
     std::vector<std::uint8_t> viol(N);
-    std::vector<int> idxv;
-    Vec ufull(N);
     int it_total = 0, rounds = 0;
     bool certified = false;
 
     while (rounds < np.active_max_rounds) {
         ++rounds;
-        const H2Mask mask = h2.build_mask(cmask);
-        idxv.clear();
-        for (int i = 0; i < N; ++i)
-            if (cmask[i]) idxv.push_back(i);
-
         MatVecIntoT<Real> mv = [&h2, &mask](const Vec& x, Vec& y) {
-            if constexpr (is_double) h2.matvec_masked_into(x, y, mask, &mask);
-            else h2.matvec_masked_single_into(x, y, mask, &mask);
+            if constexpr (is_double)
+                h2.matvec_masked_compressed_into(x, y, mask);
+            else
+                h2.matvec_masked_compressed_single_into(x, y, mask);
         };
         res = solve_contact_active_impl<Real>(
-            mv, g0, static_cast<Real>(p_bar), static_cast<Real>(lvl_tol),
-            max_iter, use_pr, pc, idxv, &p0, record_history);
+            mv, g0c, static_cast<Real>(p_bar), static_cast<Real>(lvl_tol),
+            max_iter, use_pr, pc, cidx, &p0, record_history, N,
+            static_cast<Real>(g_scale));
         it_total += res.iterations;
         if (record_history)
             hist.insert(hist.end(), res.error_history.begin(),
                         res.error_history.end());
 
-        // verification: one masked-source, full-target matvec + gap scan
-        Vec pr; // working-precision pressure (unused when Real = double)
+        // verification: streamed full-target matvec from the compressed
+        // pressure — per-leaf ls² tiles, no N-sized u
+        Vec pr; // working-precision pressure (res.pressure itself for double)
+        const Vec* psrc;
         if constexpr (is_double) {
-            h2.matvec_masked_into(res.pressure, ufull, mask, nullptr);
+            psrc = &res.pressure;
         } else {
             pr = res.pressure.template cast<Real>();
-            h2.matvec_masked_single_into(pr, ufull, mask, nullptr);
+            psrc = &pr;
         }
         const double a = res.approach;
-        long nviol = 0;
-#pragma omp parallel for schedule(static) reduction(+ : nviol)
-        for (int i = 0; i < N; ++i) {
-            std::uint8_t v = 0;
-            if (!cmask[i] &&
-                static_cast<double>(ufull(i)) + static_cast<double>(g0(i)) - a <
-                    vthresh)
-                v = 1;
-            viol[i] = v;
-            nviol += v;
-        }
-        if (nviol == 0) {
+        const int ls = h2.info().leaf_side;
+        std::atomic<long> nviol{0};
+        auto sink = [&](int ix0, int iy0, const Real* tile) {
+            long local = 0;
+            for (int ly = 0, t = 0; ly < ls; ++ly) {
+                const std::ptrdiff_t row =
+                    static_cast<std::ptrdiff_t>(iy0 + ly) * Ns + ix0;
+                for (int lx = 0; lx < ls; ++lx, ++t) {
+                    const std::ptrdiff_t i = row + lx;
+                    if (!cmask[i] &&
+                        static_cast<double>(tile[t]) +
+                                static_cast<double>(g0(i)) - a <
+                            vthresh) {
+                        viol[i] = 1;
+                        ++local;
+                    }
+                }
+            }
+            if (local) nviol.fetch_add(local, std::memory_order_relaxed);
+        };
+        std::fill(viol.begin(), viol.end(), 0);
+        if constexpr (is_double) h2.matvec_masked_stream(*psrc, mask, sink);
+        else h2.matvec_masked_stream_single(*psrc, mask, sink);
+
+        if (nviol.load() == 0) {
             certified = true;
             break;
         }
-        // extend C with the dilated violations and resume warm-started
+        // extend C with the dilated violations, rebuild the compressed
+        // layout (old slots are a subset of the new ones), remap the warm
+        // start slot-block-wise, and resume
         dilate_mask(viol, Ns, np.active_halo);
 #pragma omp parallel for schedule(static)
         for (int i = 0; i < N; ++i)
             if (viol[i]) cmask[i] = 1;
-        if constexpr (is_double) p0 = std::move(res.pressure);
-        else p0 = std::move(pr);
+
+        H2Mask old_mask = std::move(mask);
+        mask = h2.build_mask(cmask);
+        gi = h2.slot_grid_indices(mask);
+        S = static_cast<std::ptrdiff_t>(gi.size());
+        gather_level();
+
+        Vec pnew = Vec::Zero(S);
+        const int nold = old_mask.nslots();
+#pragma omp parallel for schedule(static)
+        for (int s = 0; s < nold; ++s) {
+            const int sn = mask.leaf_slot[old_mask.slot_leaf[s]];
+            pnew.segment(static_cast<std::ptrdiff_t>(sn) * ls2, ls2) =
+                psrc->segment(static_cast<std::ptrdiff_t>(s) * ls2, ls2);
+        }
+        p0 = std::move(pnew);
     }
 
     if (!certified) {
         // safety net: the candidate set never certified — run the standard
-        // full solve, warm-started from the last restricted iterate
+        // FULL-GRID solve, warm-started from the last restricted iterate.
+        // This path allocates the full CG state (it is the memory-disaster
+        // escape hatch, not the normal route).
         MatVecIntoT<Real> mvf = [&h2](const Vec& x, Vec& y) {
             if constexpr (is_double) h2.matvec_into(x, y);
             else h2.matvec_single_into(x, y);
         };
-        // p0 holds the last restricted solution: the loop only exits
-        // uncertified through the violations branch, which reassigns p0
-        // (res.pressure may already be moved-from at this point)
-        Vec pf = std::move(p0);
+        PrecondIntoT<Real> pcf;
+        if (fp) {
+            pcf = [fp](const Vec& g, const std::vector<std::uint8_t>& contact,
+                       Vec& z) {
+                if constexpr (is_double) fp->apply_into(g, contact, z);
+                else fp->apply_single_into(g, contact, z);
+            };
+        }
+        // scatter the last restricted solution (p0: the loop only exits
+        // uncertified through the violations branch, which reassigns p0 on
+        // the CURRENT slot layout) to the full grid.
+        Vec pf = Vec::Zero(N);
+#pragma omp parallel for schedule(static)
+        for (std::ptrdiff_t k = 0; k < S; ++k) pf(gi[k]) = p0(k);
+        p0.resize(0);
         // Seed the (dilated) violating points into the warm start's contact
         // set. The full solver's complementarity error Σ p|g| is blind to
         // p=0 ∧ g<0 points, so a warm start that is converged on the old
@@ -221,21 +288,50 @@ static ContactResult active_finest(const H2Operator& h2,
             if (viol[i] && pf(i) <= Real(0)) pf(i) = static_cast<Real>(p_bar);
         res = solve_contact_impl<Real>(mvf, g0, static_cast<Real>(p_bar),
                                        static_cast<Real>(lvl_tol), max_iter,
-                                       use_pr, pc, &pf, light, record_history);
+                                       use_pr, pcf, &pf, light, record_history);
         it_total += res.iterations;
         if (record_history)
             hist.insert(hist.end(), res.error_history.begin(),
                         res.error_history.end());
         res.active_fallback = true;
-    } else if (!light) {
-        // full displacement/gap fields from the final verification matvec
-        res.displacement = ufull.template cast<double>();
-        Eigen::VectorXd gp(N);
-        const double a = res.approach;
+    } else {
+        // certified: free the preconditioner's full-grid FFT scratch before
+        // materialising any full field, then scatter the compressed pressure
+        if (fp) fp->release_scratch();
+        Eigen::VectorXd pfull = Eigen::VectorXd::Zero(N);
 #pragma omp parallel for schedule(static)
-        for (int i = 0; i < N; ++i)
-            gp(i) = static_cast<double>(ufull(i)) + static_cast<double>(g0(i)) - a;
-        res.gap = std::move(gp);
+        for (std::ptrdiff_t k = 0; k < S; ++k) pfull(gi[k]) = res.pressure(k);
+        if (!light) {
+            // full displacement/gap fields: one more streamed pass writing
+            // the tiles into the result arrays
+            Vec pr;
+            const Vec* psrc;
+            if constexpr (is_double) {
+                psrc = &res.pressure;
+            } else {
+                pr = res.pressure.template cast<Real>();
+                psrc = &pr;
+            }
+            Eigen::VectorXd disp(N), gp(N);
+            const double a = res.approach;
+            const int ls = h2.info().leaf_side;
+            auto fill = [&](int ix0, int iy0, const Real* tile) {
+                for (int ly = 0, t = 0; ly < ls; ++ly) {
+                    const std::ptrdiff_t row =
+                        static_cast<std::ptrdiff_t>(iy0 + ly) * Ns + ix0;
+                    for (int lx = 0; lx < ls; ++lx, ++t) {
+                        const std::ptrdiff_t i = row + lx;
+                        disp(i) = static_cast<double>(tile[t]);
+                        gp(i) = disp(i) + static_cast<double>(g0(i)) - a;
+                    }
+                }
+            };
+            if constexpr (is_double) h2.matvec_masked_stream(*psrc, mask, fill);
+            else h2.matvec_masked_stream_single(*psrc, mask, fill);
+            res.displacement = std::move(disp);
+            res.gap = std::move(gp);
+        }
+        res.pressure = std::move(pfull);
     }
     res.active_rounds = rounds;
     res.iterations = it_total;

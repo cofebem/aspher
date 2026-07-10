@@ -59,7 +59,7 @@ def build_gap(Ns):
     return gap0
 
 
-def worker(backend, precision, Ns):
+def worker(backend, precision, Ns, active_set=False):
     import resource
     import numpy as np
     sys.path.insert(0, os.path.join(HERE, "python"))
@@ -79,6 +79,8 @@ def worker(backend, precision, Ns):
     if backend == "h2":
         kwargs["q"] = q
         kwargs["leaf_side"] = leaf_side
+    if active_set:
+        kwargs["active_set"] = True  # h2 only; defaults for delta/halo/rounds
 
     times = []
     res = None
@@ -89,7 +91,8 @@ def worker(backend, precision, Ns):
 
     rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     out = {
-        "backend": backend, "precision": precision, "Ns": Ns, "N": Ns * Ns,
+        "backend": backend + ("-active" if active_set else ""),
+        "precision": precision, "Ns": Ns, "N": Ns * Ns,
         "q": q, "leaf_side": leaf_side,
         "wall_time_s": min(times), "wall_time_all_s": times,
         "rss_gib": rss_kb / 1048576.0,
@@ -102,6 +105,9 @@ def worker(backend, precision, Ns):
         "k_low": 12.0 / Ns, "k_high": K_HIGH,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
+    if active_set:
+        out["active_rounds"] = int(res.active_rounds)
+        out["active_fallback"] = bool(res.active_fallback)
     print("JSON " + json.dumps(out), flush=True)
 
 
@@ -176,11 +182,14 @@ if __name__ == "__main__":
     ap.add_argument("--backend", choices=BACKENDS, help="single-case worker mode")
     ap.add_argument("--precision", choices=PRECISIONS)
     ap.add_argument("--ns", type=int)
+    ap.add_argument("--active-set", action="store_true",
+                    help="worker mode: finest-level active-set solve (h2 only);"
+                         " recorded as backend 'h2-active'")
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--max-ns", type=int, default=16384)
     args = ap.parse_args()
     if args.backend:
-        worker(args.backend, args.precision, args.ns)
+        worker(args.backend, args.precision, args.ns, args.active_set)
     else:
         sweep(args.timeout, args.force, args.max_ns)

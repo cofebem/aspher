@@ -7,6 +7,7 @@
 #include <Eigen/Dense>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace hmc {
@@ -30,8 +31,18 @@ struct H2Info {
 // H2Operator::build_mask; leaf occupancy is OR-propagated to all ancestors,
 // so the occupied set is closed under taking parents (an occupied non-root
 // box always has an occupied parent — L2L relies on this).
+//
+// Slot map (the O(N_c) compressed representation): occupied leaves get
+// consecutive slot ids in leaf order. A compressed vector has
+// nslots()*ls² entries; slot s stores its leaf's elements contiguously in
+// local row-major order, entry s*ls² + ly*ls + lx ↔ grid element
+// (ix0 + lx, iy0 + ly). This is a superset of the marked set (whole leaves),
+// ~2–4 N_c for contact-like masks.
 struct H2Mask {
     std::vector<std::uint8_t> box_occ; // size = number of tree boxes
+    std::vector<int> leaf_slot;        // per leaf li (leaf order): slot or -1
+    std::vector<int> slot_leaf;        // per slot: leaf index li
+    int nslots() const { return static_cast<int>(slot_leaf.size()); }
 };
 
 // Matrix-free black-box FMM (Fong & Darve 2009) operator for the translation-
@@ -84,6 +95,37 @@ public:
     void matvec_masked_single_into(const Eigen::VectorXf& x, Eigen::VectorXf& y,
                                    const H2Mask& src,
                                    const H2Mask* tgt = nullptr) const;
+
+    // ── O(N_c) compressed variants (active-set milestone M3) ──
+    // Flat grid index of every compressed-vector entry, in slot order
+    // (size nslots()*ls²): the driver's gather/scatter map.
+    std::vector<int> slot_grid_indices(const H2Mask& mask) const;
+
+    // Compressed masked matvec, src = tgt = mask: xc and yc are compressed
+    // vectors (nslots()*ls² entries, see H2Mask). No N-sized array anywhere.
+    // Same bit-for-bit contract as matvec_masked_into: identical values in
+    // identical summation order, only the addressing differs.
+    void matvec_masked_compressed_into(const Eigen::VectorXd& xc,
+                                       Eigen::VectorXd& yc,
+                                       const H2Mask& mask) const;
+    void matvec_masked_compressed_single_into(const Eigen::VectorXf& xc,
+                                              Eigen::VectorXf& yc,
+                                              const H2Mask& mask) const;
+
+    // Streamed full-target matvec from a compressed masked source (the M3
+    // verification pass): for EVERY leaf of the grid, computes the ls² output
+    // tile (tile[ly*ls+lx] = u at (ix0+lx, iy0+ly)) and hands it to sink,
+    // then discards it — O(N) compute, O(ls² per thread) output memory.
+    // sink is called concurrently from the OpenMP team: it must be
+    // thread-safe (leaves are disjoint, so writes keyed by leaf are safe).
+    void matvec_masked_stream(
+        const Eigen::VectorXd& xc, const H2Mask& src,
+        const std::function<void(int ix0, int iy0, const double* tile)>& sink)
+        const;
+    void matvec_masked_stream_single(
+        const Eigen::VectorXf& xc, const H2Mask& src,
+        const std::function<void(int ix0, int iy0, const float* tile)>& sink)
+        const;
 
     H2Info info() const { return info_; }
     void print_statistics() const;
@@ -159,6 +201,56 @@ private:
         const Eigen::Matrix<S, Eigen::Dynamic, 1>& x,
         Eigen::Matrix<S, Eigen::Dynamic, 1>& y,
         const H2Mask& src, const H2Mask* tgt,
+        const Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& Wleaf,
+        const std::array<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>, 4>& R,
+        const std::vector<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>>& couplings,
+        const std::vector<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>>& near_st,
+        Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& M,
+        Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& L) const;
+
+    // Shared masked tree passes (M2M / M2L / L2L), used by the grid,
+    // compressed, and streamed masked matvecs. Extracted verbatim from
+    // matvec_masked_impl — identical operations in identical order, so all
+    // masked variants inherit the bit-for-bit contract.
+    template <class S>
+    void masked_upward(
+        const H2Mask& src,
+        const std::array<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>, 4>& R,
+        Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& M) const;
+    template <class S>
+    void masked_coupling(
+        const H2Mask& src, const H2Mask* tgt,
+        const std::vector<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>>& couplings,
+        const Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& M,
+        Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& L) const;
+    template <class S>
+    void masked_downward(
+        const H2Mask* tgt,
+        const std::array<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>, 4>& R,
+        Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& L) const;
+
+    // P2M from a compressed (slot-blocked) source vector.
+    template <class S>
+    void p2m_compressed(
+        const Eigen::Matrix<S, Eigen::Dynamic, 1>& xc, const H2Mask& src,
+        const Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& Wleaf,
+        Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& M) const;
+
+    template <class S>
+    void matvec_masked_compressed_impl(
+        const Eigen::Matrix<S, Eigen::Dynamic, 1>& xc,
+        Eigen::Matrix<S, Eigen::Dynamic, 1>& yc, const H2Mask& mask,
+        const Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& Wleaf,
+        const std::array<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>, 4>& R,
+        const std::vector<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>>& couplings,
+        const std::vector<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>>& near_st,
+        Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& M,
+        Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& L) const;
+
+    template <class S>
+    void matvec_masked_stream_impl(
+        const Eigen::Matrix<S, Eigen::Dynamic, 1>& xc, const H2Mask& src,
+        const std::function<void(int, int, const S*)>& sink,
         const Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& Wleaf,
         const std::array<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>, 4>& R,
         const std::vector<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>>& couplings,
@@ -311,49 +403,9 @@ void H2Operator::matvec_masked_impl(
         }
     }
 
-    // M2M: occupied parents combine their occupied children only (occupancy
-    // is the OR of the children's, so an occupied parent has one).
-    for (int l = tree_.leaf_level() - 1; l >= 0; --l) {
-        const int b0 = tree_.level_begin(l);
-        const int nb = (1 << l) * (1 << l);
-#pragma omp parallel for schedule(dynamic, 32)
-        for (int k = 0; k < nb; ++k) {
-            const int b = b0 + k;
-            if (!so[b]) continue;
-            auto Mb = M.col(b);
-            Mb.setZero();
-            for (int c = 0; c < 4; ++c) {
-                const int cc = boxes[b].child[c];
-                if (cc >= 0 && so[cc]) Mb.noalias() += R[c] * M.col(cc);
-            }
-        }
-    }
-
-    // M2L on tgt boxes; non-src sources are skipped inside the CSR walk (one
-    // byte load per interaction — their moments are exact zeros for x
-    // supported on src, so skipping them changes nothing).
-#pragma omp parallel for schedule(dynamic, 64)
-    for (int t = 0; t < nbox; ++t) {
-        if (to && !to[t]) continue;
-        auto Lt = L.col(t);
-        Lt.setZero();
-        for (std::int64_t k = far_off_[t]; k < far_off_[t + 1]; ++k)
-            if (so[far_[k].source_box])
-                Lt.noalias() += couplings[far_[k].coupling_id] * M.col(far_[k].source_box);
-    }
-
-    // L2L: the tgt set is closed under parents, so L.col(parent) is valid.
-    for (int l = 1; l <= tree_.leaf_level(); ++l) {
-        const int b0 = tree_.level_begin(l);
-        const int nb = (1 << l) * (1 << l);
-#pragma omp parallel for schedule(dynamic, 32)
-        for (int k = 0; k < nb; ++k) {
-            const int b = b0 + k;
-            if (to && !to[b]) continue;
-            const int c = (boxes[b].bx & 1) + 2 * (boxes[b].by & 1);
-            L.col(b).noalias() += R[c].transpose() * L.col(boxes[b].parent);
-        }
-    }
+    masked_upward<S>(src, R, M);
+    masked_coupling<S>(src, tgt, couplings, M, L);
+    masked_downward<S>(tgt, R, L);
 
     // L2P + near on tgt leaves; near sums skip non-src source leaves (their
     // x fields are zero).
@@ -382,6 +434,218 @@ void H2Operator::matvec_masked_impl(
             for (int ly = 0; ly < ls_; ++ly)
                 y.segment((iy0 + ly) * Ns_ + ix0, ls_) =
                     YtT.col(ly) + yloc.segment(ly * ls_, ls_);
+        }
+    }
+}
+
+// ── shared masked tree passes ─────────────────────────────────────────────────
+// M2M: occupied parents combine their occupied children only (occupancy is
+// the OR of the children's, so an occupied parent has one).
+template <class S>
+void H2Operator::masked_upward(
+    const H2Mask& src,
+    const std::array<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>, 4>& R,
+    Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& M) const {
+    const auto& boxes = tree_.boxes();
+    const std::uint8_t* so = src.box_occ.data();
+    for (int l = tree_.leaf_level() - 1; l >= 0; --l) {
+        const int b0 = tree_.level_begin(l);
+        const int nb = (1 << l) * (1 << l);
+#pragma omp parallel for schedule(dynamic, 32)
+        for (int k = 0; k < nb; ++k) {
+            const int b = b0 + k;
+            if (!so[b]) continue;
+            auto Mb = M.col(b);
+            Mb.setZero();
+            for (int c = 0; c < 4; ++c) {
+                const int cc = boxes[b].child[c];
+                if (cc >= 0 && so[cc]) Mb.noalias() += R[c] * M.col(cc);
+            }
+        }
+    }
+}
+
+// M2L on tgt boxes (nullptr → all); non-src sources are skipped inside the
+// CSR walk (one byte load per interaction — their moments are exact zeros
+// for x supported on src, so skipping them changes nothing).
+template <class S>
+void H2Operator::masked_coupling(
+    const H2Mask& src, const H2Mask* tgt,
+    const std::vector<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>>& couplings,
+    const Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& M,
+    Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& L) const {
+    const int nbox = static_cast<int>(tree_.boxes().size());
+    const std::uint8_t* so = src.box_occ.data();
+    const std::uint8_t* to = tgt ? tgt->box_occ.data() : nullptr;
+#pragma omp parallel for schedule(dynamic, 64)
+    for (int t = 0; t < nbox; ++t) {
+        if (to && !to[t]) continue;
+        auto Lt = L.col(t);
+        Lt.setZero();
+        for (std::int64_t k = far_off_[t]; k < far_off_[t + 1]; ++k)
+            if (so[far_[k].source_box])
+                Lt.noalias() += couplings[far_[k].coupling_id] * M.col(far_[k].source_box);
+    }
+}
+
+// L2L: the tgt set is closed under parents, so L.col(parent) is valid.
+template <class S>
+void H2Operator::masked_downward(
+    const H2Mask* tgt,
+    const std::array<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>, 4>& R,
+    Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& L) const {
+    const auto& boxes = tree_.boxes();
+    const std::uint8_t* to = tgt ? tgt->box_occ.data() : nullptr;
+    for (int l = 1; l <= tree_.leaf_level(); ++l) {
+        const int b0 = tree_.level_begin(l);
+        const int nb = (1 << l) * (1 << l);
+#pragma omp parallel for schedule(dynamic, 32)
+        for (int k = 0; k < nb; ++k) {
+            const int b = b0 + k;
+            if (to && !to[b]) continue;
+            const int c = (boxes[b].bx & 1) + 2 * (boxes[b].by & 1);
+            L.col(b).noalias() += R[c].transpose() * L.col(boxes[b].parent);
+        }
+    }
+}
+
+// P2M from a compressed source: slot s IS the leaf's element block in local
+// row-major order, so XsT is a direct Map — same values, same products as
+// the grid gather, hence bit-identical moments.
+template <class S>
+void H2Operator::p2m_compressed(
+    const Eigen::Matrix<S, Eigen::Dynamic, 1>& xc, const H2Mask& src,
+    const Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& Wleaf,
+    Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& M) const {
+    using Vec = Eigen::Matrix<S, Eigen::Dynamic, 1>;
+    using Mat = Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>;
+    const int nslot = src.nslots();
+#pragma omp parallel
+    {
+        Mat T(q_, ls_), B(q_, q_);
+#pragma omp for schedule(static)
+        for (int s = 0; s < nslot; ++s) {
+            const int t = leaves_[src.slot_leaf[s]];
+            Eigen::Map<const Mat> XsT(
+                xc.data() + static_cast<std::ptrdiff_t>(s) * ls2_, ls_, ls_);
+            T.noalias() = Wleaf.transpose() * XsT;
+            B.noalias() = T * Wleaf;
+            M.col(t) = Eigen::Map<const Vec>(B.data(), q2_);
+        }
+    }
+}
+
+// ── matvec_masked_compressed_impl ─────────────────────────────────────────────
+template <class S>
+void H2Operator::matvec_masked_compressed_impl(
+    const Eigen::Matrix<S, Eigen::Dynamic, 1>& xc,
+    Eigen::Matrix<S, Eigen::Dynamic, 1>& yc, const H2Mask& mask,
+    const Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& Wleaf,
+    const std::array<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>, 4>& R,
+    const std::vector<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>>& couplings,
+    const std::vector<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>>& near_st,
+    Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& M,
+    Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& L) const {
+    using Vec = Eigen::Matrix<S, Eigen::Dynamic, 1>;
+    using Mat = Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>;
+    const auto& boxes = tree_.boxes();
+    const int nbox = static_cast<int>(boxes.size());
+    const int nslot = mask.nslots();
+    const int leaf_begin = tree_.level_begin(tree_.leaf_level());
+    const std::uint8_t* so = mask.box_occ.data();
+    if (M.cols() != nbox) M.resize(q2_, nbox);
+    if (L.cols() != nbox) L.resize(q2_, nbox);
+    if (yc.size() != xc.size()) yc.resize(xc.size());
+
+    p2m_compressed<S>(xc, mask, Wleaf, M);
+    masked_upward<S>(mask, R, M);
+    masked_coupling<S>(mask, &mask, couplings, M, L);
+    masked_downward<S>(&mask, R, L);
+
+    // L2P + near over the slots; near sources are src-occupied by the mask
+    // check, so their slot lookup always succeeds
+#pragma omp parallel
+    {
+        Mat T(ls_, q_), YtT(ls_, ls_);
+        Vec yloc(ls2_);
+#pragma omp for schedule(static)
+        for (int s = 0; s < nslot; ++s) {
+            const int li = mask.slot_leaf[s];
+            const int t = leaves_[li];
+            Eigen::Map<const Mat> LmT(L.col(t).data(), q_, q_);
+            T.noalias() = Wleaf * LmT;
+            YtT.noalias() = T * Wleaf.transpose();
+
+            yloc.setZero();
+            for (std::int64_t k = near_off_[li]; k < near_off_[li + 1]; ++k) {
+                const int sbox = near_[k].source_box;
+                if (!so[sbox]) continue;
+                const int ss = mask.leaf_slot[sbox - leaf_begin];
+                Eigen::Map<const Vec> xs(
+                    xc.data() + static_cast<std::ptrdiff_t>(ss) * ls2_, ls2_);
+                yloc.noalias() += near_st[near_[k].stencil_id] * xs;
+            }
+            for (int ly = 0; ly < ls_; ++ly)
+                yc.segment(static_cast<std::ptrdiff_t>(s) * ls2_ + ly * ls_, ls_) =
+                    YtT.col(ly) + yloc.segment(ly * ls_, ls_);
+        }
+    }
+}
+
+// ── matvec_masked_stream_impl ─────────────────────────────────────────────────
+template <class S>
+void H2Operator::matvec_masked_stream_impl(
+    const Eigen::Matrix<S, Eigen::Dynamic, 1>& xc, const H2Mask& src,
+    const std::function<void(int, int, const S*)>& sink,
+    const Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& Wleaf,
+    const std::array<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>, 4>& R,
+    const std::vector<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>>& couplings,
+    const std::vector<Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>>& near_st,
+    Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& M,
+    Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& L) const {
+    using Vec = Eigen::Matrix<S, Eigen::Dynamic, 1>;
+    using Mat = Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>;
+    const auto& boxes = tree_.boxes();
+    const int nbox = static_cast<int>(boxes.size());
+    const int nleaf = static_cast<int>(leaves_.size());
+    const int leaf_begin = tree_.level_begin(tree_.leaf_level());
+    const std::uint8_t* so = src.box_occ.data();
+    if (M.cols() != nbox) M.resize(q2_, nbox);
+    if (L.cols() != nbox) L.resize(q2_, nbox);
+
+    p2m_compressed<S>(xc, src, Wleaf, M);
+    masked_upward<S>(src, R, M);
+    masked_coupling<S>(src, nullptr, couplings, M, L); // all targets
+    masked_downward<S>(nullptr, R, L);
+
+    // L2P + near tile per leaf, handed to the sink and discarded — no
+    // N-sized output. The tile layout matches the compressed slot layout:
+    // tile[ly*ls + lx] = u at (ix0 + lx, iy0 + ly).
+#pragma omp parallel
+    {
+        Mat T(ls_, q_), YtT(ls_, ls_);
+        Vec yloc(ls2_), tile(ls2_);
+#pragma omp for schedule(dynamic, 32)
+        for (int li = 0; li < nleaf; ++li) {
+            const int t = leaves_[li];
+            const int ix0 = boxes[t].ix0, iy0 = boxes[t].iy0;
+            Eigen::Map<const Mat> LmT(L.col(t).data(), q_, q_);
+            T.noalias() = Wleaf * LmT;
+            YtT.noalias() = T * Wleaf.transpose();
+
+            yloc.setZero();
+            for (std::int64_t k = near_off_[li]; k < near_off_[li + 1]; ++k) {
+                const int sbox = near_[k].source_box;
+                if (!so[sbox]) continue;
+                const int ss = src.leaf_slot[sbox - leaf_begin];
+                Eigen::Map<const Vec> xs(
+                    xc.data() + static_cast<std::ptrdiff_t>(ss) * ls2_, ls2_);
+                yloc.noalias() += near_st[near_[k].stencil_id] * xs;
+            }
+            for (int ly = 0; ly < ls_; ++ly)
+                tile.segment(ly * ls_, ls_) =
+                    YtT.col(ly) + yloc.segment(ly * ls_, ls_);
+            sink(ix0, iy0, tile.data());
         }
     }
 }

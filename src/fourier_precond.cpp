@@ -101,6 +101,63 @@ apply_t(int Ns, int nh, const Eigen::MatrixXf& wh,
     }
 }
 
+// Indexed (compressed) apply: same transform pipeline as apply_t, but the
+// scatter/gather run over the compressed entries through grid_index. The
+// full grid G must be zeroed first (the compressed set is sparse in it).
+template <class S>
+static void
+apply_indexed_t(int Ns, int nh, const Eigen::MatrixXf& wh,
+                Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>& G,
+                Eigen::Matrix<std::complex<S>, Eigen::Dynamic, Eigen::Dynamic>& C,
+                std::unique_ptr<fft::SquareR2C<S>>& eng,
+                const Eigen::Matrix<S, Eigen::Dynamic, 1>& gc,
+                const std::vector<std::uint8_t>& contact_c,
+                const std::vector<int>& grid_index,
+                Eigen::Matrix<S, Eigen::Dynamic, 1>& zc) {
+    const std::ptrdiff_t nc = static_cast<std::ptrdiff_t>(grid_index.size());
+    if (!eng) {
+        G.resize(Ns, Ns);
+        C.resize(nh, Ns);
+        eng = std::make_unique<fft::SquareR2C<S>>();
+        eng->bind(Ns, G.data(), C.data());
+    }
+    if (zc.size() != nc) zc.resize(nc);
+
+    G.setZero();
+    S* Gd = G.data(); // G(ix, iy) at flat grid index iy*Ns + ix
+#pragma omp parallel for schedule(static)
+    for (std::ptrdiff_t k = 0; k < nc; ++k)
+        if (contact_c[k]) Gd[grid_index[k]] = gc(k);
+
+    eng->fwd();
+#pragma omp parallel for schedule(static)
+    for (int ky = 0; ky < Ns; ++ky) {
+        std::complex<S>* c = C.data() + static_cast<std::ptrdiff_t>(ky) * nh;
+        const float* w = wh.data() + static_cast<std::ptrdiff_t>(ky) * nh;
+        for (int kx = 0; kx < nh; ++kx) c[kx] *= static_cast<S>(w[kx]);
+    }
+    eng->inv();
+
+    double zsum = 0.0;
+    long ncontact = 0;
+#pragma omp parallel for schedule(static) reduction(+ : zsum, ncontact)
+    for (std::ptrdiff_t k = 0; k < nc; ++k) {
+        if (contact_c[k]) {
+            zc(k) = Gd[grid_index[k]];
+            zsum += static_cast<double>(zc(k));
+            ++ncontact;
+        } else {
+            zc(k) = S(0);
+        }
+    }
+    if (ncontact) {
+        const S zmean = static_cast<S>(zsum / static_cast<double>(ncontact));
+#pragma omp parallel for schedule(static)
+        for (std::ptrdiff_t k = 0; k < nc; ++k)
+            if (contact_c[k]) zc(k) -= zmean;
+    }
+}
+
 Eigen::VectorXd
 FourierPreconditioner::apply(const Eigen::VectorXd& g,
                              const std::vector<std::uint8_t>& contact) const {
@@ -127,6 +184,30 @@ void FourierPreconditioner::apply_single_into(
     const Eigen::VectorXf& g, const std::vector<std::uint8_t>& contact,
     Eigen::VectorXf& z) const {
     apply_t<float>(Ns_, nh_, wh_, Gf_, Cf_, fft_f_, g, contact, z);
+}
+
+void FourierPreconditioner::apply_into_indexed(
+    const Eigen::VectorXd& gc, const std::vector<std::uint8_t>& contact_c,
+    const std::vector<int>& grid_index, Eigen::VectorXd& zc) const {
+    apply_indexed_t<double>(Ns_, nh_, wh_, Gd_, Cd_, fft_d_, gc, contact_c,
+                            grid_index, zc);
+}
+
+void FourierPreconditioner::apply_single_into_indexed(
+    const Eigen::VectorXf& gc, const std::vector<std::uint8_t>& contact_c,
+    const std::vector<int>& grid_index, Eigen::VectorXf& zc) const {
+    apply_indexed_t<float>(Ns_, nh_, wh_, Gf_, Cf_, fft_f_, gc, contact_c,
+                           grid_index, zc);
+}
+
+void FourierPreconditioner::release_scratch() const {
+    // engines first: they hold plans bound to the scratch pointers
+    fft_d_.reset();
+    fft_f_.reset();
+    Gd_.resize(0, 0);
+    Cd_.resize(0, 0);
+    Gf_.resize(0, 0);
+    Cf_.resize(0, 0);
 }
 
 } // namespace hmc

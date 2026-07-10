@@ -13,7 +13,13 @@
 // certificate, in both precisions; and a deliberately broken candidate set
 // (delta=0, halo=0, one round) must trigger the full-solve fallback and
 // still return the correct pressures rather than silently-wrong ones.
+// M3 — O(N_c) compressed variants: the slot-blocked compressed matvec and
+// the streamed verification must match the grid-based masked matvec
+// bit-for-bit (same values, same summation order, different addressing);
+// the indexed preconditioner apply must match the full-grid apply to
+// roundoff (its contact-mean reduction runs in a different order).
 #include "boussinesq_kernel.hpp"
+#include "fourier_precond.hpp"
 #include "h2_operator.hpp"
 #include "nested_solve.hpp"
 
@@ -211,6 +217,93 @@ int main() {
     }
 
     std::printf("test_active (M1): all passed\n");
+
+    // ── M3: compressed matvec, streamed verification, indexed precond ───────
+    {
+        const int ls2 = ls * ls;
+        const std::vector<int> gi = ref_op.slot_grid_indices(src);
+        const std::ptrdiff_t S = static_cast<std::ptrdiff_t>(gi.size());
+        CHECK(S == static_cast<std::ptrdiff_t>(src.nslots()) * ls2);
+
+        Eigen::VectorXd xc(S);
+        for (std::ptrdiff_t k = 0; k < S; ++k) xc(k) = x(gi[k]);
+
+        // compressed masked matvec == grid masked matvec, bit-for-bit
+        {
+            hmc::H2Operator op(kernel, hp);
+            op.build();
+            Eigen::VectorXd yc;
+            op.matvec_masked_compressed_into(xc, yc, src);
+            int bad = 0;
+            for (std::ptrdiff_t k = 0; k < S; ++k)
+                if (yc(k) != y_ref(gi[k])) ++bad;
+            std::printf("compressed f64:   %d mismatches\n", bad);
+            CHECK(bad == 0);
+        }
+        {
+            hmc::H2Operator op(kernel, hp);
+            op.build();
+            Eigen::VectorXf ycf;
+            const Eigen::VectorXf xcf = xc.cast<float>();
+            op.matvec_masked_compressed_single_into(xcf, ycf, src);
+            int bad = 0;
+            for (std::ptrdiff_t k = 0; k < S; ++k)
+                if (ycf(k) != yf_ref(gi[k])) ++bad;
+            std::printf("compressed f32:   %d mismatches\n", bad);
+            CHECK(bad == 0);
+        }
+
+        // streamed verification tiles == grid masked tgt=all, bit-for-bit
+        {
+            hmc::H2Operator op(kernel, hp);
+            op.build();
+            std::vector<int> bad(1, 0);
+            Eigen::VectorXd ystream(N);
+            op.matvec_masked_stream(
+                xc, src, [&](int ix0, int iy0, const double* tile) {
+                    for (int ly = 0, t = 0; ly < ls; ++ly)
+                        for (int lx = 0; lx < ls; ++lx, ++t)
+                            ystream(static_cast<std::ptrdiff_t>(iy0 + ly) * Ns +
+                                    ix0 + lx) = tile[t];
+                });
+            int nbad = count_mismatches(ystream, y_ref, everywhere);
+            std::printf("streamed f64:     %d mismatches\n", nbad);
+            CHECK(nbad == 0);
+            (void)bad;
+        }
+
+        // indexed preconditioner == full-grid preconditioner (to roundoff:
+        // the contact-mean reduction order differs)
+        {
+            hmc::FourierPreconditioner fp(Ns);
+            std::vector<std::uint8_t> contact_full(N, 0), contact_c(S, 0);
+            std::mt19937 crng(23);
+            std::uniform_real_distribution<double> cu(0.0, 1.0);
+            for (std::ptrdiff_t k = 0; k < S; ++k)
+                if (mask[gi[k]] && cu(crng) < 0.7) {
+                    contact_c[k] = 1;
+                    contact_full[gi[k]] = 1;
+                }
+            Eigen::VectorXd zf, zc;
+            fp.apply_into(x, contact_full, zf);
+            fp.apply_into_indexed(xc, contact_c, gi, zc);
+            double num = 0.0, den = 0.0;
+            for (std::ptrdiff_t k = 0; k < S; ++k) {
+                num += (zc(k) - zf(gi[k])) * (zc(k) - zf(gi[k]));
+                den += zf(gi[k]) * zf(gi[k]);
+            }
+            const double rel = std::sqrt(num / (den > 0 ? den : 1.0));
+            std::printf("indexed precond:  rel %.2e\n", rel);
+            CHECK(rel <= 1e-12);
+            fp.release_scratch(); // and a second apply after release works
+            fp.apply_into_indexed(xc, contact_c, gi, zc);
+            double num2 = 0.0;
+            for (std::ptrdiff_t k = 0; k < S; ++k)
+                num2 += (zc(k) - zf(gi[k])) * (zc(k) - zf(gi[k]));
+            CHECK(std::sqrt(num2 / (den > 0 ? den : 1.0)) <= 1e-12);
+        }
+    }
+    std::printf("test_active (M3 kernels): all passed\n");
 
     // ── M2: active-set nested driver equivalence ─────────────────────────────
     {

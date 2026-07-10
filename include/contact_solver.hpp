@@ -102,8 +102,17 @@ ContactResult solve_contact(const MatVec& S, const Eigen::VectorXd& g0,
 // The result is always light (no displacement/gap fields: the operator
 // output is not valid off the candidate leaves) — the caller computes full
 // fields from its verification matvec. iterations/error/approach/objective/
-// contact_fraction/mean_pressure are filled as usual; pressure is the
-// full-grid field (zero off idx).
+// contact_fraction/mean_pressure are filled as usual; pressure has g0's
+// length (zero off idx).
+//
+// O(N_c) compressed mode (M3): g0 and all state may be COMPRESSED vectors
+// (slot-blocked, see H2Mask) rather than full-grid ones — the algorithm only
+// ever addresses them through idx, so it cannot tell the difference. Two
+// physical quantities must then be supplied because they are properties of
+// the grid, not of the compressed vector: N_grid (the physical cell count,
+// for the load constraint P = p_bar·N_grid and the reported fractions;
+// 0 → g0.size()) and g_scale (the full-grid gap scale max−min used to
+// normalise the complementarity error; <=0 → computed from g0).
 template <class Real>
 ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
                                         Eigen::Ref<const VecT<Real>> g0,
@@ -112,6 +121,8 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
                                         const PrecondIntoT<Real>& precond,
                                         const std::vector<int>& idx,
                                         VecT<Real>* p_init,
-                                        bool record_history = false);
+                                        bool record_history = false,
+                                        int N_grid = 0,
+                                        Real g_scale = Real(0));
 
 } // namespace hmc

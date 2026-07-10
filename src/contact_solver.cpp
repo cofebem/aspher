@@ -225,16 +225,18 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
                                         const PrecondIntoT<Real>& precond,
                                         const std::vector<int>& idx,
                                         VecT<Real>* p_init,
-                                        bool record_history) {
+                                        bool record_history,
+                                        int N_grid, Real g_scale) {
     using Vec = VecT<Real>;
     const int N = static_cast<int>(g0.size());
     const int Nc = static_cast<int>(idx.size());
     if (N == 0 || Nc == 0 || p_bar <= Real(0))
         throw std::invalid_argument(
             "solve_contact_active: empty gap/candidate set or p_bar <= 0");
+    if (N_grid <= 0) N_grid = N;
 
-    const Real P_total = p_bar * N;
-    Real g_scale = g0.maxCoeff() - g0.minCoeff();
+    const Real P_total = static_cast<Real>(static_cast<double>(p_bar) * N_grid);
+    if (g_scale <= Real(0)) g_scale = g0.maxCoeff() - g0.minCoeff();
     if (g_scale <= Real(0)) g_scale = Real(1);
     const Real p_unif = static_cast<Real>(static_cast<double>(P_total) / Nc);
 
@@ -420,8 +422,8 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
     res.approach = static_cast<double>(alpha);
     res.objective = obj;
     res.iterations = it;
-    res.contact_fraction = double(nc) / N;
-    res.mean_pressure = total / N;
+    res.contact_fraction = double(nc) / N_grid;
+    res.mean_pressure = total / N_grid;
     if constexpr (std::is_same_v<Real, double>)
         res.pressure = std::move(p);
     else
@@ -432,11 +434,11 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
 template ContactResult solve_contact_active_impl<double>(
     const MatVecIntoT<double>&, Eigen::Ref<const VecT<double>>, double, double,
     int, bool, const PrecondIntoT<double>&, const std::vector<int>&,
-    VecT<double>*, bool);
+    VecT<double>*, bool, int, double);
 template ContactResult solve_contact_active_impl<float>(
     const MatVecIntoT<float>&, Eigen::Ref<const VecT<float>>, float, float,
     int, bool, const PrecondIntoT<float>&, const std::vector<int>&,
-    VecT<float>*, bool);
+    VecT<float>*, bool, int, float);
 
 ContactResult solve_contact(const MatVec& S, const Eigen::VectorXd& g0,
                             double p_bar, double tol, int max_iter, bool use_pr,
