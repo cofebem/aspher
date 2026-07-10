@@ -24,6 +24,9 @@ __pycache__/
 example_rough_contact.png
 bench_h2_memory.png
 data/tamaas_n*/
+# default-path identity reference (build-specific; regenerate with
+# `python tests/ref_solve.py save` on the known-good build)
+data/ref_512.npz
 
 # convergence-study result cache (binary pickles, regenerable)
 doc/convergence_study/repro/cache/
