@@ -145,6 +145,36 @@ the symbol, applied to the stick-masked residual — direct generalization of
 `fourier_precond`); (ii) spectral validation of the stencil tables; (iii) ρ
 estimate for the Uzawa reference (operator norm from the symbol).
 
+### 3.3 Equation cross-check — RESOLVED 2026-07-13 (spec §12 gate)
+
+Verified against two independent sources supplied by the user:
+
+- **Duquesne thesis 2025, Annexe G**
+  (`REF/Tangential/ThesePBRemyDUQUESNE.pdf`, eqs. G.19–G.22): corner-form
+  primitives `U^qx_x = −(1−ν²)/(πE)·x ln(ρ̄−y) − (1+ν)/(πE)·y ln(ρ̄−x)` and
+  `U^qx_y = −ν(1+ν)/(πE)·ρ̄` reduce, under the second mixed difference (the
+  y-independent `2x ln|x|` term cancels), EXACTLY to our
+  `(1/(2πG))[(1−ν)X_log + Y_log]` and `(ν/(2πG))[R(k,n)−R(k,m)+R(l,m)−R(l,n)]`
+  with `1/(2πG) = (1+ν)/(πE)`. This independently confirms the Pohrt & Li
+  eq. (18) h²-typo resolution. G.22 gives the (1−2ν) normal↔tangential
+  coupling primitive for the post-v1 coupled case.
+- **Tamaas `src/model/influence.hh`** (`Boussinesq<3,0>::applyU0`, Fourier
+  space): with d± = (∓i q̂x, ∓i q̂y, 1), d₂ = (i q̂x, i q̂y, 0), the operator
+  `B = [2I + (1−2ν) d₊d₋ᵀ + d₂d₂ᵀ − e₃e₃ᵀ]/(2μ|q|)` has tangential block
+  `[I − ν q̂⊗q̂]/(μ|q|)` ≡ our symbol (since `1/μ = 2/(E*(1−ν))`), zz block
+  `2/(E*|q|)` (Love), and imaginary antisymmetric xz coupling ∝(1−2ν).
+- **Tamaas cone projection** (`Kato::enforcePressureCoulomb`,
+  `src/solvers/kato.hh`): identical three-case orthogonal projection onto
+  K_μ as de Saxcé–Feng eq. (105) — our planned shared projection module.
+  Note: Tamaas's general coupled solver (`Condat`) solves the *associated*
+  Coulomb law (docstring caveat: normal/tangential slip coupled); our
+  bipotential path targets the true non-associated law — a differentiator
+  to keep.
+- **Validation option for M4/M5**: cross-validate the tangential solve
+  against Tamaas `PolonskyKeerTan` (Coulomb `solve` / `solveTresca`) in the
+  `fluidpaper` env, following the `tamaas-comparison` skill pattern (mind
+  the dcfft quirks of CLAUDE.md for the non-periodic case).
+
 ## 4. Operators
 
 - **FFT backend** (`fft_operator`): three new kernel tables (`C_xx`, `C_yy`,
@@ -326,9 +356,9 @@ Existing `ContactSolver` / `solve_nested` are untouched.
 
 ## 12. Open items
 
-- The exact constants (`G*`, symbol `α, β`) pinned at M2 against the papers
-  **and the user's analytical formulas** (user offered to supply/cross-check
-  the rectangle-integrated Cerruti equations).
+- ~~The exact constants (`G*`, symbol `α, β`) pinned at M2 against the papers
+  and the user's analytical formulas~~ — RESOLVED, see §3.3 (Duquesne annex G
+  exact match; Tamaas `influence.hh` symbol match; 2026-07-13).
 - Uzawa `ρ` selection heuristic (symbol-based estimate + safety factor) —
   tuned at M6, reported honestly.
 - `REF/BiPotential` was said to contain two references; only
