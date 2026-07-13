@@ -140,10 +140,83 @@ static int test_kernel_class() {
     return 0;
 }
 
+static int test_symbol() {
+    const int Ns = 128;
+    const double L = 1.0, E = 1.7, nu = 0.3, h = L / Ns;
+    hmc::CerrutiKernel C(Ns, L, E, nu);
+    hmc::BoussinesqKernel B(Ns, L, E);
+
+    // exact analytic properties at an arbitrary wavevector
+    {
+        const double kx = 7.3, ky = -2.1, kk = std::hypot(kx, ky);
+        const Eigen::Matrix2d S = C.symbol(kx, ky);
+        CHECK((S - S.transpose()).lpNorm<Eigen::Infinity>() < 1e-18);
+        // longitudinal eigenvalue == the normal (Love) symbol 2/(E*|k|)
+        Eigen::Vector2d el(kx / kk, ky / kk), et(-ky / kk, kx / kk);
+        CHECK(std::abs(el.dot(S * el) / (2.0 / (E * kk)) - 1.0) < 1e-14);
+        // transverse eigenvalue == 2/(E*(1-nu)|k|)
+        CHECK(std::abs(et.dot(S * et) / (2.0 / (E * (1.0 - nu) * kk)) - 1.0) <
+              1e-14);
+        // isotropy: same eigenvalues at a rotated wavevector of equal norm
+        const Eigen::Matrix2d S2 = C.symbol(kk, 0.0);
+        CHECK(std::abs(S2(0, 0) - el.dot(S * el)) < 1e-13 * S2(0, 0));
+        CHECK(std::abs(S2(1, 1) - et.dot(S * et)) < 1e-13 * S2(1, 1));
+        CHECK(std::abs(S2(0, 1)) < 1e-18);
+    }
+
+    // truncated-lattice DFT of the offset tables vs the continuum symbol.
+    // Same-machinery calibration: the Love table vs 2/(E*|k|) bounds the
+    // truncation error of the method itself; the Cerruti components must
+    // match their symbols at the same order.
+    auto dft = [&](auto entry, double kx, double ky) {
+        double s = 0.0;
+        for (int dy = -(Ns - 1); dy <= Ns - 1; ++dy)
+            for (int dx = -(Ns - 1); dx <= Ns - 1; ++dx)
+                s += entry(dx, dy) * std::cos(kx * dx * h + ky * dy * h);
+        return s;
+    };
+    const int modes[][2] = {{8, 0}, {0, 8}, {6, 6}, {12, 5}};
+    for (auto& mo : modes) {
+        const double kx = 2.0 * M_PI * mo[0] / L, ky = 2.0 * M_PI * mo[1] / L;
+        const double kk = std::hypot(kx, ky);
+        const double love_err =
+            std::abs(dft([&](int dx, int dy) { return B.entry_offset(dx, dy); },
+                         kx, ky) /
+                         (2.0 / (E * kk)) -
+                     1.0);
+        const Eigen::Matrix2d S = C.symbol(kx, ky);
+        const double exx =
+            std::abs(dft([&](int dx, int dy) { return C.xx_offset(dx, dy); },
+                         kx, ky) /
+                         S(0, 0) -
+                     1.0);
+        const double eyy =
+            std::abs(dft([&](int dx, int dy) { return C.yy_offset(dx, dy); },
+                         kx, ky) /
+                         S(1, 1) -
+                     1.0);
+        std::printf("mode (%2d,%2d): love %.2e  xx %.2e  yy %.2e\n", mo[0],
+                    mo[1], love_err, exx, eyy);
+        CHECK(love_err < 0.15);
+        CHECK(exx < 0.18 && eyy < 0.18);
+        if (mo[0] != 0 && mo[1] != 0) { // xy symbol vanishes on the axes
+            const double exy =
+                std::abs(dft([&](int dx, int dy) { return C.xy_offset(dx, dy); },
+                             kx, ky) /
+                             S(0, 1) -
+                         1.0);
+            std::printf("             xy %.2e\n", exy);
+            CHECK(exy < 0.10);
+        }
+    }
+    return 0;
+}
+
 int main() {
     if (int rc = test_brackets_vs_quadrature()) return rc;
     if (int rc = test_identities()) return rc;
     if (int rc = test_kernel_class()) return rc;
+    if (int rc = test_symbol()) return rc;
     std::printf("test_cerruti: all checks passed\n");
     return 0;
 }

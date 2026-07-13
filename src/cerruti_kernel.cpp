@@ -69,9 +69,21 @@ Eigen::MatrixXd CerrutiKernel::assemble_dense() const {
     return M;
 }
 
-Eigen::Matrix2d CerrutiKernel::symbol(double, double) const {
-    // Temporary stub returning zero — Task 5 implements the real symbol
-    return Eigen::Matrix2d::Zero();
+Eigen::Matrix2d CerrutiKernel::symbol(double kx, double ky) const {
+    // Continuum tangential symbol (spec section 3.2):
+    //   Chat(k) = (2 / (E* (1-nu) |k|)) [ I - nu k k^T / |k|^2 ]
+    // Longitudinal eigenvalue 2/(E*|k|) (== the normal Love symbol), transverse
+    // 2/(E*(1-nu)|k|). Derived from the point kernels via
+    // FT(1/s) = 2 pi/|k|, FT(x^2/s^3) = 2 pi ky^2/|k|^3,
+    // FT(xy/s^3) = -2 pi kx ky/|k|^3.
+    const double k2 = kx * kx + ky * ky;
+    const double kk = std::sqrt(k2);
+    const double c = 2.0 / (E_star_ * (1.0 - nu_) * kk);
+    Eigen::Matrix2d S;
+    S(0, 0) = c * (1.0 - nu_ * kx * kx / k2);
+    S(1, 1) = c * (1.0 - nu_ * ky * ky / k2);
+    S(0, 1) = S(1, 0) = c * (-nu_ * kx * ky / k2);
+    return S;
 }
 
 } // namespace hmc
