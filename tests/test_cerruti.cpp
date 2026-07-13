@@ -99,9 +99,51 @@ static int test_identities() {
     return 0;
 }
 
+static int test_kernel_class() {
+    const int Ns = 16;
+    const double L = 1.0, E = 1.7, nu = 0.3, h = L / Ns;
+    hmc::CerrutiKernel C(Ns, L, E, nu);
+    CHECK(C.grid_size() == Ns && C.size() == Ns * Ns);
+    CHECK(C.element_size() == h && C.E_star() == E && C.nu() == nu);
+
+    // scaled self terms: xx = (2-nu)*4a*ln(1+sqrt(2)) / (pi E* (1-nu)); xy = 0
+    const double a = 0.5 * h;
+    const double self =
+        (2.0 - nu) * 4.0 * a * std::log(1.0 + std::sqrt(2.0)) /
+        (M_PI * E * (1.0 - nu));
+    CHECK(std::abs(C.xx_offset(0, 0) / self - 1.0) < 1e-14);
+    CHECK(C.xy_offset(0, 0) == 0.0);
+
+    // x<->y swap serves yy; parity/sign handling of the signed offsets
+    CHECK(C.yy_offset(3, 1) == C.xx_offset(1, 3));
+    CHECK(C.xx_offset(-3, 1) == C.xx_offset(3, 1));
+    CHECK(C.xy_offset(2, 5) == C.xy_offset(-2, -5));
+    CHECK(C.xy_offset(-2, 5) == -C.xy_offset(2, 5));
+    CHECK(C.xy_offset(2, -5) == -C.xy_offset(2, 5));
+    CHECK(C.xy_offset(0, 4) == 0.0 && C.xy_offset(4, 0) == 0.0);
+
+    // out-of-span offsets are zero (entry_offset convention)
+    CHECK(C.xx_offset(Ns, 0) == 0.0 && C.xy_offset(0, -Ns) == 0.0);
+
+    // far evaluators agree with the tables at integer offsets (exact:
+    // same closed form, same arithmetic)
+    CHECK(C.xx_far(4 * h, 2 * h) == C.xx_offset(4, 2));
+    CHECK(C.yy_far(4 * h, 2 * h) == C.yy_offset(4, 2));
+    CHECK(C.xy_far(4 * h, 2 * h) == C.xy_offset(4, 2));
+
+    // dense block: symmetric and positive definite (elastic compliance)
+    const Eigen::MatrixXd M = C.assemble_dense();
+    CHECK(M.rows() == 2 * Ns * Ns);
+    CHECK((M - M.transpose()).lpNorm<Eigen::Infinity>() == 0.0);
+    Eigen::LLT<Eigen::MatrixXd> llt(M);
+    CHECK(llt.info() == Eigen::Success);
+    return 0;
+}
+
 int main() {
     if (int rc = test_brackets_vs_quadrature()) return rc;
     if (int rc = test_identities()) return rc;
+    if (int rc = test_kernel_class()) return rc;
     std::printf("test_cerruti: all checks passed\n");
     return 0;
 }

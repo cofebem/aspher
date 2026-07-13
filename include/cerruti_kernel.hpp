@@ -23,4 +23,52 @@ namespace hmc {
 double cerruti_uxx(double x, double y, double a, double b, double nu);
 double cerruti_uxy(double x, double y, double a, double b);
 
+// Tangential (Cerruti) influence tables for an Ns x Ns grid of square
+// elements of side h = L/Ns carrying uniform tangential traction, mirror of
+// BoussinesqKernel. Only the xx and xy tables are stored: yy is the x<->y
+// transpose of xx, and xy's signs are restored from the odd parity
+//   xx(dx,dy) even in dx and dy;  yy(dx,dy) = xx(dy,dx);
+//   xy odd in dx and odd in dy (stored for |dx|,|dy|; zero on the axes).
+// Prefactors: 1/(2 pi G) = 1/(pi E* (1-nu)) on xx/yy; extra nu on xy.
+class CerrutiKernel {
+public:
+    CerrutiKernel(int Ns, double L, double E_star, double nu);
+
+    int    grid_size() const { return Ns_; }
+    int    size() const { return Ns_ * Ns_; }
+    double element_size() const { return h_; }
+    double domain_size() const { return L_; }
+    double E_star() const { return E_star_; }
+    double nu() const { return nu_; }
+
+    double xx_offset(int dix, int diy) const {
+        const int dx = std::abs(dix), dy = std::abs(diy);
+        if (dx >= Ns_ || dy >= Ns_) return 0.0;
+        return xx_[static_cast<std::size_t>(dy) * Ns_ + dx];
+    }
+    double yy_offset(int dix, int diy) const { return xx_offset(diy, dix); }
+    double xy_offset(int dix, int diy) const {
+        const int dx = std::abs(dix), dy = std::abs(diy);
+        if (dx >= Ns_ || dy >= Ns_) return 0.0;
+        const double v = xy_[static_cast<std::size_t>(dy) * Ns_ + dx];
+        return ((dix > 0) == (diy > 0)) ? v : -v; // axis entries are exact 0
+    }
+
+    double xx_far(double dx, double dy) const {
+        return pref_ * cerruti_uxx(dx, dy, a_, a_, nu_);
+    }
+    double yy_far(double dx, double dy) const { return xx_far(dy, dx); }
+    double xy_far(double dx, double dy) const {
+        return prefnu_ * cerruti_uxy(dx, dy, a_, a_);
+    }
+
+    Eigen::MatrixXd assemble_dense() const;
+    Eigen::Matrix2d symbol(double kx, double ky) const;
+
+private:
+    int Ns_;
+    double L_, h_, a_, E_star_, nu_, pref_, prefnu_;
+    std::vector<double> xx_, xy_;
+};
+
 } // namespace hmc
