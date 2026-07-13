@@ -116,6 +116,7 @@ Exact zero-padded (Hockney) circular convolution of the pressure with the Love e
 ### Frictional contact (in progress, spec doc/specs/2026-07-13-frictional-contact-design.md)
 - **M1 done**: `H2Operator` is kernel-agnostic — `H2Operator(Ns, h, FarKernelFn, NearKernelFn, params)` with fully-scaled `std::function` kernels called only at `build()` (matvec path untouched); the `BoussinesqKernel` constructor delegates and is **bit-for-bit** identical (gated by `test_functor_ctor` + `tests/ref_solve.py`).
 - **M2 done**: `cerruti_kernel.{hpp,cpp}` — element-integrated tangential kernels (Pohrt & Li 2014 eqs. (17)/(20); eq. (18)'s printed h² factors are a dimensional typo, correct corner form `R(k,n)−R(k,m)+R(l,m)−R(l,n)` verified by quadrature), `CerrutiKernel` offset tables (xx stored, yy = x↔y transpose, xy odd-parity signs restored at lookup), continuum symbol `Ĉ(k) = (2/(E*(1−ν)|k|))[I − ν kkᵀ/|k|²]` whose longitudinal eigenvalue equals the Love symbol `2/(E*|k|)`. Prefactor convention: `1/(2πG) = 1/(πE*(1−ν))`.
+- **M3 done**: `tangential_operator.{hpp,cpp}` — `TangentialFFTOperator` (exact zero-padded convolution; all three spectra REAL (xy is odd per axis but even under joint negation, matching its real symbol) with a per-mode all-real 2×2 mix; 2 fwd + 2 inv transforms per blocked matvec) and `TangentialH2Operator` (three scalar `H2Operator` kernel-functor instances; 4 scalar applies per blocked matvec). Stacked `[q_x; q_y]` layout matching `CerrutiKernel::assemble_dense`. Double-only in M3 (float path is a follow-up; layout doesn't block it). Gates in `test_tangential`. Both operators' `matvec_into` allow `u` to alias `q` (regression-tested).
 
 ### Polonsky–Keer (1999) PCG
 Projected CG for the QP `min ½p'Sp + p'g₀  s.t. p≥0, mean(p)=p_bar`.
@@ -218,6 +219,8 @@ Fix: use plain `\begin{enumerate}` and `\begin{itemize}` without optional argume
 | Active-set nested Ns=4096 f64 (seed-42 rough, p̄=0.002, co-tenant) | 173→46.5 s (3.7×), 91 it both, area 0.005403 both, solve-peak RSS 1593→841 MB, 1 round |
 | Active-set nested Ns=16384 f32 (full-band surface, area 0.0047 = 10× study contact, co-tenant) | std 1445 s/18.3 GiB → active 308 s/10.9 GiB (**4.7× / 1.67×**), 86 vs 89 it, same area, 1 round |
 | Active-set nested Ns=16384 f64 (same case) | 1458 s / 210 it / **12.5 GiB** to tol 1e-8 — std f64 cannot run at all there (>24 GiB); official rfgen fresh-reboot A/B pending (user protocol) |
+| Tangential FFT matvec vs dense (Ns=8/16, rel L2) | 2.9×10⁻¹⁶ (test_tangential) |
+| Tangential H2 matvec vs dense (Ns=32, q=4 / q=6) | 1.671×10⁻⁴ / 6.965×10⁻⁶ |
 | Cerruti closed forms vs 64² GL quadrature (6 sampled offsets) | rel err < 1e-9 (test_cerruti) |
 | Cerruti table DFT vs continuum symbol (Ns=128) | axis modes ~12-16% (truncation-bound, love calib 12.4%); diagonal modes 0.6-1.2%, xy <=0.9% |
 
