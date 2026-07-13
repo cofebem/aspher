@@ -113,6 +113,10 @@ Matrix-free black-box FMM (Chebyshev interpolation, Fong & Darve 2009). **No blo
 ### FFT-convolution operator (`backend="fft"`) — exact, O(N log N)
 Exact zero-padded (Hockney) circular convolution of the pressure with the Love element table on a (2Ns)² grid (`fft_operator.hpp/.cpp`, shared square r2c/c2r engine in `src/fft_engine.hpp` — pocketfft default, FFTW3 under `-DASPHER_USE_FFTW=ON`). **Matches the dense matvec to roundoff** (rel L2 ~1e-15 double, ~1.4e-7 float; no interpolation, no Gibbs — that exactness is its main value), unlike H2's ~1e-4 (q=4) interpolation error. ~10 N reals double scratch (kernel half-spectrum 2N + padded grid 4N + complex half-spectrum work 4N), object-owned and reused; single-precision caches via `build_single_caches`/`matvec_single_into` (same contract as H2). The padded transforms skip structurally-zero forward lines and unread inverse lines (2026-07 perf commit). **Measured performance** (bench_fft.py, 20-core, desktop co-tenancy — ratios more reliable than absolutes): matvec modestly faster than H2 (q=6) at Ns ≤ 2048 (1.6×/1.5× at 1024/2048), ≈parity at Ns=4096 (337 vs 331 ms) — the padded transforms are bandwidth-bound, not flop-bound, so the spec's 2–3× estimate did not materialise. H2 remains preferred for very large Ns (O(N) vs O(N log N), ~5× smaller working set). Available as `ContactSolver(backend="fft")` and `hc.solve_nested(..., backend="fft")`. Spec: `doc/specs/2026-07-09-fft-convolution-backend-design.md`.
 
+### Frictional contact (in progress, spec doc/specs/2026-07-13-frictional-contact-design.md)
+- **M1 done**: `H2Operator` is kernel-agnostic — `H2Operator(Ns, h, FarKernelFn, NearKernelFn, params)` with fully-scaled `std::function` kernels called only at `build()` (matvec path untouched); the `BoussinesqKernel` constructor delegates and is **bit-for-bit** identical (gated by `test_functor_ctor` + `tests/ref_solve.py`).
+- **M2 done**: `cerruti_kernel.{hpp,cpp}` — element-integrated tangential kernels (Pohrt & Li 2014 eqs. (17)/(20); eq. (18)'s printed h² factors are a dimensional typo, correct corner form `R(k,n)−R(k,m)+R(l,m)−R(l,n)` verified by quadrature), `CerrutiKernel` offset tables (xx stored, yy = x↔y transpose, xy odd-parity signs restored at lookup), continuum symbol `Ĉ(k) = (2/(E*(1−ν)|k|))[I − ν kkᵀ/|k|²]` whose longitudinal eigenvalue equals the Love symbol `2/(E*|k|)`. Prefactor convention: `1/(2πG) = 1/(πE*(1−ν))`.
+
 ### Polonsky–Keer (1999) PCG
 Projected CG for the QP `min ½p'Sp + p'g₀  s.t. p≥0, mean(p)=p_bar`.
 Default β formula: **Polak-Ribière+** (`use_pr=true`); Fletcher-Reeves available via `use_pr=false`.
@@ -214,6 +218,8 @@ Fix: use plain `\begin{enumerate}` and `\begin{itemize}` without optional argume
 | Active-set nested Ns=4096 f64 (seed-42 rough, p̄=0.002, co-tenant) | 173→46.5 s (3.7×), 91 it both, area 0.005403 both, solve-peak RSS 1593→841 MB, 1 round |
 | Active-set nested Ns=16384 f32 (full-band surface, area 0.0047 = 10× study contact, co-tenant) | std 1445 s/18.3 GiB → active 308 s/10.9 GiB (**4.7× / 1.67×**), 86 vs 89 it, same area, 1 round |
 | Active-set nested Ns=16384 f64 (same case) | 1458 s / 210 it / **12.5 GiB** to tol 1e-8 — std f64 cannot run at all there (>24 GiB); official rfgen fresh-reboot A/B pending (user protocol) |
+| Cerruti closed forms vs 64² GL quadrature (all offsets tested) | rel err < 1e-9 (test_cerruti) |
+| Cerruti table DFT vs continuum symbol (Ns=128) | axis modes ~12-16% (truncation-bound, love calib 12.4%); diagonal modes 0.6-1.2%, xy <=0.9% |
 
 ---
 
