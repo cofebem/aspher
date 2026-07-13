@@ -71,6 +71,7 @@ add_library(aspher_core STATIC
   src/fourier_precond.cpp
   src/fft_operator.cpp
   src/nested_solve.cpp
+  src/tangential_operator.cpp
 )
 target_include_directories(aspher_core PUBLIC include)
 target_link_libraries(aspher_core PUBLIC Eigen3::Eigen)
@@ -94,7 +95,7 @@ endif()
 
 if(NOT SKBUILD)
   enable_testing()
-  foreach(t kernel hmatrix contact h2 precond fft active cerruti)
+  foreach(t kernel hmatrix contact h2 precond fft active cerruti tangential)
     add_executable(test_${t} tests/test_${t}.cpp)
     target_link_libraries(test_${t} PRIVATE aspher_core)
     target_compile_options(test_${t} PRIVATE -Wall -Wextra)
