@@ -59,6 +59,23 @@ static int test_h2_vs_dense() {
     CHECK(e4 < 5e-3);
     CHECK(e6 < e4);
     CHECK(e6 < 1e-4);
+
+    // aliasing contract: u may be the same vector as q (both backends)
+    {
+        hmc::TangentialH2Operator A(C, {8, 4, 1});
+        A.build();
+        const Eigen::VectorXd expect = A.matvec(q);
+        Eigen::VectorXd inplace = q;
+        A.matvec_into(inplace, inplace);
+        CHECK((inplace - expect).lpNorm<Eigen::Infinity>() == 0.0);
+        hmc::TangentialFFTOperator F(C);
+        F.build();
+        const Eigen::VectorXd expectF = F.matvec(q);
+        inplace = q;
+        F.matvec_into(inplace, inplace);
+        CHECK((inplace - expectF).lpNorm<Eigen::Infinity>() == 0.0);
+    }
+
     return 0;
 }
 

@@ -75,7 +75,7 @@ public:
 private:
     int Ns_;
     H2Operator Hxx_, Hyy_, Hxy_;
-    mutable Eigen::VectorXd qc_, tc_; // component input / output scratch
+    mutable Eigen::VectorXd qx_, qy_, tc_; // component inputs / output scratch (both input halves copied out before any write to u, so u may alias q, same contract as TangentialFFTOperator)
 };
 
 } // namespace hmc

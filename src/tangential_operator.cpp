@@ -191,16 +191,17 @@ void TangentialH2Operator::matvec_into(const Eigen::VectorXd& q,
             "TangentialH2Operator::matvec: q size != 2*Ns*Ns");
     if (u.size() != 2 * N) u.resize(2 * N);
 
-    qc_ = q.head(N); // q_x
-    Hxx_.matvec_into(qc_, tc_);
-    u.head(N) = tc_;
-    Hxy_.matvec_into(qc_, tc_);
-    u.tail(N) = tc_;
+    qx_ = q.head(N); // both halves gathered before any write: u may alias q
+    qy_ = q.tail(N);
 
-    qc_ = q.tail(N); // q_y
-    Hxy_.matvec_into(qc_, tc_);
+    Hxx_.matvec_into(qx_, tc_);
+    u.head(N) = tc_;
+    Hxy_.matvec_into(qy_, tc_);
     u.head(N) += tc_;
-    Hyy_.matvec_into(qc_, tc_);
+
+    Hxy_.matvec_into(qx_, tc_);
+    u.tail(N) = tc_;
+    Hyy_.matvec_into(qy_, tc_);
     u.tail(N) += tc_;
 }
 
