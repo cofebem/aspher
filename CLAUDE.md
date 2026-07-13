@@ -218,7 +218,7 @@ Fix: use plain `\begin{enumerate}` and `\begin{itemize}` without optional argume
 | Active-set nested Ns=4096 f64 (seed-42 rough, p̄=0.002, co-tenant) | 173→46.5 s (3.7×), 91 it both, area 0.005403 both, solve-peak RSS 1593→841 MB, 1 round |
 | Active-set nested Ns=16384 f32 (full-band surface, area 0.0047 = 10× study contact, co-tenant) | std 1445 s/18.3 GiB → active 308 s/10.9 GiB (**4.7× / 1.67×**), 86 vs 89 it, same area, 1 round |
 | Active-set nested Ns=16384 f64 (same case) | 1458 s / 210 it / **12.5 GiB** to tol 1e-8 — std f64 cannot run at all there (>24 GiB); official rfgen fresh-reboot A/B pending (user protocol) |
-| Cerruti closed forms vs 64² GL quadrature (all offsets tested) | rel err < 1e-9 (test_cerruti) |
+| Cerruti closed forms vs 64² GL quadrature (6 sampled offsets) | rel err < 1e-9 (test_cerruti) |
 | Cerruti table DFT vs continuum symbol (Ns=128) | axis modes ~12-16% (truncation-bound, love calib 12.4%); diagonal modes 0.6-1.2%, xy <=0.9% |
 
 ---

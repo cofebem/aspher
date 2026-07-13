@@ -28,7 +28,7 @@ double cerruti_uxy(double x, double y, double a, double b);
 // BoussinesqKernel. Only the xx and xy tables are stored: yy is the x<->y
 // transpose of xx, and xy's signs are restored from the odd parity
 //   xx(dx,dy) even in dx and dy;  yy(dx,dy) = xx(dy,dx);
-//   xy odd in dx and odd in dy (stored for |dx|,|dy|; zero on axes to within ~1 ULP).
+//   xy odd in dx and odd in dy (stored for |dx|,|dy|; exactly zero on the axes (guarded)).
 // Prefactors: 1/(2 pi G) = 1/(pi E* (1-nu)) on xx/yy; extra nu on xy.
 class CerrutiKernel {
 public:
@@ -41,6 +41,7 @@ public:
     double E_star() const { return E_star_; }
     double nu() const { return nu_; }
 
+    // Signed element offsets, dix = ix_target - ix_source (matches H2Operator's build()).
     double xx_offset(int dix, int diy) const {
         const int dx = std::abs(dix), dy = std::abs(diy);
         if (dx >= Ns_ || dy >= Ns_) return 0.0;
@@ -48,10 +49,11 @@ public:
     }
     double yy_offset(int dix, int diy) const { return xx_offset(diy, dix); }
     double xy_offset(int dix, int diy) const {
+        if (dix == 0 || diy == 0) return 0.0; // odd kernel: exact 0 on the axes
         const int dx = std::abs(dix), dy = std::abs(diy);
         if (dx >= Ns_ || dy >= Ns_) return 0.0;
         const double v = xy_[static_cast<std::size_t>(dy) * Ns_ + dx];
-        return ((dix > 0) == (diy > 0)) ? v : -v; // axis entries are zero to within ~1 ULP
+        return ((dix > 0) == (diy > 0)) ? v : -v;
     }
 
     double xx_far(double dx, double dy) const {

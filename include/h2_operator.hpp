@@ -50,6 +50,7 @@ struct H2Mask {
 // is the exact element-offset entry. Both are FULLY SCALED (elastic constants
 // included) and are called only during build() — couplings and stencils are
 // cached — so the indirection never touches the matvec path.
+// Both are evaluated at TARGET-minus-SOURCE offsets (t.pos - s.pos); irrelevant for even kernels, load-bearing for kernels odd in one variable (post-v1 coupling components).
 using FarKernelFn = std::function<double(double, double)>;
 using NearKernelFn = std::function<double(int, int)>;
 
