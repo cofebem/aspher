@@ -45,6 +45,14 @@ struct H2Mask {
     int nslots() const { return static_cast<int>(slot_leaf.size()); }
 };
 
+// Kernel plumbing (friction M1): the far kernel is the element-integrated
+// influence evaluated at a continuous center offset (dx, dy); the near kernel
+// is the exact element-offset entry. Both are FULLY SCALED (elastic constants
+// included) and are called only during build() — couplings and stencils are
+// cached — so the indirection never touches the matvec path.
+using FarKernelFn = std::function<double(double, double)>;
+using NearKernelFn = std::function<double(int, int)>;
+
 // Matrix-free black-box FMM (Fong & Darve 2009) operator for the translation-
 // invariant Boussinesq half-space kernel on a uniform Ns x Ns grid. Far field
 // via tensor-product Chebyshev interpolation with cached, translation-invariant
@@ -53,6 +61,11 @@ struct H2Mask {
 class H2Operator {
 public:
     H2Operator(const BoussinesqKernel& kernel, H2Params params);
+    // Generic translation-invariant kernel. far/near must be fully scaled;
+    // near's backing storage (e.g. a kernel table) must outlive the operator,
+    // matching the kernel-reference contract of the other constructor.
+    H2Operator(int Ns, double h, FarKernelFn far, NearKernelFn near,
+               H2Params params);
 
     void build();
 
@@ -141,10 +154,11 @@ private:
     // of the box origin; depends only on the side length).
     std::vector<double> centers_norm(int side) const;
 
-    const BoussinesqKernel* kernel_;
     H2Params p_;
     int Ns_, q_, q2_, ls_, ls2_;
-    double h_, scale_; // scale_ = 1 / (pi E*)
+    double h_;
+    FarKernelFn far_fn_;   // fully scaled far kernel (build()-time only)
+    NearKernelFn near_fn_; // fully scaled near element entry (build()-time only)
 
     ChebBasis cheb_;
     UniformQuadTree tree_;

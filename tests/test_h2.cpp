@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <random>
 
 #define CHECK(cond)                                                        \
     do {                                                                   \
@@ -107,10 +108,39 @@ static int test_accuracy() {
     return 0;
 }
 
+// M1 gate: the generic-kernel constructor fed the Boussinesq far/near
+// functions must reproduce the kernel-constructed operator bit-for-bit.
+static int test_functor_ctor() {
+    const int Ns = 64;
+    const double L = 1.0, E = 1.3, h = L / Ns;
+    hmc::BoussinesqKernel K(Ns, L, E);
+    hmc::H2Params prm{8, 4, 1};
+
+    hmc::H2Operator A(K, prm);
+    A.build();
+
+    hmc::H2Operator B(
+        Ns, h,
+        [scale = 1.0 / (M_PI * E), a = 0.5 * h](double dx, double dy) {
+            return scale * hmc::love_uz(dx, dy, a, a);
+        },
+        [&K](int dix, int diy) { return K.entry_offset(dix, diy); }, prm);
+    B.build();
+
+    std::mt19937 rng(3);
+    std::uniform_real_distribution<double> d(0.0, 1.0);
+    Eigen::VectorXd x(Ns * Ns);
+    for (int i = 0; i < x.size(); ++i) x(i) = d(rng);
+    const Eigen::VectorXd ya = A.matvec(x), yb = B.matvec(x);
+    CHECK((ya - yb).lpNorm<Eigen::Infinity>() == 0.0); // bit-for-bit
+    return 0;
+}
+
 int main() {
     if (int rc = test_cheb()) return rc;
     if (int rc = test_tree()) return rc;
     if (int rc = test_caches()) return rc;
     if (int rc = test_accuracy()) return rc;
+    if (int rc = test_functor_ctor()) return rc;
     return 0;
 }

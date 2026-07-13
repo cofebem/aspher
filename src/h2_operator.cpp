@@ -7,10 +7,24 @@
 namespace hmc {
 
 H2Operator::H2Operator(const BoussinesqKernel& kernel, H2Params params)
-    : kernel_(&kernel), p_(params), Ns_(kernel.grid_size()), q_(params.q),
-      q2_(params.q * params.q), ls_(params.leaf_side), ls2_(params.leaf_side * params.leaf_side),
-      h_(kernel.element_size()), scale_(1.0 / (M_PI * kernel.E_star())),
-      cheb_(params.q), tree_(kernel.grid_size(), params.leaf_side) {}
+    : H2Operator(kernel.grid_size(), kernel.element_size(),
+                 // identical arithmetic to the pre-refactor far_kernel():
+                 // scale * love_uz(dx, dy, h/2, h/2)
+                 [scale = 1.0 / (M_PI * kernel.E_star()),
+                  a = 0.5 * kernel.element_size()](double dx, double dy) {
+                     return scale * love_uz(dx, dy, a, a);
+                 },
+                 [k = &kernel](int dix, int diy) {
+                     return k->entry_offset(dix, diy);
+                 },
+                 params) {}
+
+H2Operator::H2Operator(int Ns, double h, FarKernelFn far, NearKernelFn near,
+                       H2Params params)
+    : p_(params), Ns_(Ns), q_(params.q), q2_(params.q * params.q),
+      ls_(params.leaf_side), ls2_(params.leaf_side * params.leaf_side), h_(h),
+      far_fn_(std::move(far)), near_fn_(std::move(near)),
+      cheb_(params.q), tree_(Ns, params.leaf_side) {}
 
 std::vector<double> H2Operator::centers_norm(int side) const {
     // element-center k (k = 0..side-1) normalized into the box geometric extent:
@@ -22,7 +36,7 @@ std::vector<double> H2Operator::centers_norm(int side) const {
 }
 
 double H2Operator::far_kernel(double dx, double dy) const {
-    return scale_ * love_uz(dx, dy, 0.5 * h_, 0.5 * h_);
+    return far_fn_(dx, dy);
 }
 
 // packed key for the coupling cache: (level, dbx, dby)
@@ -126,7 +140,7 @@ void H2Operator::build() {
                         const int rt = lxt + ls_ * lyt;
                         for (int lys = 0; lys < ls_; ++lys)
                             for (int lxs = 0; lxs < ls_; ++lxs)
-                                A(rt, lxs + ls_ * lys) = kernel_->entry_offset(
+                                A(rt, lxs + ls_ * lys) = near_fn_(
                                     lxt - lxs - dx * ls_, lyt - lys - dy * ls_);
                     }
                 near_stencils_.push_back(std::move(A));
