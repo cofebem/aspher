@@ -69,7 +69,7 @@ Eigen::MatrixXd CerrutiKernel::assemble_dense() const {
     return M;
 }
 
-Eigen::Matrix2d CerrutiKernel::symbol(double kx, double ky) const {
+Eigen::Matrix2d CerrutiKernel::symbol(double, double) const {
     // Temporary stub returning zero — Task 5 implements the real symbol
     return Eigen::Matrix2d::Zero();
 }

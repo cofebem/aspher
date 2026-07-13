@@ -28,7 +28,7 @@ double cerruti_uxy(double x, double y, double a, double b);
 // BoussinesqKernel. Only the xx and xy tables are stored: yy is the x<->y
 // transpose of xx, and xy's signs are restored from the odd parity
 //   xx(dx,dy) even in dx and dy;  yy(dx,dy) = xx(dy,dx);
-//   xy odd in dx and odd in dy (stored for |dx|,|dy|; zero on the axes).
+//   xy odd in dx and odd in dy (stored for |dx|,|dy|; zero on axes to within ~1 ULP).
 // Prefactors: 1/(2 pi G) = 1/(pi E* (1-nu)) on xx/yy; extra nu on xy.
 class CerrutiKernel {
 public:
@@ -51,7 +51,7 @@ public:
         const int dx = std::abs(dix), dy = std::abs(diy);
         if (dx >= Ns_ || dy >= Ns_) return 0.0;
         const double v = xy_[static_cast<std::size_t>(dy) * Ns_ + dx];
-        return ((dix > 0) == (diy > 0)) ? v : -v; // axis entries are exact 0
+        return ((dix > 0) == (diy > 0)) ? v : -v; // axis entries are zero to within ~1 ULP
     }
 
     double xx_far(double dx, double dy) const {
