@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cerruti_kernel.hpp"
+#include "h2_operator.hpp"
 
 #include <Eigen/Dense>
 #include <memory>
@@ -53,6 +54,28 @@ private:
     mutable Eigen::MatrixXd G1_, G2_;
     mutable Eigen::MatrixXcd C1_, C2_;
     mutable std::unique_ptr<fft::SquareR2C<double>> fft1_, fft2_;
+};
+
+// Matrix-free O(N) tangential operator: three scalar H2Operator instances
+// (xx, yy, xy) built through the M1 kernel-functor constructor from a
+// CerrutiKernel (which must outlive this object). Blocked matvec
+//   u_x = XX q_x + XY q_y,  u_y = XY q_x + YY q_y
+// costs 4 scalar H2 applies + 2 adds. Same stacked [q_x; q_y] layout and
+// dense-reference semantics as TangentialFFTOperator. Component scratch is
+// object-owned and reused: no concurrent applies on one instance.
+class TangentialH2Operator {
+public:
+    TangentialH2Operator(const CerrutiKernel& kernel, H2Params params);
+
+    void build();
+
+    Eigen::VectorXd matvec(const Eigen::VectorXd& q) const;
+    void matvec_into(const Eigen::VectorXd& q, Eigen::VectorXd& u) const;
+
+private:
+    int Ns_;
+    H2Operator Hxx_, Hyy_, Hxy_;
+    mutable Eigen::VectorXd qc_, tc_; // component input / output scratch
 };
 
 } // namespace hmc

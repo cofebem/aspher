@@ -155,4 +155,53 @@ void TangentialFFTOperator::matvec_into(const Eigen::VectorXd& q,
     }
 }
 
+TangentialH2Operator::TangentialH2Operator(const CerrutiKernel& kernel,
+                                           H2Params params)
+    : Ns_(kernel.grid_size()),
+      Hxx_(kernel.grid_size(), kernel.element_size(),
+           [k = &kernel](double dx, double dy) { return k->xx_far(dx, dy); },
+           [k = &kernel](int di, int dj) { return k->xx_offset(di, dj); },
+           params),
+      Hyy_(kernel.grid_size(), kernel.element_size(),
+           [k = &kernel](double dx, double dy) { return k->yy_far(dx, dy); },
+           [k = &kernel](int di, int dj) { return k->yy_offset(di, dj); },
+           params),
+      Hxy_(kernel.grid_size(), kernel.element_size(),
+           [k = &kernel](double dx, double dy) { return k->xy_far(dx, dy); },
+           [k = &kernel](int di, int dj) { return k->xy_offset(di, dj); },
+           params) {}
+
+void TangentialH2Operator::build() {
+    Hxx_.build();
+    Hyy_.build();
+    Hxy_.build();
+}
+
+Eigen::VectorXd TangentialH2Operator::matvec(const Eigen::VectorXd& q) const {
+    Eigen::VectorXd u;
+    matvec_into(q, u);
+    return u;
+}
+
+void TangentialH2Operator::matvec_into(const Eigen::VectorXd& q,
+                                       Eigen::VectorXd& u) const {
+    const int N = Ns_ * Ns_;
+    if (static_cast<int>(q.size()) != 2 * N)
+        throw std::invalid_argument(
+            "TangentialH2Operator::matvec: q size != 2*Ns*Ns");
+    if (u.size() != 2 * N) u.resize(2 * N);
+
+    qc_ = q.head(N); // q_x
+    Hxx_.matvec_into(qc_, tc_);
+    u.head(N) = tc_;
+    Hxy_.matvec_into(qc_, tc_);
+    u.tail(N) = tc_;
+
+    qc_ = q.tail(N); // q_y
+    Hxy_.matvec_into(qc_, tc_);
+    u.head(N) += tc_;
+    Hyy_.matvec_into(qc_, tc_);
+    u.tail(N) += tc_;
+}
+
 } // namespace hmc

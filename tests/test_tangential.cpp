@@ -40,8 +40,31 @@ static int test_fft_vs_dense() {
     return 0;
 }
 
+// H2 gate: far-field Chebyshev interpolation error only (near field exact).
+// Mirrors test_h2's Love gates; the xy component's odd parity is exercised
+// through the signed-offset coupling/stencil caches.
+static int test_h2_vs_dense() {
+    const int Ns = 32;
+    hmc::CerrutiKernel C(Ns, 1.0, 1.7, 0.3);
+    const Eigen::MatrixXd D = C.assemble_dense();
+    const Eigen::VectorXd q = random_q(2 * Ns * Ns, 11);
+    const Eigen::VectorXd ref = D * q;
+    auto relerr = [&](int qo) {
+        hmc::TangentialH2Operator A(C, {8, qo, 1});
+        A.build();
+        return (A.matvec(q) - ref).norm() / ref.norm();
+    };
+    const double e4 = relerr(4), e6 = relerr(6);
+    std::printf("tangential H2 rel err: q=4 %.3e  q=6 %.3e\n", e4, e6);
+    CHECK(e4 < 5e-3);
+    CHECK(e6 < e4);
+    CHECK(e6 < 1e-4);
+    return 0;
+}
+
 int main() {
     if (int rc = test_fft_vs_dense()) return rc;
+    if (int rc = test_h2_vs_dense()) return rc;
     std::printf("test_tangential: all checks passed\n");
     return 0;
 }
