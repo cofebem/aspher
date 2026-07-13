@@ -16,7 +16,7 @@
 half-space flexibility problem\\[2pt]
 \large strategy, design choices, and validation}
 \author{ASPHER}
-\date{2026-06-27}
+\date{2026-06-27 --- revised 2026-07-13 (active-set solve)}
 
 \begin{document}
 \maketitle
@@ -30,7 +30,10 @@ interpolation. We explain why this design is preferred over a dense matrix
 or a classical $\mathcal{H}$-matrix with ACA-compressed blocks, describe the
 algorithm and the choices that make it efficient for a regular grid with a
 translation-invariant kernel, and report measured memory, accuracy, and a
-comparison against the FFT solver Tamaas.
+comparison against the FFT solver Tamaas. A final section documents the
+masked matvec and the active-set solve built on it (July 2026), which cut the
+large-grid solve by a further $\sim\!4\times$ in time and $\sim\!2\times$ in
+memory without changing the solution.
 \end{abstract}
 
 \section{Problem and discretisation}
@@ -305,9 +308,10 @@ separations (Gibbs-like), and its effective modulus is $2\Es{}^2$ (both
 verified against Hertz theory; see the project README). The difference is
 therefore dominated by the FFT reference, and it is the same $\approx3.3\%$
 seen for the $\mathcal{H}$-matrix backend. Both H2 and FFT are $\Order(N)$ in
-memory; H2 is additionally \emph{local}, which leaves room to skip work
-outside the contact set (active-set masking), something a global FFT cannot
-do without re-padding.
+memory; H2 is additionally \emph{local}, which allows skipping work outside
+the contact set --- something a global FFT cannot do without re-padding.
+This is no longer just ``room'': the masked matvec and the active-set solve
+of Section~\ref{sec:active-note} realise it.
 
 \section{Convergence acceleration}
 \label{sec:accel}
@@ -415,6 +419,61 @@ monotone/constraint multigrid for the variational
 inequality~\cite{Kornhuber1994,Brandt1977,BornemannDeuflhard1996} is the heavier
 alternative, deferred for now.
 
+\section{Active-set solve: masked matvec and restricted PCG}
+\label{sec:active-note}
+
+At light loads the contact set is a small fraction of the grid
+($N_c/N\sim10^{-2}$--$10^{-3}$), yet the solver of
+Section~\ref{sec:accel} still applies the operator and every $\Order(N)$
+vector pass on the full grid. The active-set solve
+(\texttt{hc.solve\_nested(..., active\_set=True)}, July 2026) exploits the
+locality of the $\mathcal{H}^2$ apply to restrict the whole finest-level
+iteration to a \emph{candidate set} and certify the result.
+
+\paragraph{Masked matvec.} \texttt{H2Mask} is a flat per-box occupancy
+bitmap over the quad-tree, OR-propagated to ancestors (parent-closed).
+The masked apply runs P2M/M2M only on source-occupied boxes, skips
+non-source entries inside the M2L interaction-list walk, and runs
+L2L/L2P/near only on target boxes. For an input that vanishes off the
+source leaves the output is \textbf{bit-for-bit identical} to the unmasked
+matvec on the target leaves: every skipped contribution is an exact zero and
+the kept summation order is unchanged (asserted in
+\texttt{tests/test\_active.cpp}, double and float). Measured cost with source
+$=$ target $=$ candidates: $1.8$--$2.4\%$ of a full matvec at
+$N_c/N\approx10^{-2}$ ($N_s=2048/4096$) and $\approx\!0.9\%$ at $N_s=16384$;
+the verification mode (full target grid) costs $2$--$10\%$ and runs once or
+twice per solve, not per iteration.
+
+\paragraph{Restricted Polonsky--Keer.} The finest nested level runs the
+\emph{identical} PCG (Section~\ref{sec:accel}) with all $\Order(N)$ loops
+driven by the candidate index list and all CG state compressed to
+$\Order(N_c)$ slot-blocked vectors ($\approx2$--$4\,N_c$ entries). The
+candidate set is $\mathcal{K}=\mathrm{dilate}(\text{prolonged coarse
+contact})\cup\{\text{coarse gap}<\delta\}$; the gap term is mandatory
+($\sim\!30\%$ of fine contact islands have no coarse-contact precursor on
+rich spectra), and $\delta$ is kept generous because a tight threshold can
+pass verification while boundary pressures are subtly wrong. Verification is
+one streamed masked-source/full-target matvec plus a gap scan; violations
+are dilated into $\mathcal{K}$ and the solve resumes warm-started (one round
+suffices in practice), with a full-solve fallback as escape hatch. Two
+findings shape the design: restriction does \emph{not} improve conditioning
+(the islands span the domain, so the smooth inter-island modes keep their
+domain-scale $\kappa$ --- the $\abs{q}$ preconditioner \textbf{stays on},
+applied through its full-grid FFT with compressed scatter/gather), and the
+reduced-wave-vector (capped-symbol $\min(\abs{q},q_c)$) preconditioner
+variant of the FFT-homogenisation literature~\cite{GierdenEtAl2022} scales
+like the unpreconditioned iteration and was rejected. Full theory, tables,
+and the certification subtleties: \texttt{pcg.tex} \S``Active-Set
+Acceleration'' and \texttt{h2\_fmm\_detailed.tex}.
+
+\paragraph{Measured.} Same solution as the standard nested solve (pressure
+rel-$L_2\sim10^{-14}$ double, $\Delta A_c=0$). At $N_s=4096$ (double):
+$173\to46.5$\,s ($3.7\times$), solve-peak RSS $1593\to841$\,MB. At
+$N_s=16384$ (float, full-band surface): $1445\to308$\,s ($4.7\times$),
+$18.3\to10.9$\,GiB ($1.67\times$); in \emph{double}, the active-set solve
+runs in $12.5$\,GiB where the standard double solve exceeds the machine's
+31\,GiB entirely.
+
 \section{Design choices, summarised}
 \begin{itemize}
 \item \textbf{bbFMM over analytic FMM}: kernel-agnostic, needs only
@@ -432,13 +491,18 @@ all existing tests are untouched; PCG plugs into \texttt{H2Operator::matvec}.
 \end{itemize}
 
 \section{Limitations and outlook}
-The current operator runs on the full grid (the contact constraint is
-handled by the PCG projection). Natural next steps: active-domain
-\emph{masking} to skip near/far work outside the contact patch; rectangular
-($n_x\neq n_y$) and locally refined grids; single-precision cache storage;
-and an FFT backend for the fully-active rectangular case. None of these
-change the public API
-(\texttt{H2Operator\{build(),matvec(),print\_statistics()\}}).
+Of the extensions once listed here, three are now implemented without
+changing the public API: active-domain \emph{masking}
+(Section~\ref{sec:active-note}); \emph{single-precision} execution
+(\texttt{single\_precision=True} keeps float copies of the caches and runs
+the matvec, PCG, and preconditioner FFT in \texttt{float} with all scalar
+reductions accumulated in double --- see \texttt{pcg.tex}); and an exact
+\emph{FFT-convolution backend} (\texttt{backend="fft"}, zero-padded Love
+kernel; matches the dense operator to $\sim10^{-15}$, roughly at parity with
+H2 in matvec time at $N_s=4096$, with H2 preferred at very large $N_s$ for
+its $\Order(N)$ cost and smaller working set). Remaining next steps:
+rectangular ($n_x\neq n_y$) and locally refined grids; leaf-side/$q$
+auto-tuning; GPU offload of the near field and M2L.
 
 \bibliographystyle{unsrt}
 \bibliography{references}

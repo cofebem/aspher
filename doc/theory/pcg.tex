@@ -56,7 +56,8 @@
        \large Theory, Line Search Strategies, and Application\\
        to Elastic Contact Mechanics}
 \author{ASPHER project (formerly Hcontact) --- technical reference}
-\date{June 2026 --- revised July 2026 (preconditioning and finite-precision implementation)}
+\date{June 2026 --- revised July 2026 (preconditioning, finite-precision
+implementation, and the active-set solver)}
 \maketitle
 \tableofcontents
 
@@ -545,7 +546,10 @@ execution with double accumulation of scalar reductions, the cancellation-safe
 form of the line-search denominator, and the allocation-free organisation of
 the iteration.  The operator-side theory (Chebyshev black-box FMM, translation
 caching) is covered in the companion document \texttt{h2\_fmm\_detailed.tex};
-here we treat only what changes \emph{inside} the P-K loop.
+here we treat only what changes \emph{inside} the P-K loop.  The
+\emph{active-set} acceleration, which restricts the whole iteration to a
+candidate set rather than modifying its steps, is treated separately in
+Section~\ref{sec:active}.
 
 \subsection{The $|\mathbf q|$ preconditioner in brief}
 \label{sec:impl-precond}
@@ -572,6 +576,55 @@ direction is $t_i = z_i + \beta t_i$ on $\calC$.  The exact line
 search~\eqref{eq:tau}, projection, overlap correction and load rescaling are
 untouched; with the preconditioner disabled ($\bz = \tilde\bg$ on $\calC$) the
 algorithm reduces to Algorithm~\ref{alg:pk} exactly.
+
+\subsection{A reduced-wave-vector (capped-symbol) variant: negative result}
+\label{sec:impl-capped}
+
+FFT-based computational homogenisation has a model-order-reduction device ---
+working with a \emph{reduced set of wave vectors}, keeping only the
+low-frequency band spectral (Kochmann, Gierden, Reese and
+co-workers~\cite{GierdenEtAl2022}) --- that suggests a cheaper variant of the
+spectral preconditioner: cap the symbol at a cutoff wavenumber $q_c$,
+\begin{equation}
+  \widehat{M^{-1}_{q_c}}(\mathbf k) = \min\bigl(|\mathbf k|,\; q_c\bigr),
+  \label{eq:capped-symbol}
+\end{equation}
+so that only the modes below $q_c$ are rescaled individually while the whole
+band above $q_c$ is treated uniformly.  If the $1/|\mathbf q|$ conditioning
+were dominated by the smooth (low-$|\mathbf q|$) end of the spectrum, the
+capped form would retain most of the benefit at a fraction of the spectral
+resolution.  This was tested in the active-set prototype
+(\texttt{experiments/active\_set\_proto.py}, self-affine surface, $H = 0.8$,
+tol $10^{-8}$, restricted solve of Section~\ref{sec:active}, $q_c = 32$):
+
+\begin{table}[ht]
+\centering
+\caption{Iteration counts of the capped symbol~\eqref{eq:capped-symbol}
+         against the full $|\mathbf q|$ symbol and the unpreconditioned
+         iteration (restricted P-K, candidate set = dilated true contact set).}
+\label{tab:capped}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Case & none & capped ($q_c{=}32$) & full $|\mathbf q|$ \\
+\midrule
+$N_s{=}1024$, $\bar p = 0.002$ & 121--132 & 104--110 & 56--57 \\
+$N_s{=}1024$, $\bar p = 0.01$  & 377      & 237      & 130    \\
+$N_s{=}2048$, $\bar p = 0.002$ & 247      & 185      & 65     \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The capped symbol lands between the two arms and, decisively, \emph{scales
+like the unpreconditioned iteration} ($\approx\!1.9\times$ more iterations per
+grid doubling, against $\approx\!1.25\times$ for the full symbol): the
+$1/|\mathbf q|$ conditioning is spread across the entire resolved band, so
+rescaling only the smooth end leaves the $\Theta(N_s)$ growth of
+$\kappa$ intact.  In its simple capped form the idea is therefore not worth
+the added parameter for this operator, and the production preconditioner
+carries only the full $|\mathbf k|$ symbol.  (A two-scale split ---
+per-island \emph{local} preconditioning plus a low-band global correction ---
+remains conceivable future work; the plain cap is not a useful step toward
+it.)
 
 \subsection{Half-spectrum FFT application}
 \label{sec:impl-fft}
@@ -750,6 +803,179 @@ tolerance clamp, with a 200-iteration stagnation guard retained as a safety
 net.
 
 % ---------------------------------------------------------
+\section{Active-Set Acceleration: Restricted Iteration on Candidate Sets}
+\label{sec:active}
+
+At light loads the converged contact set occupies a small fraction of the
+grid ($N_c/N \sim 10^{-2}$--$10^{-3}$ for the rough surfaces of interest),
+yet Algorithm~\ref{alg:pk} performs both matvecs and every $O(N)$ vector pass
+on the full grid.  The \emph{active-set acceleration} (July 2026,
+\texttt{active\_set=True} in \texttt{hc.solve\_nested}) runs the finest level
+of the nested continuation as a restricted P-K iteration on a
+\emph{candidate set} $\mathcal{K} \supseteq \calC^*$ believed to contain the
+true contact set, with the operator applied by a masked $\mathcal{H}^2$
+matvec whose cost is proportional to the candidate leaves (measured
+1.8--2.4\% of a full matvec at $N_c/N \approx 10^{-2}$, $\approx\!0.9\%$ at
+$N_s = 16384$; the operator-side construction --- occupancy bitmaps, masked
+FMM passes, bit-for-bit exactness --- is documented in the companion
+\texttt{h2\_fmm\_detailed.tex}).  Convergence on $\mathcal{K}$ is then
+\emph{certified} by explicit verification on the full grid, so the final
+answer is the same fixed point as the unrestricted solve (measured pressure
+rel-$L^2 \sim 10^{-14}$ in double precision, $\Delta A_c = 0$).
+
+\subsection{What restriction does and does not buy}
+\label{sec:active-cond}
+
+A tempting hypothesis is that restricting the QP to the neighbourhood of the
+contact islands also shrinks the condition number to the island extent,
+making the spectral preconditioner redundant.  The prototype study
+(\texttt{experiments/active\_set\_proto.py}) \emph{refutes} this: the
+restricted-unpreconditioned iteration count equals the
+global-unpreconditioned one at every size and load tested
+(Table~\ref{tab:capped}, ``none'' column: e.g.\ 121--132 restricted vs.\ 132
+global at $N_s = 1024$), because the contact islands are spread across the
+whole domain and the smooth $1/|\mathbf q|$ \emph{inter-island} modes retain
+their domain-scale conditioning.  Conversely, the $|\mathbf q|$
+preconditioner keeps its full advantage on the restricted iteration, and
+that advantage grows with $N_s$ ($\times1.9$ per grid doubling
+unpreconditioned vs.\ $\times1.25$ preconditioned).  The design consequence:
+\textbf{the preconditioner stays on}; what restriction buys is per-iteration
+operator cost and memory, not iteration count.
+
+\subsection{Candidate set from the nested cascade}
+\label{sec:active-cand}
+
+The coarse levels of the nested continuation (Section~\ref{sec:impl}) supply
+both a warm start and, crucially, a \emph{gap field} on the next-to-finest
+grid.  The candidate set is
+\begin{equation}
+  \mathcal{K} \;=\; \operatorname{dilate}_{k}\bigl(\text{prolonged coarse
+  contact set}\bigr) \;\cup\; \{\,i : g^{\mathrm{coarse}}_i < \delta \cdot
+  g_{\mathrm{scale}}\,\},
+  \label{eq:candidate}
+\end{equation}
+with halo width $k$ (default 2) and gap threshold $\delta$ (default $0.05$,
+relative to the fine gap scale $g_{\mathrm{scale}} = \max\bg_0 - \min\bg_0$).
+The gap-proximity term is \emph{mandatory}, not a refinement: on self-affine
+surfaces with spectral content down to the fine Nyquist, $\sim\!30\%$ of the
+fine contact islands have \emph{no coarse-contact precursor at all} (orphan
+islands --- asperities invisible on the coarse grid), so any purely geometric
+dilation of the coarse contact set would miss them; the physics that rescues
+the construction is that such an asperity still sits at a \emph{small coarse
+gap}.  With $\delta$ in the validated range the candidate set is
+$|\mathcal{K}| \approx 2$--$5\,N_c$ and one verification round suffices.
+
+The threshold must be \emph{generous}.  At tight $\delta$ the prototype
+exhibited a treacherous failure: a few missed boundary points let
+verification pass (no penetration beyond tolerance outside $\mathcal{K}$)
+while the pressure carried a $0.5$--$0.9\%$ error --- \textbf{the
+certificate can be clean while the active set is subtly wrong}.  A generous
+$\delta$ only costs memory and is tunable; the invisible failure is not.
+
+\subsection{The restricted iteration}
+\label{sec:active-restricted}
+
+The restricted solver
+(\texttt{solve\_contact\_active\_impl}) is \emph{algorithmically identical}
+to Algorithm~\ref{alg:pk} with the preconditioner of
+Section~\ref{sec:impl-precond}: PR+, the rigid-body shift, the exact centred
+line search, the overlap correction, the load renormalisation and the
+double-accumulated reductions are all unchanged.  What changes is the index
+space:
+\begin{itemize}
+  \item every per-iteration $O(N)$ loop runs over the candidate index list
+        ($O(N_c)$ work); the pressure iterate is exactly zero off
+        $\mathcal{K}$, so restricting the loops changes nothing in exact
+        arithmetic as long as $\calC \subseteq \mathcal{K}$;
+  \item the \emph{load constraint stays global}: the rescaling enforces
+        $\sum_i p_i = N\bar p$ with $N$ the full grid size --- the physical
+        load is a full-grid quantity;
+  \item the operator is the masked matvec with source and target sets both
+        $\mathcal{K}$; its output is stale off the candidate leaves and is
+        never read there;
+  \item the $|\mathbf q|$ preconditioner is applied \emph{unchanged} through
+        its full-grid FFT (Section~\ref{sec:active-cond} is why): the
+        compressed residual is scattered into the owned FFT grid, transformed,
+        and gathered back compressed
+        (\texttt{FourierPreconditioner::apply\_into\_indexed}).  It reads the
+        residual only on the contact mask ($\subseteq \mathcal{K}$) and zeroes
+        its output elsewhere, so stale entries never leak.
+\end{itemize}
+All CG state is stored in \emph{compressed slot-blocked} form: an
+occupied-leaf $\to$ slot map lays each candidate leaf's $\ell^2$ elements out
+contiguously, so the vectors are $O(N_c)$ ($\approx 2$--$4\,N_c$ entries for
+contact-like masks) and the leaf blocks are contiguous for the operator's
+P2M/near passes.  Only the FFT grid of the preconditioner and two
+\texttt{uint8} masks remain full-size; the FFT scratch is released after the
+last CG iteration.
+
+\subsection{Verification, extension, and certification}
+\label{sec:active-verify}
+
+After the restricted solve converges on $\mathcal{K}$, one
+masked-source/\emph{full-target} matvec (streamed per target leaf, never
+materialising an $N$-sized displacement) evaluates the true gap everywhere.
+Points outside $\mathcal{K}$ with $g_i < -\varepsilon\,g_{\mathrm{scale}}$
+are \emph{violations}: physically, contact the candidate set failed to
+anticipate.  If any exist, they are dilated into $\mathcal{K}$ and the
+restricted solve resumes from its own warm start; on the surfaces tested one
+round always sufficed (violation-free certificates at the default
+$\delta$).  After \texttt{active\_max\_rounds} uncertified rounds the driver
+falls back to the standard full-grid solve --- correctness never depends on
+the candidate heuristic.
+
+\subsection{A blindness of the complementarity error}
+\label{sec:active-blind}
+
+The fallback exposed a subtlety of the stopping
+criterion~\eqref{eq:stopping} worth recording: the complementarity error
+$e_k \propto \sum_i p_i |\tilde g_i|$ is \emph{blind} to points with
+$p_i = 0$ and $\tilde g_i < 0$ (penetration carrying no pressure).  A fallback warm start that is converged on the old candidate set
+but penetrating outside it therefore ``converges'' at iteration~0 with the
+penetration unfixed (a $1.5\times10^{-2}$ pressure error was observed in the
+regression test).  The overlap correction~\eqref{eq:overlap} cannot rescue
+this on its own, because a converged iterate takes no further CG step.  The
+driver therefore \emph{seeds} the violating points with $\bar p$ in the
+fallback warm start: they join the contact set at iteration~0 and the full
+solve, exact for any $\bp \geq 0$ start, proceeds normally.
+
+\subsection{Measured results}
+\label{sec:active-results}
+
+All runs: seed-42 self-affine surfaces, $\bar p = 0.002$, tol $10^{-8}$
+(float clamped at $2\times10^{-6}$), nested continuation, $q = 4$,
+$\ell = 16$, light result, one verification round, no fallback.  Timings on
+the co-tenant 20-core workstation --- ratios are the reliable quantity.
+
+\begin{table}[ht]
+\centering
+\caption{Standard vs.\ active-set nested solve (July 2026).  RSS is the
+         solve-phase peak.  The $N_s{=}16384$ surface is full-band
+         ($k^{-1.8}$ to the Nyquist, contact fraction $\approx 0.0047$).}
+\label{tab:active}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Case & standard nested & active-set nested & factor \\
+\midrule
+$N_s{=}1024$, f64, wall            & 2.54\,s        & 1.05\,s          & $2.4\times$ \\
+$N_s{=}4096$, f64, wall / iters    & 172.9\,s / 91  & 46.5\,s / 91     & $3.7\times$ \\
+$N_s{=}4096$, f64, solve-peak RSS  & 1593\,MB       & 841\,MB          & $1.9\times$ \\
+$N_s{=}16384$, f32, wall / iters   & 1445\,s / 86   & 308\,s / 89      & $4.7\times$ \\
+$N_s{=}16384$, f32, solve-peak RSS & 18.3\,GiB      & 10.9\,GiB        & $1.67\times$ \\
+$N_s{=}16384$, f64, wall / RSS     & --- (OOM, $>$24\,GiB) & 1458\,s / 12.5\,GiB & enabler \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+Solution equivalence: contact areas identical to all reported digits and
+pressure rel-$L^2 \sim 10^{-14}$ (double) against the standard nested solve;
+the $N_s = 1024$ case also reproduces the Python prototype's contact area
+exactly.  The last row is the qualitative gain: double precision to
+tol~$10^{-8}$ at $N_s = 16384$ ($N \approx 2.7\times10^{8}$) in
+12.5\,GiB, on a machine where the standard double solve does not fit at all.
+
+% ---------------------------------------------------------
 \section{GPCG: Gradient Projected Conjugate Gradient}
 \label{sec:gpcg}
 
@@ -893,8 +1119,13 @@ Key observations:
         iterations; the solve time is dominated by the 9.3\,s assembly rather
         than the CG iterations.
   \item $N_s = 1024$ ($\approx 10^6$ unknowns) requires an estimated 26\,GiB
-        for the H-matrix and is out of scope on the current workstation (12\,GiB RAM);
-        it would require MPI or out-of-core ACA.
+        for the H-matrix and is out of scope for this \emph{stored-matrix}
+        backend.  This limitation is historical: the matrix-free
+        $\mathcal{H}^2$ operator (companion document
+        \texttt{h2\_fmm\_detailed.tex}) with the nested continuation and the
+        active-set solver of Section~\ref{sec:active} now reaches
+        $N_s = 16384$ ($N \approx 2.7\times10^{8}$) in double precision on a
+        32\,GiB workstation.
 \end{itemize}
 
 % ---------------------------------------------------------

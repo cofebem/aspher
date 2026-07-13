@@ -36,7 +36,7 @@
 \title{The black-box FMM ($\Htwo$) operator in ASPHER:\\[4pt]
 a detailed derivation, design rationale, and validation}
 \author{ASPHER (formerly Hcontact) --- theory companion to \texttt{doc/theory/h2\_fmm.tex}}
-\date{2026-06-30}
+\date{2026-06-30 --- revised 2026-07-13 (masked matvec and active-set solve)}
 
 \begin{document}
 \maketitle
@@ -63,7 +63,10 @@ operators P2M, M2M, M2L, L2L, L2P, with the small-matrix forms exactly as
 coded; the translation-invariant caching that collapses storage to $\Order(N)$;
 operation and storage counts; accuracy analysis; a justification of every
 default parameter; validation against the dense operator, the classical
-$\Hmat$-matrix, and the FFT solver Tamaas; and limitations.
+$\Hmat$-matrix, and the FFT solver Tamaas; the masked matvec and the
+active-set solve built on it (July 2026), including the exactness argument,
+the candidate-set construction and its certification subtleties, and the
+$\Order(N_c)$ compressed state; and limitations.
 \end{abstract}
 
 \tableofcontents
@@ -90,9 +93,13 @@ method. Sections~\ref{sec:tree}--\ref{sec:bbfmm} develop the geometry, the
 approximation theory, and the five transfer operators. Section~\ref{sec:cache}
 explains the translation-invariant caching that is the decisive optimisation
 for a regular grid. Sections~\ref{sec:complexity}--\ref{sec:params} analyse
-complexity and accuracy and justify every parameter. Sections~\ref{sec:valid}--\ref{sec:outlook}
-report validation and discuss limitations. Throughout, claims of fact about the
-implementation are tied to specific source locations.
+complexity and accuracy and justify every parameter.
+Sections~\ref{sec:valid}--\ref{sec:accel} report validation and the
+convergence accelerations (preconditioning, nested continuation).
+Section~\ref{sec:active} documents the masked matvec and the active-set
+solve that restrict all work to the neighbourhood of the contact set, and
+Section~\ref{sec:outlook} discusses limitations. Throughout, claims of fact
+about the implementation are tied to specific source locations.
 
 \paragraph{Conventions.}
 A grid element is identified by integer indices $(i_x,i_y)$, $0\le i_x,i_y<N_s$,
@@ -1260,7 +1267,11 @@ two complementary, \emph{optional} accelerations: a spectral (Fourier)
 preconditioner and a nested-grid (cascadic / full-multigrid) continuation with
 warm starts. Both are exact in the sense that they change only the path, not the
 fixed point: with the preconditioner disabled the solver reproduces the original
-iteration bit-for-bit (Proposition~\ref{prop:precond-none}).
+iteration bit-for-bit (Proposition~\ref{prop:precond-none}). A third
+acceleration of a different kind --- restricting the \emph{work} per iteration
+to the neighbourhood of the contact set rather than reducing the iteration
+count --- is built on top of these two and is developed in
+Section~\ref{sec:active}.
 
 \subsection{Why the iteration count grows: conditioning of $S$}
 \label{sec:cond}
@@ -1356,6 +1367,26 @@ two symbols are within one iteration at every grid size
 (Table~\ref{tab:precond-it}), so the simpler, always-positive $\abs{\mathbf q}$
 form is the production choice and the C++ implementation
 (\code{FourierPreconditioner}) carries only it.
+
+\begin{remark}[Reduced-wave-vector (capped) symbol: a tested negative]
+\label{rem:capped}
+A third symbol was tested during the active-set prototype study
+(\code{experiments/active\_set\_proto.py}): the \emph{capped} form
+$w_{q_c}(\mathbf q)=\min(\abs{\mathbf q},q_c)$, transplanting the
+reduced-set-of-wave-vectors model-order-reduction idea of FFT-based
+computational homogenisation (Kochmann, Gierden, Reese and
+co-workers~\cite{GierdenEtAl2022}): rescale only the low band
+$\abs{\mathbf q}<q_c$ spectrally and treat everything above uniformly. It
+does not work here: at $q_c=32$ the iteration count lands between the
+unpreconditioned and fully preconditioned arms (e.g.\ $185$ vs $247$/$65$ at
+$N_s=2048$) but \emph{scales like the unpreconditioned one}
+($\times1.9$ per grid doubling) --- the $1/\abs{\mathbf q}$ conditioning is
+spread over the whole resolved band, so rescaling only the smooth end leaves
+the $\Theta(N_s)$ growth of $\kappa$ intact. The production preconditioner
+therefore carries only the full $\abs{\mathbf q}$ symbol; iteration tables in
+\code{doc/theory/pcg.tex}, \S``A reduced-wave-vector (capped-symbol)
+variant''.
+\end{remark}
 
 \begin{proposition}[Scale invariance]
 \label{prop:scale}
@@ -1674,30 +1705,313 @@ coarse-grid corrections (truncated/monotone restrictions) rather than only seedi
 the active set; that is expected to remove the remaining boundary-leakage term at
 the cost of a substantially more intricate solver, and is left as future work.
 
+\section{Active-set solve: masked matvec and restricted Polonsky--Keer}
+\label{sec:active}
+
+The accelerations of Section~\ref{sec:accel} reduce the \emph{number} of
+iterations; each iteration still applies the operator and every $\Order(N)$
+vector pass on the full grid. At the light loads typical of rough-contact
+studies the converged contact set occupies $N_c/N\sim10^{-2}$--$10^{-3}$ of
+the grid, so almost all of that work concerns points that carry no pressure
+and never will. The active-set solve (July 2026;
+\code{hc.solve\_nested(..., active\_set=True)}, $\Htwo$ backend only)
+restricts the finest nested level to a \emph{candidate set}
+$\mathcal K\supseteq$ the true contact set, applies the operator through a
+\emph{masked} matvec whose cost is proportional to the candidate leaves, and
+\emph{certifies} the result by explicit full-grid verification --- so the
+answer remains the same fixed point as the unrestricted solve. Design spec:
+\code{doc/specs/2026-07-10-active-set-solver-design.md}; prototype study:
+\code{experiments/active\_set\_results.md}; solver-side theory (restricted
+iteration, certification, fallback):\ \code{doc/theory/pcg.tex},
+\S``Active-Set Acceleration''. Here we cover the operator side and the
+findings that shaped the design.
+
+\subsection{Prototype findings that shaped the design}
+\label{sec:active-proto}
+
+A Python prototype (\code{experiments/active\_set\_proto.py}; exact
+algorithm and exact operator, so its iteration counts are trustworthy even
+though its wall times are not) answered three questions.
+
+\begin{enumerate}
+\item \textbf{Restriction does not replace the preconditioner.} The
+hypothesis that restricting the QP to the contact islands shrinks the
+condition number to the island extent is \emph{refuted}: the
+restricted-unpreconditioned count equals the global-unpreconditioned one at
+every size and load tested ($121$--$132$ vs $132$ at $N_s=1024$,
+$\bar p=0.002$; $247$ vs $250$ at $N_s=2048$), because the islands span the
+whole domain and the smooth $1/\abs{\mathbf q}$ \emph{inter-island} modes
+keep their domain-scale conditioning. The $\abs{\mathbf q}$ preconditioner
+retains its full advantage on the restricted iteration ($65$ vs $247$ at
+$N_s=2048$) and that advantage grows with $N_s$. The capped
+reduced-wave-vector symbol fares no better (Remark~\ref{rem:capped}).
+Consequence: \textbf{the preconditioner stays on}; restriction buys
+per-iteration cost and memory, not iteration count.
+\item \textbf{Gap-proximity candidates are mandatory.} On self-affine
+surfaces with spectral content down to the fine Nyquist, ${\sim}30\%$ of the
+fine contact islands have \emph{no coarse-contact precursor at all}
+($108/362$, $380/1241$, $313/996$ islands in the three configurations
+tested): asperities invisible on the coarse grid. Geometric dilation of the
+coarse contact set alone would miss all of them; what rescues the
+construction is that such an asperity still sits at a \emph{small coarse
+gap}, so the candidate set must be
+\begin{equation}
+  \mathcal K \;=\; \operatorname{dilate}_k\!\bigl(\text{prolonged coarse
+  contact}\bigr)\;\cup\;\{\,i:\ g^{\text{coarse}}_i<\delta\cdot
+  g_{\text{scale}}\,\},
+  \label{eq:candidate-set}
+\end{equation}
+with halo $k$ (default $2$) and threshold $\delta$ (default $0.05$ of the
+fine gap scale). In the validated range $\abs{\mathcal K}\approx2$--$5\,N_c$
+and one verification round recovers the reference solution to solver
+tolerance.
+\item \textbf{The certificate can be clean while the answer is subtly
+wrong.} At tight $\delta$ a few missed boundary points let verification pass
+(no penetration beyond tolerance outside $\mathcal K$) while the pressure
+carries a $0.5$--$0.9\%$ error. $\delta$ is therefore kept \emph{generous}
+--- a fat candidate set costs tunable memory; the failure mode of a tight
+one is invisible.
+\end{enumerate}
+
+\subsection{The masked matvec}
+\label{sec:masked}
+
+\paragraph{Occupancy mask.} \code{H2Mask} (\code{include/h2\_operator.hpp})
+is a flat per-box occupancy bitmap over the complete uniform quadtree ---
+no index lists. \code{H2Operator::build\_mask} marks the leaf boxes
+intersecting the marked point set (the box of grid point $(i_x,i_y)$ is
+\code{box\_id(leaf\_level, $i_x/\ell$, $i_y/\ell$)}) and OR-propagates to
+ancestors in one reverse sweep over the level-ordered box array,
+$\Order(N+n_{\text{box}})$. The occupied set is therefore
+\emph{parent-closed} --- every ancestor of an occupied box is occupied ---
+which is exactly the property the downward pass relies on.
+
+\paragraph{Masked passes.} \code{matvec\_masked\_into(x, y, src, tgt)}
+shares every cache and buffer with the unmasked \code{matvec\_impl} and
+masks each pass:
+\begin{itemize}
+\item \textbf{P2M} computes moments only for \code{src}-occupied leaves;
+skipped columns of the shared moment scratch hold stale data that no later
+pass reads.
+\item \textbf{M2M} runs only on \code{src}-occupied parents, combining
+their \code{src}-occupied children (occupancy is the OR of the children's,
+so an occupied parent has at least one).
+\item \textbf{M2L} computes locals only for \code{tgt}-occupied boxes
+(\code{tgt = nullptr} means all boxes --- the verification mode) and skips
+non-\code{src} sources inside the CSR interaction-list walk: one byte load
+per interaction. Prebuilt masked interaction lists were considered and
+rejected --- the branchy skip already meets the cost target
+(Table~\ref{tab:masked-gate}).
+\item \textbf{L2L/L2P/near} run only on \code{tgt} boxes; near sums skip
+non-\code{src} source leaves. All masked loops use dynamic OpenMP schedules:
+occupied boxes are spatially clustered, so static chunking would idle most
+threads.
+\end{itemize}
+
+\paragraph{Contract and exactness.} The caller guarantees that $x$ vanishes
+outside the \code{src}-occupied leaves; the output $y$ is valid only on
+\code{tgt}-occupied leaves (there is no $\Order(N)$ zeroing per apply). For
+such $x$ the masked output is \textbf{bit-for-bit identical} to the unmasked
+matvec on the target leaves. The argument is worth recording because it is
+stronger than the usual ``equal up to rounding'': every contribution the
+mask skips --- a moment of an all-zero leaf, an M2L term from an unoccupied
+source, a near sum over zero pressures --- is an \emph{exact} floating-point
+zero vector, and adding a zero vector never changes IEEE bits; every kept
+contribution is computed by the same code on the same operands in the same
+summation order as in the unmasked apply. \code{tests/test\_active.cpp}
+asserts exact equality at $N_s=256$ on a clustered random mask (islands plus
+isolated pixels), in double and float, for \code{tgt=all}, \code{tgt=src},
+and the full mask --- each masked call on a \emph{fresh} operator, so the
+shared scratch starts as garbage and any wrongly-read stale column fails
+loudly.
+
+\paragraph{Measured cost (the M1 gate).} The go/no-go criterion for the
+whole feature was the masked-matvec constant: the cost model needed
+${\lesssim}5\%$ of a full matvec at $N_c/N\approx5\times10^{-3}$.
+Table~\ref{tab:masked-gate} (\code{tests/bench\_masked.cpp}; candidate masks
+from a real contact solve, dilated by 2; best-of-repetitions on the 20-core
+workstation, ratios are the quantity of interest) shows the measurement.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{rrrrrrr}
+\toprule
+$N_s$ & $\ell$ & $q$ & cand$/N$ & leaf occ. & restricted (f64) & verify (f64) \\
+\midrule
+2048  & 8  & 6 & $1.08\times10^{-2}$ & 2.1\% & 1.24\,ms (\textbf{1.8\%}) & 4.8\,ms (7.2\%) \\
+2048  & 16 & 4 & $1.08\times10^{-2}$ & 2.9\% & 3.69\,ms (\textbf{2.1\%}) & 7.7\,ms (4.3\%) \\
+4096  & 8  & 6 & $1.06\times10^{-2}$ & 1.8\% & 4.41\,ms (\textbf{1.8\%}) & 23.1\,ms (9.5\%) \\
+4096  & 16 & 4 & $1.06\times10^{-2}$ & 2.3\% & 12.9\,ms (\textbf{1.8\%}) & 22.9\,ms (3.1\%) \\
+16384 & 16 & 4 & $7.6\times10^{-3}$  & 1.3\% & 112\,ms (\textbf{0.93\%}) & 248\,ms (2.1\%) \\
+\bottomrule
+\end{tabular}
+\caption{Masked-matvec cost relative to the full unmasked matvec at the same
+$(N_s,\ell,q)$, double precision. ``Restricted'' is src $=$ tgt $=$
+candidates (the per-iteration mode); ``verify'' is masked source with full
+target grid (once or twice per solve). Float ratios are similar. The
+per-iteration operator cost at $N_s=16384$ drops from $12.0$\,s to
+$0.11$\,s.}
+\label{tab:masked-gate}
+\end{table}
+
+The verification-mode cost has an $\Order(N)$ floor on the target side
+(all locals, all leaves must be evaluated), which is why it sits at
+$2$--$10\%$ rather than ${\sim}1\%$ --- acceptable because it is paid per
+\emph{round}, not per iteration.
+
+\subsection{The restricted driver on the nested cascade}
+\label{sec:active-driver}
+
+The driver (\code{active\_finest} in \code{src/nested\_solve.cpp}) keeps the
+coarse levels of Section~\ref{sec:nested} unchanged and replaces only the
+finest level:
+\begin{enumerate}
+\item build $\mathcal K$ by \eqref{eq:candidate-set} from the next-to-finest
+level's contact set and gap field (kept at $(N_s/2)^2$; the prolonged fine
+copy is never materialised);
+\item run the \emph{restricted} Polonsky--Keer solve on $\mathcal K$
+(algorithmically identical PCG --- PR$^+$, exact centred line search,
+overlap correction, load renormalisation, double-accumulated reductions ---
+with every $\Order(N)$ loop driven by the candidate index list and the
+operator applied as the masked matvec with src $=$ tgt $=\mathcal K$),
+warm-started from the prolonged coarse pressure; the load constraint stays
+global ($\sum_i p_i = N\bar p$);
+\item verify: one masked-source/full-target matvec plus a gap scan;
+points outside $\mathcal K$ with $g_i<-\varepsilon\,g_{\text{scale}}$ are
+violations, dilated into $\mathcal K$, and the solve resumes warm-started;
+\item after \code{active\_max\_rounds} uncertified rounds, fall back to the
+standard full-grid solve --- correctness never depends on the candidate
+heuristic. \code{ContactResult.active\_rounds} and \code{.active\_fallback}
+report the outcome.
+\end{enumerate}
+The fallback carries one non-obvious detail, found by a regression test with
+deliberately hostile parameters ($\delta=0$, no halo): the Polonsky--Keer
+complementarity error $\sum_i p_i\abs{\tilde g_i}$ is \emph{blind} to points
+with $p_i=0$ and $\tilde g_i<0$, so a fallback warm start that is converged
+on the old $\mathcal K$ but penetrating outside it ``converges'' at
+iteration~0 with the penetration unfixed. The driver therefore seeds the
+violating points with $\bar p$ in the fallback warm start, forcing them into
+the contact set from iteration~0; the full solve is exact for any
+$\pp\ge0$ start and proceeds normally. The solver-side discussion is in
+\code{pcg.tex}.
+
+\subsection{$\Order(N_c)$ compressed state and streamed verification}
+\label{sec:active-memory}
+
+Restricting the \emph{flops} without restricting the \emph{memory} would
+leave the large-grid solve dominated by $N$-sized CG vectors. The driver
+therefore works entirely on \emph{compressed slot-blocked} vectors:
+\code{H2Mask} carries an occupied-leaf $\to$ slot map, and a compressed
+vector stores each occupied leaf's $\ell^2$ elements contiguously (element
+$(l_x,l_y)$ of slot $s$ at index $s\ell^2+l_y\ell+l_x$;
+${\approx}2$--$4\,N_c$ entries for contact-like masks). Three pieces make
+this work:
+\begin{itemize}
+\item \code{H2Operator::matvec\_masked\_compressed\_into}: P2M and the near
+field read the slot blocks directly (an \code{Eigen::Map} of the contiguous
+block --- the compressed layout actually \emph{removes} the strided grid
+gathers of the grid-masked version), sharing the M2M/M2L/L2L passes
+verbatim with the grid-masked matvec; bit-for-bit identical to it (asserted
+in \code{test\_active}, both precisions). The multipole/local scratch stays
+full-size --- it is $\Order(N/\ell^2\cdot q^2)$ (${\approx}0.36$\,GiB at
+$N_s=16384$, $q=4$, $\ell=16$) and the verification pass needs all target
+locals anyway.
+\item \code{H2Operator::matvec\_masked\_stream}: the verification apply ---
+full-target matvec whose L2P$+$near output is computed per target leaf into
+an $\ell^2$ tile and handed to a thread-safe sink, never materialising an
+$N$-sized displacement; bit-for-bit identical to the grid-masked
+\code{tgt=all} apply. Non-light results re-stream the tiles into the
+displacement/gap output arrays.
+\item \code{FourierPreconditioner::apply\_into\_indexed}: scatters the
+compressed contact-masked residual into the preconditioner's owned full FFT
+grid (zeroed per apply), transforms, and gathers back compressed. The
+full-grid FFT is the deliberate trade-off of this design (restriction does
+not help conditioning, Section~\ref{sec:active-proto}, so the full-size
+transform is retained); the scratch (${\approx}4N$ reals in float) is
+released after the last CG iteration, before the final full-grid pressure
+scatter.
+\end{itemize}
+Only two \code{uint8} masks (candidate and violation) remain $N$-sized
+through the solve.
+
+\subsection{Measured results}
+\label{sec:active-measured}
+
+All measurements: seed-42 self-affine surfaces, $\bar p=0.002$, tol
+$10^{-8}$ (float clamped at $2\times10^{-6}$), $q=4$, $\ell=16$, light
+result, co-tenant 20-core workstation (ratios are the reliable quantity).
+Every active run certified in \textbf{one verification round}, no fallback.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lllr}
+\toprule
+case & standard nested & active-set nested & factor \\
+\midrule
+$N_s{=}1024$ f64, wall            & 2.54\,s          & 1.05\,s        & $2.4\times$ \\
+$N_s{=}4096$ f64, wall / iters    & 172.9\,s / 91    & 46.5\,s / 91   & $3.7\times$ \\
+$N_s{=}4096$ f64, solve-peak RSS  & 1593\,MB         & 841\,MB        & $1.9\times$ \\
+$N_s{=}16384$ f32, wall / iters   & 1444.9\,s / 86   & 308.0\,s / 89  & $4.7\times$ \\
+$N_s{=}16384$ f32, solve-peak RSS & 18.28\,GiB       & 10.94\,GiB     & $1.67\times$ \\
+$N_s{=}16384$ f64, wall / RSS     & --- ($>$24\,GiB, OOM) & 1458\,s / 12.50\,GiB & enabler \\
+\bottomrule
+\end{tabular}
+\caption{Standard vs active-set nested solve. The $N_s=16384$ surface is
+full-band ($k^{-1.8}$ to the Nyquist, contact fraction ${\approx}0.0047$ ---
+a \emph{harder} case than the band-limited study surface). Contact areas
+agree to all reported digits; pressure rel-$L_2\sim10^{-14}$ (double)
+against the standard nested solve, and the $N_s=1024$ case reproduces the
+Python prototype's contact area exactly.}
+\label{tab:active-measured}
+\end{table}
+
+The last row is the qualitative gain: double precision to tol $10^{-8}$ at
+$N_s=16384$ ($N\approx2.7\times10^{8}$) in $12.5$\,GiB, on a machine where
+the standard double solve does not fit at all. On the default
+\code{active\_delta} the coarse-gap term of \eqref{eq:candidate-set} admits
+${\approx}6\%$ of the grid on this rich-spectrum surface
+($\abs{\mathcal K}\approx9\,N_c$); memory-critical runs can roughly halve
+the compressed state with \code{active\_delta} ${\approx}0.02$ while staying
+inside the prototype-validated safety margin --- but the default errs
+deliberately on the generous side (finding~3 of
+Section~\ref{sec:active-proto}).
+
 \section{Limitations and outlook}
 \label{sec:outlook}
 
-The operator currently runs on the full grid; the contact constraint is handled
-by the PCG projection, not by skipping inactive DOFs. Natural extensions, none of
-which change the public interface
-(\code{H2Operator\{build(),matvec(),print\_statistics()\}}):
+Three of the extensions once listed here are now implemented, none changing
+the public interface:
 \begin{itemize}
-\item \textbf{Active-set masking.} Restrict the near and far passes to leaves and
-interactions touching the contact patch. Because the $\Htwo$ apply is local
-(unlike the FFT), masking is natural and can reduce the per-iteration cost as the
-contact area shrinks.
+\item \textbf{Active-set masking} --- done (July 2026,
+Section~\ref{sec:active}): the masked matvec restricts the near and far
+passes to occupied leaves at $1$--$2\%$ of the full-apply cost, and the
+restricted driver certifies the result against the full grid.
+\item \textbf{Single-precision caches} --- done: \code{build\_single\_caches}
+holds \code{float} copies of the couplings, stencils, and transfer matrices,
+and \code{matvec\_single}/\code{matvec\_masked\_single\_into} run the apply
+in \code{float} end-to-end; the solver's \code{single\_precision} mode uses
+them with all scalar reductions accumulated in double
+(\code{doc/theory/pcg.tex}).
+\item \textbf{FFT backend} --- done (\code{backend="fft"}, July 2026): an
+exact zero-padded (Hockney) convolution with the Love element table,
+matching the dense operator to ${\sim}10^{-15}$. Measured at rough parity
+with the $\Htwo$ matvec at $N_s=4096$ and modestly faster below; the padded
+transforms are bandwidth-bound, so the $\Htwo$ operator remains preferred at
+very large $N_s$ ($\Order(N)$ vs $\Order(N\log N)$, ${\sim}5\times$ smaller
+working set, and it admits masking --- the FFT does not). Spec:
+\code{doc/specs/2026-07-09-fft-convolution-backend-design.md}.
+\end{itemize}
+Remaining natural extensions:
+\begin{itemize}
 \item \textbf{Rectangular / refined grids.} The uniform quadtree currently
 requires a square, power-of-two grid with $\ell\mid N_s$
 (\code{uniform\_quadtree.cpp:16--19}). Anisotropic ($n_x\ne n_y$) and locally
 refined trees would broaden applicability at the cost of more distinct cached
 couplings.
-\item \textbf{Single-precision caches.} Storing couplings, stencils, and buffers
-in \code{float} halves memory; given the $10^{-6}$ accuracy target at $q=6$,
-single precision in the far field is comfortably adequate.
-\item \textbf{FFT backend for the fully-active case.} For a saturated rectangular
-contact, the DC-FFT convolution remains competitive and could be offered
-alongside, with the $\Htwo$ operator preferred for sparse contact and the FFT for
-near-full contact.
+\item \textbf{Leaf-side / $q$ auto-tuning} for a given accuracy target and
+machine, and a PCG convergence and timing sweep at $N_s\ge1024$.
+\item \textbf{GPU offload} of the near field and M2L (the two
+dense-block-dominated passes).
 \end{itemize}
 
 \section*{Summary}
@@ -1713,6 +2027,11 @@ $N$-independent interpolation error ($3.2\times10^{-6}$ at $q=6$). The operator
 reaches $2.7\times10^8$ unknowns at second-scale build and matvec times and
 $14$\,GiB, regimes entirely out of reach for dense or classical $\Hmat$
 representations, and is faster per matvec than a state-of-the-art FFT reference.
+Its locality further admits a \emph{masked} apply --- bit-for-bit identical on
+the target set at $1$--$2\%$ of the full cost --- on which the certified
+active-set solve of Section~\ref{sec:active} builds, cutting the large-grid
+contact solve by another ${\sim}4\times$ in time and ${\sim}2\times$ in memory
+and enabling double precision at $N_s=16384$ on a 32\,GiB workstation.
 
 \bibliographystyle{unsrt}
 \bibliography{references}
