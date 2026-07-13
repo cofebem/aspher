@@ -61,6 +61,7 @@ endif()
 
 add_library(aspher_core STATIC
   src/boussinesq_kernel.cpp
+  src/cerruti_kernel.cpp
   src/cluster_tree.cpp
   src/hmatrix.cpp
   src/contact_solver.cpp
@@ -93,7 +94,7 @@ endif()
 
 if(NOT SKBUILD)
   enable_testing()
-  foreach(t kernel hmatrix contact h2 precond fft active)
+  foreach(t kernel hmatrix contact h2 precond fft active cerruti)
     add_executable(test_${t} tests/test_${t}.cpp)
     target_link_libraries(test_${t} PRIVATE aspher_core)
     target_compile_options(test_${t} PRIVATE -Wall -Wextra)
