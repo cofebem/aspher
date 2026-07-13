@@ -21,7 +21,7 @@ import rfgen as rf
 import time
 
 # ── 2. size ───────────────────────────────────────────────────────────────────
-Nmax = 4096 
+Nmax = 16384 #* 4
 sampling = 1
 Ns = Nmax // sampling  # grid is Ns x Ns; must be a power of two for backend="h2"
 L = 1.0           # domain side length
@@ -68,32 +68,34 @@ pressures = np.linspace(0,p_bar,N_load_steps,endpoint=True)
 # A rigid flat is pressed onto the rough surface, so the initial gap is -height.
 # (This solver object is only needed for the commented single-grid solve below;
 #  skip building it at Ns=16384 where it would waste ~14 GiB unused.)
-if Ns != 16384:
-    solver = hc.ContactSolver(grid_size=Ns, domain_size=L, E_star=1.0,
-                              backend="h2", q=6)
+# Per-size H2 accuracy knobs: coarser interpolation (q=4) + bigger leaves at the
+# largest grids to keep memory down; sharper (q=6) for smaller grids.
+if Ns >= 16384:
+    q, leaf_side = 4, 16
+else:
+    q, leaf_side = 6, 8
 
-# result = hc.solve_nested(grid_size=1024, gap=g0, p_nominal=0.05, coarsest=64, q=6)
-for inc,p in enumerate(pressures[1:]):
+for inc, p in enumerate(pressures[1:]):
     print("Pressure = ", p)
     start = time.time()
-    # res = solver.solve(gap=-surface, p_nominal=p, tol=1e-8, max_iter=5000)
-    if Ns == 16384:
-        # memory-lean settings for the largest grid (~2.7e8 DOFs):
-        #  - single_precision: run the matvec + PCG in float (~half the RAM)
-        #  - light_result: skip the displacement/gap result arrays (2 x Ns^2)
-        #  - larger leaves (leaf_side=16), q=4
-        # The |q| preconditioner stays ON: single precision needs it to
-        # converge (the float solve stalls without it). It runs in float too,
-        # so its FFT stays memory-lean. The solve reaches a ~2e-6 float floor —
-        # plenty for the contact area.
-        res = hc.solve_nested(grid_size=Ns, gap=-surface, p_nominal=p,
-                              coarsest=64, q=4, leaf_side=16, precond=True,
-                              single_precision=True, light_result=True)
-    else:
-        res = hc.solve_nested(grid_size=Ns, gap=-surface, p_nominal=p,
-                              coarsest=64, q=6)
+    # Active-set nested solve (h2 backend; requires Ns > coarsest):
+    #  - active_set        : the finest level runs restricted Polonsky-Keer on a
+    #                        candidate set (dilated coarse contact + near-contact)
+    #                        through the masked H2 matvec -> ~4x faster and
+    #                        ~1.7x less RAM at large Ns, with identical area.
+    #                        Knobs: active_delta=0.05, active_halo=2,
+    #                        active_max_rounds=5 (defaults; fine at Ns=4096).
+    #  - single_precision  : float matvec + PCG (~half the RAM). Needs precond ON.
+    #  - light_result      : skip displacement/gap arrays; pressure still filled.
+    #  - precond stays ON  : the float solve stalls without the |q| preconditioner,
+    #                        and the restriction does not improve conditioning.
+    res = hc.solve_nested(grid_size=Ns, gap=-surface, p_nominal=p,
+                          coarsest=64, q=q, leaf_side=leaf_side, precond=True,
+                          single_precision=True, light_result=True,
+                          active_set=True)
     print("CPU time = ", time.time() - start," seconds")
-    
+    print(f"active_rounds={res.active_rounds}  active_fallback={res.active_fallback}")
+
     # ── 5. contact area + plot ────────────────────────────────────────────────────
     if inc % plot_every == 0 or inc == pressures.shape[0]-2:
         pressure = np.asarray(res.pressure)          # (Ns, Ns)
