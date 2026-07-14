@@ -210,4 +210,121 @@ void FourierPreconditioner::release_scratch() const {
     Cf_.resize(0, 0);
 }
 
+TangentialFourierPreconditioner::TangentialFourierPreconditioner(int Ns,
+                                                                 double nu)
+    : Ns_(Ns), nh_(Ns / 2 + 1), wxx_(Ns / 2 + 1, Ns), wyy_(Ns / 2 + 1, Ns),
+      wxy_(Ns / 2 + 1, Ns) {
+    const double gamma = nu / (1.0 - nu);
+    const double norm = 1.0 / (static_cast<double>(Ns) * static_cast<double>(Ns));
+    auto kof = [Ns](int i) { return (i < Ns / 2) ? i : i - Ns; };
+    for (int ky = 0; ky < Ns; ++ky) {
+        const double fy = static_cast<double>(kof(ky));
+        for (int kx = 0; kx < nh_; ++kx) {
+            const double fx = static_cast<double>(kx);
+            const double k2 = fx * fx + fy * fy;
+            if (k2 == 0.0) {
+                wxx_(kx, ky) = wyy_(kx, ky) = wxy_(kx, ky) = 0.0;
+                continue;
+            }
+            const double kk = std::sqrt(k2);
+            wxx_(kx, ky) = norm * kk * (1.0 + gamma * fx * fx / k2);
+            wyy_(kx, ky) = norm * kk * (1.0 + gamma * fy * fy / k2);
+            wxy_(kx, ky) = norm * kk * gamma * fx * fy / k2;
+        }
+    }
+}
+
+TangentialFourierPreconditioner::~TangentialFourierPreconditioner() = default;
+
+void TangentialFourierPreconditioner::apply_into(
+    const Eigen::VectorXd& g, const std::vector<std::uint8_t>& mask,
+    bool remove_mean, Eigen::VectorXd& z) const {
+    const int N = Ns_ * Ns_;
+    if (!fft1_) {
+        G1_.resize(Ns_, Ns_);
+        G2_.resize(Ns_, Ns_);
+        C1_.resize(nh_, Ns_);
+        C2_.resize(nh_, Ns_);
+        fft1_ = std::make_unique<fft::SquareR2C<double>>();
+        fft2_ = std::make_unique<fft::SquareR2C<double>>();
+        fft1_->bind(Ns_, G1_.data(), C1_.data());
+        fft2_->bind(Ns_, G2_.data(), C2_.data());
+    }
+    if (z.size() != 2 * N) z.resize(2 * N);
+
+    // masked scatter of both components
+#pragma omp parallel for schedule(static)
+    for (int iy = 0; iy < Ns_; ++iy) {
+        double* c1 = G1_.data() + static_cast<std::ptrdiff_t>(iy) * Ns_;
+        double* c2 = G2_.data() + static_cast<std::ptrdiff_t>(iy) * Ns_;
+        const double* gx = g.data() + static_cast<std::ptrdiff_t>(iy) * Ns_;
+        const double* gy =
+            g.data() + N + static_cast<std::ptrdiff_t>(iy) * Ns_;
+        const std::uint8_t* mi =
+            mask.data() + static_cast<std::ptrdiff_t>(iy) * Ns_;
+        for (int ix = 0; ix < Ns_; ++ix) {
+            c1[ix] = mi[ix] ? gx[ix] : 0.0;
+            c2[ix] = mi[ix] ? gy[ix] : 0.0;
+        }
+    }
+
+    fft1_->fwd();
+    fft2_->fwd();
+
+    // per-mode symmetric 2×2 inverse-symbol multiply (in place, local temps)
+#pragma omp parallel for schedule(static)
+    for (int ky = 0; ky < Ns_; ++ky) {
+        std::complex<double>* a =
+            C1_.data() + static_cast<std::ptrdiff_t>(ky) * nh_;
+        std::complex<double>* b =
+            C2_.data() + static_cast<std::ptrdiff_t>(ky) * nh_;
+        const double* xx = wxx_.data() + static_cast<std::ptrdiff_t>(ky) * nh_;
+        const double* yy = wyy_.data() + static_cast<std::ptrdiff_t>(ky) * nh_;
+        const double* xy = wxy_.data() + static_cast<std::ptrdiff_t>(ky) * nh_;
+        for (int kx = 0; kx < nh_; ++kx) {
+            const std::complex<double> ga = a[kx], gb = b[kx];
+            a[kx] = xx[kx] * ga + xy[kx] * gb;
+            b[kx] = xy[kx] * ga + yy[kx] * gb;
+        }
+    }
+
+    fft1_->inv();
+    fft2_->inv();
+
+    // masked gather (+ per-component mask-mean removal for force control)
+    double zsx = 0.0, zsy = 0.0;
+    long nm = 0;
+#pragma omp parallel for schedule(static) reduction(+ : zsx, zsy, nm)
+    for (int iy = 0; iy < Ns_; ++iy) {
+        const double* c1 = G1_.data() + static_cast<std::ptrdiff_t>(iy) * Ns_;
+        const double* c2 = G2_.data() + static_cast<std::ptrdiff_t>(iy) * Ns_;
+        const std::uint8_t* mi =
+            mask.data() + static_cast<std::ptrdiff_t>(iy) * Ns_;
+        double* zx = z.data() + static_cast<std::ptrdiff_t>(iy) * Ns_;
+        double* zy = z.data() + N + static_cast<std::ptrdiff_t>(iy) * Ns_;
+        for (int ix = 0; ix < Ns_; ++ix) {
+            if (mi[ix]) {
+                zx[ix] = c1[ix];
+                zy[ix] = c2[ix];
+                zsx += c1[ix];
+                zsy += c2[ix];
+                ++nm;
+            } else {
+                zx[ix] = 0.0;
+                zy[ix] = 0.0;
+            }
+        }
+    }
+    if (remove_mean && nm) {
+        const double mxv = zsx / static_cast<double>(nm);
+        const double myv = zsy / static_cast<double>(nm);
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < N; ++i)
+            if (mask[i]) {
+                z(i) -= mxv;
+                z(N + i) -= myv;
+            }
+    }
+}
+
 } // namespace hmc
