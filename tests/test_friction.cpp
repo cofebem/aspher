@@ -326,8 +326,9 @@ static int test_cattaneo_mindlin() {
     CHECK(res.converged);
 
     const double ca = std::cbrt(1.0 - QoverMuP); // stick radius ratio
-    // stick radius from the state map: largest slip-point radius inside c,
-    // smallest stick-point radius outside — bracket must straddle c*a
+    // stick radius from the state map: the largest stick-point radius; the
+    // two-sided |r_stick_max − c·a| < 1.5h check catches both over- and
+    // under-sized stick zones (an undersized one also fails the profile rel-L2 gate)
     double r_stick_max = 0.0;
     for (int iy = 0; iy < Ns; ++iy)
         for (int ix = 0; ix < Ns; ++ix) {

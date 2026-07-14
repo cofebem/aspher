@@ -338,11 +338,14 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
                            tol, max_iter, use_pr, precond, nullptr);
             const int total_slip = px.n_slip + py.n_slip;
             const int total_cand = px.n_slip + px.n_stick + py.n_slip + py.n_stick;
-            if (total_slip > total_cand / 5) {
+            if (tries == 0 && total_slip > total_cand / 5) {
                 // probes slipping >20%, halve eps and retry (once only)
                 eps_probe *= 0.5;
                 continue;
             }
+            // K always assigned: either guard passes on first try, or second try
+            // always computes it. Slightly soft K on edge slip is fine—Broyden
+            // updates absorb it.
             K.col(0) = px.q_mean / eps_probe;
             K.col(1) = py.q_mean / eps_probe;
             total_probe_it = px.iterations + py.iterations;
@@ -364,6 +367,7 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
     Eigen::Vector2d delta_prev = Eigen::Vector2d::Zero();
     Eigen::Vector2d F_prev = -target; // F(0) = -q_bar exactly (q(0) = 0)
     Eigen::VectorXd q_warm;
+    if (q_init) q_warm = *q_init; // per-step warm start (M5 driver); solve_disp re-clamps
     int total_it = total_probe_it;
     bool best_converged = false;
     double F_best = 1e300;
