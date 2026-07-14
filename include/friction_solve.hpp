@@ -34,14 +34,18 @@ using TanPrecondInto = std::function<void(
 //
 // Algorithm notes (deviation from the spec §5.1 sketch, deliberate): the CG
 // runs over the FULL candidate set A = {s_i > 0} with per-point radial disk
-// clamping as the projection and a β-restart whenever a clamp fires
+// clamping as the projection and a β-restart on stick/slip partition changes
 // (Tamaas PolonskyKeerTan-style). A strict stick-set CG would freeze the
 // remaining direction DOF of bound (slipping) points; keeping them in the
-// CG lets their direction converge. Force control enforces mean(q) = q̄ by
-// an additive correction over interior points each iteration (a vector
-// load cannot be rescaled like the scalar p̄); the constraint is met to
-// solver tolerance at convergence, and δ_t is recovered as the interior
-// mean of u. All grid-length reductions accumulate in double. target is
+// CG lets their direction converge. Force control solves F(δ_t) = mean(q(δ_t)) − q̄ = 0
+// by an outer Newton/Broyden iteration on the rigid shift (δ_t is the Lagrange
+// multiplier of the load constraint): the 2×2 stiffness is initialized
+// from two small-shift probe solves, updated by noise-guarded Broyden
+// secants, and the outer stops when F stops responding at the inner
+// solver's resolution; the load is then met exactly by a terminal
+// additive correction over interior points (one-shot, with re-clamping).
+// δ_t reported is the best-|F| outer iterate's shift.
+// All grid-length reductions accumulate in double. target is
 // δ_t (displacement control) or q̄ (force control). Double-only in M4.
 // converged=true is also set on the stagnation exit (200 non-improving iterations):
 // the achievable metric floor was reached and the best iterate is returned —

@@ -317,22 +317,37 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
     qs.head(N) = s;
     C(qs, us);
     const double u_scale = us.head(N).cwiseAbs().maxCoeff();
-    const double eps = 1e-4 * u_scale; // deep inside the full-stick regime
+    if (u_scale <= 0.0) throw std::runtime_error("solve_tangential: degenerate tangential operator (C(s,0) == 0)");
+    const double eps = 1e-4 * u_scale; // edge points slip lightly, K slightly soft, first Newton step overshoots
 
     // full-stick 2×2 stiffness from two ε-probes (F(0) = −q̄ needs no solve:
-    // δ = 0 ⇒ q = 0 exactly)
+    // δ = 0 ⇒ q = 0 exactly). Edge points slip lightly, so K is slightly soft
+    // and the first Newton step overshoots; absorbed by Broyden updates and
+    // floor detection. Robustness guard: if probes slip heavily (>20%), halve
+    // eps and redo.
     Eigen::Matrix2d K;
     int total_probe_it = 0;
+    double eps_probe = eps;
     {
-        TangentialResult px =
-            solve_disp(C, s, active, Stotal, Eigen::Vector2d(eps, 0.0),
-                       tol, max_iter, use_pr, precond, nullptr);
-        TangentialResult py =
-            solve_disp(C, s, active, Stotal, Eigen::Vector2d(0.0, eps),
-                       tol, max_iter, use_pr, precond, nullptr);
-        K.col(0) = px.q_mean / eps;
-        K.col(1) = py.q_mean / eps;
-        total_probe_it = px.iterations + py.iterations;
+        for (int tries = 0; tries < 2; ++tries) {
+            TangentialResult px =
+                solve_disp(C, s, active, Stotal, Eigen::Vector2d(eps_probe, 0.0),
+                           tol, max_iter, use_pr, precond, nullptr);
+            TangentialResult py =
+                solve_disp(C, s, active, Stotal, Eigen::Vector2d(0.0, eps_probe),
+                           tol, max_iter, use_pr, precond, nullptr);
+            const int total_slip = px.n_slip + py.n_slip;
+            const int total_cand = px.n_slip + px.n_stick + py.n_slip + py.n_stick;
+            if (total_slip > total_cand / 5) {
+                // probes slipping >20%, halve eps and retry (once only)
+                eps_probe *= 0.5;
+                continue;
+            }
+            K.col(0) = px.q_mean / eps_probe;
+            K.col(1) = py.q_mean / eps_probe;
+            total_probe_it = px.iterations + py.iterations;
+            break;
+        }
     }
 
     // The inner solver resolves q_mean only to its metric floor (~1e-4
@@ -350,7 +365,7 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
     Eigen::Vector2d F_prev = -target; // F(0) = -q_bar exactly (q(0) = 0)
     Eigen::VectorXd q_warm;
     int total_it = total_probe_it;
-    bool inner_converged = false;
+    bool best_converged = false;
     double F_best = 1e300;
     Eigen::Vector2d delta_best = delta;
 
@@ -359,12 +374,12 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
             C, s, active, Stotal, delta, tol, max_iter, use_pr, precond,
             q_warm.size() ? &q_warm : nullptr);
         total_it += inner.iterations;
-        inner_converged = inner.converged;
         const Eigen::Vector2d F = inner.q_mean - target;
         q_warm = inner.q; // warm-start the next inner solve (copy; res moves)
         if (F.norm() < F_best) {
             F_best = F.norm();
             delta_best = delta;
+            best_converged = inner.converged;
             res = std::move(inner);
             res.delta_t = delta;
         }
@@ -440,9 +455,10 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
         res.n_slip = nsl;
         res.n_open = nop;
     }
+    // res.error still describes the pre-correction iterate (the KKT-optimal one); the correction's KKT perturbation is O((N/ni)·F_best).
     res.delta_t = delta_best;
-    res.converged =
-        inner_converged && F_best <= 1e-3 * target.norm();
+    res.converged = best_converged && F_best <= 1e-3 * target.norm() &&
+                    (res.q_mean - target).norm() <= 1e-10 * target.norm();
     res.iterations = total_it;
     return res;
 }
