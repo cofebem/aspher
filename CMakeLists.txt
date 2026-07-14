@@ -96,7 +96,7 @@ endif()
 
 if(NOT SKBUILD)
   enable_testing()
-  foreach(t kernel hmatrix contact h2 precond fft active cerruti tangential friction)
+  foreach(t kernel hmatrix contact h2 precond fft active cerruti tangential friction driver)
     add_executable(test_${t} tests/test_${t}.cpp)
     target_link_libraries(test_${t} PRIVATE aspher_core)
     target_compile_options(test_${t} PRIVATE -Wall -Wextra)
