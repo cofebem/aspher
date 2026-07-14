@@ -45,6 +45,10 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
             "FrictionDriver::step: max_threshold_iter <= 0");
     if (spec.T && static_cast<int>(spec.T->size()) != N_)
         throw std::invalid_argument("FrictionDriver::step: T size");
+    if (model_->velocity_dependent() && spec.max_threshold_iter < 2)
+        throw std::invalid_argument(
+            "FrictionDriver::step: with velocity-dependent model, "
+            "max_threshold_iter must be >= 2");
     FrictionStepResult res;
     bool ok = true;
 
@@ -66,6 +70,7 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
         res.normal = solve_contact(Sop, g0_, spec.p_bar, spec.tol_normal,
                                    spec.max_iter, true, Pn, warm);
         ok = ok && res.normal.converged;
+        if (!ok) { res.converged = false; return res; }
         p_new = res.normal.pressure;
     }
 
@@ -96,7 +101,12 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
                                            : (spec.delta_t - delta_t_);
         Eigen::VectorXd u_hist = -u_t_;
         const double g_floor =
-            1e-6 * (target.norm() + u_t_.cwiseAbs().maxCoeff());
+            1e-6 * (u_t_.cwiseAbs().maxCoeff() +
+                    (spec.has_q_bar ? target.norm() : 0.0));
+        // displacement units only: under force control the target is a
+        // traction and must NOT enter the displacement-residual floor (unit
+        // mixing at non-unit E*); a cold first force step gets floor 0 — its
+        // it-0 gmax is an honest scale.
 
         // velocity for the threshold: previous pass's slip increment
         // (first pass: previous STEP's — quasi-static continuation)
@@ -109,6 +119,14 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
         const int max_pass =
             model_->velocity_dependent() ? spec.max_threshold_iter : 1;
         Eigen::VectorXd s_old;
+        Eigen::Vector2d dinit0;
+        const Eigen::Vector2d* dinit0_p = nullptr;
+        if (spec.has_q_bar && K_new.determinant() > 0.0) {
+            const Eigen::Vector2d q_mean_now(q_.head(N_).mean(),
+                                             q_.tail(N_).mean());
+            dinit0 = K_new.inverse() * (target - q_mean_now);
+            dinit0_p = &dinit0;
+        }
         Eigen::Vector2d dinit;
         const Eigen::Vector2d* dinit_p = nullptr;
         for (pass = 0; pass < max_pass; ++pass) {
@@ -129,7 +147,8 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
             tan = solve_tangential(Cop, s, spec.has_q_bar, target,
                                    spec.tol_tangential, spec.max_iter, true,
                                    Mop, &q_warm, &u_hist, g_floor,
-                                   spec.has_q_bar ? &K_new : nullptr, dinit_p);
+                                   spec.has_q_bar ? &K_new : nullptr,
+                                   pass == 0 ? dinit0_p : dinit_p);
             dinit = tan.delta_t;
             dinit_p = &dinit;
             // slip increment of this candidate solution: Δw = Δδ − (u − uⁿ)
