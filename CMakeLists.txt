@@ -74,6 +74,7 @@ add_library(aspher_core STATIC
   src/tangential_operator.cpp
   src/friction_solve.cpp
   src/friction_driver.cpp
+  src/bipotential.cpp
 )
 target_include_directories(aspher_core PUBLIC include)
 target_link_libraries(aspher_core PUBLIC Eigen3::Eigen)
@@ -97,7 +98,7 @@ endif()
 
 if(NOT SKBUILD)
   enable_testing()
-  foreach(t kernel hmatrix contact h2 precond fft active cerruti tangential friction driver)
+  foreach(t kernel hmatrix contact h2 precond fft active cerruti tangential friction driver uzawa)
     add_executable(test_${t} tests/test_${t}.cpp)
     target_link_libraries(test_${t} PRIVATE aspher_core)
     target_compile_options(test_${t} PRIVATE -Wall -Wextra)
