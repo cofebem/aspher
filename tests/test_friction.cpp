@@ -185,10 +185,85 @@ static int test_kkt_displacement() {
     return 0;
 }
 
+static int test_kkt_force() {
+    const int Ns = 32, N = Ns * Ns;
+    const double L = 1.0, E = 1.0, nu = 0.3;
+    hmc::CerrutiKernel K(Ns, L, E, nu);
+    hmc::TangentialFFTOperator C(K);
+    C.build();
+    hmc::TanMatVecInto Cop = [&C](const Eigen::VectorXd& x,
+                                  Eigen::VectorXd& y) { C.matvec_into(x, y); };
+    const Eigen::VectorXd s = hertz_threshold(Ns, L, 0.3, 0.4, 1.0);
+    // impose ~55% of the fully-sliding load in x (partial slip guaranteed)
+    const double Sbar = s.sum() / N;
+    const Eigen::Vector2d qbar(0.55 * Sbar, 0.1 * Sbar);
+    hmc::TangentialResult res = hmc::solve_tangential(
+        Cop, s, /*force_control=*/true, qbar, 1e-5, 20000);
+    std::printf("force-control: it %d err %.3e stick %d slip %d\n",
+                res.iterations, res.error, res.n_stick, res.n_slip);
+    CHECK(res.converged);
+    CHECK(res.n_stick > 0 && res.n_slip > 0);
+    // load met to solver tolerance
+    const double load_err = (res.q_mean - qbar).norm() / qbar.norm();
+    std::printf("force-control load constraint (rel): %.3e\n", load_err);
+    CHECK(load_err <= 1e-8);
+    Eigen::VectorXd u;
+    C.matvec_into(res.q, u);
+    // High-slip vector problems (40% slip here) have a shallower inner
+    // metric floor than the displacement test's 1e-4 gate: slip DIRECTIONS
+    // keep rotating and every clamp perturbs the CG geometry. Measured floor
+    // on this problem: stick 1.2e-3 / align 4.9e-3 relative. Gate at 1e-2;
+    // the sharp force-control physics gates live in the Cattaneo-Mindlin and
+    // Ciavarella-Jager tests (nu=0: directions do not rotate, floor deep).
+    if (int rc = check_kkt(res, s, u, res.delta_t, res.delta_t.norm(), 1e-2))
+        return rc;
+    return 0;
+}
+
+// Preconditioner A/B: identical solution, fewer (or equal) iterations.
+static int test_precond_ab() {
+    const int Ns = 64;
+    const double L = 1.0, E = 1.0, nu = 0.3;
+    hmc::CerrutiKernel K(Ns, L, E, nu);
+    hmc::TangentialFFTOperator C(K);
+    C.build();
+    hmc::TanMatVecInto Cop = [&C](const Eigen::VectorXd& x,
+                                  Eigen::VectorXd& y) { C.matvec_into(x, y); };
+    const Eigen::VectorXd s = hertz_threshold(Ns, L, 0.3, 0.4, 1.0);
+    const Eigen::Vector2d dt(3e-2, 1e-2);
+    hmc::TangentialResult r0 =
+        hmc::solve_tangential(Cop, s, false, dt, 1e-5, 20000);
+    hmc::TangentialFourierPreconditioner M(Ns, nu);
+    hmc::TanPrecondInto Mop =
+        [&M](const Eigen::VectorXd& g, const std::vector<std::uint8_t>& mask,
+             bool rm, Eigen::VectorXd& z) { M.apply_into(g, mask, rm, z); };
+    hmc::TangentialResult r1 =
+        hmc::solve_tangential(Cop, s, false, dt, 1e-5, 20000, true, Mop);
+    const double dq = (r1.q - r0.q).norm() / r0.q.norm();
+    std::printf("precond A/B: it %d -> %d, dq %.3e\n", r0.iterations,
+                r1.iterations, dq);
+    CHECK(r0.converged && r1.converged);
+    // Both runs stop at their own metric floor (~1e-5), so the iterates
+    // agree to floor level, not to machine precision (measured dq ~8e-4).
+    CHECK(dq < 5e-3);
+    CHECK(r1.iterations <= r0.iterations);  // never worse on this problem
+    // both must be valid KKT points of the SAME QP (the real equivalence)
+    Eigen::VectorXd u0, u1;
+    C.matvec_into(r0.q, u0);
+    C.matvec_into(r1.q, u1);
+    // Ns=64 metric floor is shallower than Ns=32's (measured align ratio
+    // ~1.1e-3 unpreconditioned, with run-to-run OpenMP jitter): gate 3e-3.
+    if (int rc = check_kkt(r0, s, u0, dt, dt.norm(), 3e-3)) return rc;
+    if (int rc = check_kkt(r1, s, u1, dt, dt.norm(), 3e-3)) return rc;
+    return 0;
+}
+
 int main() {
     if (int rc = test_precond_symbol()) return rc;
     if (int rc = test_precond_mask_mean()) return rc;
     if (int rc = test_kkt_displacement()) return rc;
+    if (int rc = test_kkt_force()) return rc;
+    if (int rc = test_precond_ab()) return rc;
     std::printf("test_friction: all checks passed\n");
     return 0;
 }
