@@ -229,7 +229,15 @@ TangentialFourierPreconditioner::TangentialFourierPreconditioner(int Ns,
             const double kk = std::sqrt(k2);
             wxx_(kx, ky) = norm * kk * (1.0 + gamma * fx * fx / k2);
             wyy_(kx, ky) = norm * kk * (1.0 + gamma * fy * fy / k2);
-            wxy_(kx, ky) = norm * kk * gamma * fx * fy / k2;
+            // The odd cross term is ill-defined at self-conjugate Nyquist
+            // modes (kx == Ns/2 or ky == Ns/2): the half-spectrum mirror
+            // reuses this entry, flipping the effective sign. Zero it there
+            // (even terms are sign-independent and stay) — same treatment
+            // as the odd xy kernel's zeroed self-conjugate row/col in
+            // TangentialFFTOperator.
+            wxy_(kx, ky) = (kx == Ns_ / 2 || ky == Ns_ / 2)
+                               ? 0.0
+                               : norm * kk * gamma * fx * fy / k2;
         }
     }
 }

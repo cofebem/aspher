@@ -47,6 +47,33 @@ static int test_precond_symbol() {
     };
     if (run(kx, ky, knorm * (1.0 + gamma))) return 1;  // longitudinal
     if (run(-ky, kx, knorm)) return 1;                 // transverse
+
+    // Nyquist-touching mode: the odd cross term is zeroed there (self-
+    // conjugate mirror), so the response is diagonal: |k|(1 + gamma*k̂a²)
+    // per Cartesian polarization.
+    {
+        const int mxn = 3, myn = Ns / 2;
+        const double kn = std::hypot(double(mxn), double(myn));
+        const double kxh = mxn / kn;
+        Eigen::VectorXd g(2 * N), z;
+        for (int iy = 0; iy < Ns; ++iy)
+            for (int ix = 0; ix < Ns; ++ix) {
+                const double ph =
+                    2.0 * M_PI * (mxn * ix + myn * iy) / double(Ns);
+                g(iy * Ns + ix) = std::cos(ph);      // x-polarized
+                g(N + iy * Ns + ix) = 0.0;
+            }
+        M.apply_into(g, mask, false, z);
+        const double lam = kn * (1.0 + gamma * kxh * kxh);
+        double err = 0.0;
+        for (int i = 0; i < N; ++i) {
+            err = std::max(err, std::abs(z(i) - lam * g(i)));
+            err = std::max(err, std::abs(z(N + i))); // y stays zero
+        }
+        err /= lam * g.lpNorm<Eigen::Infinity>();
+        std::printf("precond nyquist mode err %.3e\n", err);
+        CHECK(err < 1e-10);
+    }
     return 0;
 }
 
