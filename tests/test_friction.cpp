@@ -258,12 +258,120 @@ static int test_precond_ab() {
     return 0;
 }
 
+// Full stick: rigid circular region (radius a) dragged by delta_x on an
+// otherwise traction-free surface = tangential flat punch. Mindlin:
+//   Q_x = 8 G a delta_x / (2 - nu),  G = E*(1-nu)/2.
+// Discretization error is O(h) at the singular edge (normal-path Hertz
+// analog measured 1.6% at comparable a/h) — gate at 4%, record measured.
+static int test_full_stick_stiffness() {
+    const int Ns = 128, N = Ns * Ns;
+    const double L = 1.0, E = 1.0, nu = 0.3, a = 0.25, h = L / Ns;
+    hmc::CerrutiKernel K(Ns, L, E, nu);
+    hmc::TangentialFFTOperator C(K);
+    C.build();
+    hmc::TanMatVecInto Cop = [&C](const Eigen::VectorXd& x,
+                                  Eigen::VectorXd& y) { C.matvec_into(x, y); };
+    Eigen::VectorXd s(N);
+    for (int iy = 0; iy < Ns; ++iy)
+        for (int ix = 0; ix < Ns; ++ix) {
+            const double x = (ix + 0.5) * h - 0.5 * L,
+                         y = (iy + 0.5) * h - 0.5 * L;
+            s(iy * Ns + ix) = (x * x + y * y < a * a) ? 1e12 : 0.0;
+        }
+    const Eigen::Vector2d dt(1e-3, 0.0);
+    hmc::TangentialResult res =
+        hmc::solve_tangential(Cop, s, false, dt, 1e-5, 20000);
+    CHECK(res.converged);
+    CHECK(res.n_slip == 0); // threshold huge: nothing slips
+    const double G = 0.5 * E * (1.0 - nu);
+    const double Qx_num = res.q_mean(0) * L * L; // mean(q)·area = total force
+    const double Qx_ana = 8.0 * G * a * dt(0) / (2.0 - nu);
+    const double ratio = Qx_num / Qx_ana;
+    std::printf("full-stick stiffness: Qx num %.6e ana %.6e ratio %.4f\n",
+                Qx_num, Qx_ana, ratio);
+    CHECK(std::abs(ratio - 1.0) < 0.04);
+    // y-force vanishes by symmetry (xy coupling is odd; gate loose for
+    // roundoff accumulation)
+    CHECK(std::abs(res.q_mean(1)) < 1e-8 * std::abs(res.q_mean(0)));
+    return 0;
+}
+
+// Cattaneo–Mindlin partial slip at nu = 0 (where the tangential kernel is
+// isotropic and proportional to the normal one, so the classical solution
+// is exact for the continuum problem): imposed Hertz threshold s = mu*p,
+// force control Q_x = (1 - (c/a)^3) mu P with c/a = 0.5^(1/3) for Q/(mu P)
+// = 0.5. Gates: stick radius within 1.5 cells; q_x profile rel-L2 < 4%
+// (continuum-vs-grid discretization); q_y == 0 exactly at nu = 0 with a
+// y-symmetric problem (gate at roundoff).
+static int test_cattaneo_mindlin() {
+    const int Ns = 128, N = Ns * Ns;
+    const double L = 1.0, E = 1.0, nu = 0.0, a = 0.2, mu = 0.5, p0 = 1.0;
+    const double h = L / Ns;
+    hmc::CerrutiKernel K(Ns, L, E, nu);
+    hmc::TangentialFFTOperator C(K);
+    C.build();
+    hmc::TanMatVecInto Cop = [&C](const Eigen::VectorXd& x,
+                                  Eigen::VectorXd& y) { C.matvec_into(x, y); };
+    const Eigen::VectorXd s = hertz_threshold(Ns, L, a, mu, p0);
+    // mean of s = mu*p over the grid; total sliding load muP = muP_mean·N·h²,
+    // so imposing q̄_x = 0.5·muP_mean means Q_x = 0.5·muP.
+    const double muP_mean = s.sum() / N;
+    const double QoverMuP = 0.5;
+    const Eigen::Vector2d qbar(QoverMuP * muP_mean, 0.0);
+    hmc::TangentialResult res =
+        hmc::solve_tangential(Cop, s, true, qbar, 1e-5, 40000);
+    CHECK(res.converged);
+
+    const double ca = std::cbrt(1.0 - QoverMuP); // stick radius ratio
+    // stick radius from the state map: largest slip-point radius inside c,
+    // smallest stick-point radius outside — bracket must straddle c*a
+    double r_stick_max = 0.0;
+    for (int iy = 0; iy < Ns; ++iy)
+        for (int ix = 0; ix < Ns; ++ix) {
+            const int i = iy * Ns + ix;
+            if (res.state[i] != 1) continue;
+            const double x = (ix + 0.5) * h - 0.5 * L,
+                         y = (iy + 0.5) * h - 0.5 * L;
+            r_stick_max = std::max(r_stick_max, std::hypot(x, y));
+        }
+    std::printf("cattaneo-mindlin: c/a num %.4f ana %.4f (1.5-cell tol %.4f)\n",
+                r_stick_max / a, ca, 1.5 * h / a);
+    CHECK(std::abs(r_stick_max - ca * a) < 1.5 * h);
+
+    // traction profile: q_x(r) = mu p0 [sqrt(1-r²/a²) − (c/a) sqrt(1-r²/c²)]
+    double num2 = 0.0, den2 = 0.0, qymax = 0.0, qxmax = 0.0;
+    for (int iy = 0; iy < Ns; ++iy)
+        for (int ix = 0; ix < Ns; ++ix) {
+            const int i = iy * Ns + ix;
+            const double x = (ix + 0.5) * h - 0.5 * L,
+                         y = (iy + 0.5) * h - 0.5 * L;
+            const double rr = std::hypot(x, y);
+            double qa = 0.0;
+            if (rr < a) qa = mu * p0 * std::sqrt(1.0 - rr * rr / (a * a));
+            if (rr < ca * a)
+                qa -= mu * p0 * ca *
+                      std::sqrt(1.0 - rr * rr / (ca * ca * a * a));
+            num2 += (res.q(i) - qa) * (res.q(i) - qa);
+            den2 += qa * qa;
+            qxmax = std::max(qxmax, std::abs(res.q(i)));
+            qymax = std::max(qymax, std::abs(res.q(N + i)));
+        }
+    const double relL2 = std::sqrt(num2 / den2);
+    std::printf("cattaneo-mindlin: qx rel-L2 %.3e  qy/qx %.3e\n", relL2,
+                qymax / qxmax);
+    CHECK(relL2 < 0.04);
+    CHECK(qymax <= 1e-10 * qxmax); // exact decoupling at nu = 0
+    return 0;
+}
+
 int main() {
     if (int rc = test_precond_symbol()) return rc;
     if (int rc = test_precond_mask_mean()) return rc;
     if (int rc = test_kkt_displacement()) return rc;
     if (int rc = test_kkt_force()) return rc;
     if (int rc = test_precond_ab()) return rc;
+    if (int rc = test_full_stick_stiffness()) return rc;
+    if (int rc = test_cattaneo_mindlin()) return rc;
     std::printf("test_friction: all checks passed\n");
     return 0;
 }
