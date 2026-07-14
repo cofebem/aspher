@@ -25,6 +25,9 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
     if (s.minCoeff() < 0.0)
         throw std::invalid_argument("solve_tangential: negative threshold");
 
+    if (force_control)
+        throw std::logic_error("force control lands in M4c"); // Task-3 stub
+
     // candidate set A = { s > 0 }
     std::vector<std::uint8_t> active(N);
     int nA = 0;
@@ -254,10 +257,6 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
             if (was_int != is_int) set_changed = 1;
         }
         delta_conj = set_changed ? 0.0 : 1.0;
-
-        if (force_control) {
-            throw std::logic_error("force control lands in M4c");
-        }
     }
 
     // Return the BEST iterate seen, not the last: near the metric floor

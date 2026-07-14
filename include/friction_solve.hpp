@@ -43,6 +43,9 @@ using TanPrecondInto = std::function<void(
 // solver tolerance at convergence, and δ_t is recovered as the interior
 // mean of u. All grid-length reductions accumulate in double. target is
 // δ_t (displacement control) or q̄ (force control). Double-only in M4.
+// converged=true is also set on the stagnation exit (200 non-improving iterations):
+// the achievable metric floor was reached and the best iterate is returned —
+// same semantics as solve_contact's stagnation guard.
 TangentialResult solve_tangential(const TanMatVecInto& C,
                                   const Eigen::VectorXd& s,
                                   bool force_control,
