@@ -2,6 +2,9 @@
 #include "friction_solve.hpp"
 #include "tangential_operator.hpp"
 #include "cerruti_kernel.hpp"
+#include "contact_solver.hpp"
+#include "fft_operator.hpp"
+#include "boussinesq_kernel.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -364,6 +367,73 @@ static int test_cattaneo_mindlin() {
     return 0;
 }
 
+// Deterministic smooth "rough" surface: a few incommensurate cosines.
+static Eigen::VectorXd wavy_gap(int Ns, double L) {
+    Eigen::VectorXd g0(Ns * Ns);
+    const double h = L / Ns;
+    const int mj[6][2] = {{1, 2}, {3, 1}, {2, 4}, {5, 3}, {4, 6}, {7, 2}};
+    const double Aj[6] = {0.8, 0.45, 0.3, 0.18, 0.12, 0.08};
+    const double ph[6] = {0.3, 1.1, 2.0, 4.2, 5.1, 0.7};
+    for (int iy = 0; iy < Ns; ++iy)
+        for (int ix = 0; ix < Ns; ++ix) {
+            const double x = (ix + 0.5) * h / L, y = (iy + 0.5) * h / L;
+            double z = 0.0;
+            for (int j = 0; j < 6; ++j)
+                z += Aj[j] * std::cos(2.0 * M_PI * (mj[j][0] * x +
+                                                    mj[j][1] * y) + ph[j]);
+            g0(iy * Ns + ix) = 0.02 * z; // heights ~2% of L
+        }
+    g0.array() -= g0.minCoeff(); // gap >= 0 somewhere-in-contact convention
+    return g0;
+}
+
+static int test_ciavarella_jager() {
+    const int Ns = 64, N = Ns * Ns;
+    const double L = 1.0, E = 1.0, nu = 0.0, mu = 0.4, p_bar = 0.01;
+    hmc::BoussinesqKernel BK(Ns, L, E);
+    hmc::FFTOperator S(BK);
+    S.build();
+    hmc::MatVec Sop = [&S](const Eigen::VectorXd& x) { return S.matvec(x); };
+    const Eigen::VectorXd g0 = wavy_gap(Ns, L);
+
+    hmc::ContactResult full = hmc::solve_contact(Sop, g0, p_bar, 1e-12, 20000);
+    CHECK(full.converged);
+    CHECK(full.contact_fraction > 0.05 && full.contact_fraction < 0.95);
+
+    const double qx_bar = 0.5 * mu * p_bar; // Q = 0.5 muP
+    hmc::ContactResult red =
+        hmc::solve_contact(Sop, g0, p_bar - qx_bar / mu, 1e-12, 20000);
+    CHECK(red.converged);
+
+    // tangential solve: threshold mu*p, imposed mean traction qx_bar
+    hmc::CerrutiKernel K(Ns, L, E, nu);
+    hmc::TangentialFFTOperator C(K);
+    C.build();
+    hmc::TanMatVecInto Cop = [&C](const Eigen::VectorXd& x,
+                                  Eigen::VectorXd& y) { C.matvec_into(x, y); };
+    const Eigen::VectorXd s = mu * full.pressure;
+    hmc::TangentialResult res = hmc::solve_tangential(
+        Cop, s, true, Eigen::Vector2d(qx_bar, 0.0), 1e-6, 40000);
+    CHECK(res.converged);
+
+    // discrete-exact superposition: q_x = mu (p - p*), q_y = 0
+    const Eigen::VectorXd q_ref = mu * (full.pressure - red.pressure);
+    const double rel =
+        (res.q.head(N) - q_ref).norm() / q_ref.norm();
+    const double qy_rel = res.q.tail(N).norm() / q_ref.norm();
+    // stick fraction (within contact) matches the reduced contact area
+    const int n_contact = static_cast<int>(
+        (full.pressure.array() > 0.0).count());
+    const int n_red = static_cast<int>((red.pressure.array() > 0.0).count());
+    std::printf("ciavarella-jager: qx rel %.3e  qy rel %.3e  stick %d vs "
+                "reduced-contact %d\n",
+                rel, qy_rel, res.n_stick, n_red);
+    CHECK(rel < 1e-4);
+    CHECK(qy_rel < 1e-8);
+    CHECK(std::abs(res.n_stick - n_red) <= std::max(4, n_contact / 50));
+    return 0;
+}
+
 int main() {
     if (int rc = test_precond_symbol()) return rc;
     if (int rc = test_precond_mask_mean()) return rc;
@@ -372,6 +442,7 @@ int main() {
     if (int rc = test_precond_ab()) return rc;
     if (int rc = test_full_stick_stiffness()) return rc;
     if (int rc = test_cattaneo_mindlin()) return rc;
+    if (int rc = test_ciavarella_jager()) return rc;
     std::printf("test_friction: all checks passed\n");
     return 0;
 }
