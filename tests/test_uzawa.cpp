@@ -76,6 +76,15 @@ static Eigen::VectorXd hertz_gap(int Ns, double L, double R) {
     return g0;
 }
 
+// Forward declaration: direct KKT verification helper
+static int check_bipotential_kkt(
+    const hmc::BipotentialResult& br,
+    const std::function<void(const Eigen::VectorXd&, Eigen::VectorXd&)>& S,
+    const std::function<void(const Eigen::VectorXd&, Eigen::VectorXd&)>& C,
+    const Eigen::VectorXd& g0, double mu, double alpha,
+    const Eigen::Vector2d& dt, const Eigen::VectorXd* s_frozen, double gtol,
+    double wtol);
+
 // Cross-check: production staggered path (normal PK at p_bar -> alpha*, p*;
 // tangential displacement-control at delta_t -> q*) vs the bipotential
 // Uzawa at the SAME imposed (alpha*, delta_t). Independent solvers, same
@@ -130,6 +139,14 @@ static int test_cross_check_coulomb() {
     CHECK(relq < 5e-3);
     const int n_contact = N - br.n_open;
     CHECK(std::abs(br.n_stick - tr.n_stick) <= std::max(4, n_contact / 50));
+
+    // Direct KKT self-check (measured violations: gap~9e-11, stick~2e-11,
+    // align~3.5e-13; gates set at ~10x measured values for safety margin)
+    const double gtol_coulomb = 1e-9;
+    const double wtol_coulomb = 1e-9;
+    if (int rc = check_bipotential_kkt(br, Sinto, Cinto, g0, mu, alpha, dt,
+                                       nullptr, gtol_coulomb, wtol_coulomb))
+        return rc;
     return 0;
 }
 
@@ -171,6 +188,69 @@ static int test_cross_check_tresca() {
     CHECK(br.converged);
     CHECK(relp < 5e-3);
     CHECK(relq < 1e-2);
+
+    // Direct KKT self-check (measured violations: gap~9e-10, stick~0,
+    // align~1e-19; gates set at ~10x measured values for safety margin)
+    const double gtol_tresca = 1e-9;
+    const double wtol_tresca = 1e-9;
+    if (int rc = check_bipotential_kkt(br, Sinto, Cinto, g0, 0.0, nr.approach, dt,
+                                       &s, gtol_tresca, wtol_tresca))
+        return rc;
+    return 0;
+}
+
+// Direct KKT verification of a bipotential solution: normal LCP (p>0 =>
+// |g| small; p=0 => g >= -tol) and tangential stick/slip law against
+// s = mu*p (Coulomb) or s_frozen. gtol/wtol are absolute tolerances scaled
+// by the caller from the problem scales.
+static int check_bipotential_kkt(
+    const hmc::BipotentialResult& br,
+    const std::function<void(const Eigen::VectorXd&, Eigen::VectorXd&)>& S,
+    const std::function<void(const Eigen::VectorXd&, Eigen::VectorXd&)>& C,
+    const Eigen::VectorXd& g0, double mu, double alpha,
+    const Eigen::Vector2d& dt, const Eigen::VectorXd* s_frozen, double gtol,
+    double wtol) {
+    const int N = static_cast<int>(g0.size());
+    Eigen::VectorXd uz(N), ut(2 * N);
+    S(br.p, uz);
+    C(br.q, ut);
+    double worst_pen = 0.0, worst_gap = 0.0, worst_stick = 0.0,
+           worst_align = 0.0, worst_neg = 0.0, worst_over = 0.0;
+    for (int i = 0; i < N; ++i) {
+        const double g = uz(i) + g0(i) - alpha;
+        const double si = s_frozen ? (*s_frozen)(i) : mu * br.p(i);
+        const double qn = std::hypot(br.q(i), br.q(N + i));
+        const double wx = dt(0) - ut(i), wy = dt(1) - ut(N + i);
+        if (br.p(i) > 0.0)
+            worst_gap = std::max(worst_gap, std::abs(g));
+        else
+            worst_pen = std::max(worst_pen, std::max(0.0, -g));
+        if (si <= 0.0) {
+            worst_over = std::max(worst_over, qn);
+            continue;
+        }
+        worst_over = std::max(worst_over, qn - si);
+        if (qn < si * (1.0 - 1e-9)) {
+            worst_stick = std::max(worst_stick, std::hypot(wx, wy));
+        } else if (qn > 0.0) {
+            const double qhx = br.q(i) / qn, qhy = br.q(N + i) / qn;
+            const double wpar = wx * qhx + wy * qhy;
+            worst_align = std::max(
+                worst_align,
+                std::hypot(wx - wpar * qhx, wy - wpar * qhy));
+            worst_neg = std::max(worst_neg, std::max(0.0, -wpar));
+        }
+    }
+    std::printf("uzawa KKT: gap %.2e pen %.2e stick %.2e align %.2e neg %.2e"
+                " over %.2e\n",
+                worst_gap, worst_pen, worst_stick, worst_align, worst_neg,
+                worst_over);
+    CHECK(worst_gap <= gtol);
+    CHECK(worst_pen <= gtol);
+    CHECK(worst_stick <= wtol);
+    CHECK(worst_align <= wtol);
+    CHECK(worst_neg <= wtol);
+    CHECK(worst_over <= 1e-12);
     return 0;
 }
 

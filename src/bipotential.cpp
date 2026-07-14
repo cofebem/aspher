@@ -85,7 +85,10 @@ BipotentialResult solve_bipotential(
                     tx *= f;
                     ty *= f;
                 }
-                if (tn == 0.0) { tx = 0.0; ty = 0.0; }
+                if (tn == 0.0) {  // no shear without contact pressure: for an
+                    tx = 0.0;       // externally-supplied s_frozen this is NOT
+                    ty = 0.0;       // redundant with the disk clamp (s may be > 0
+                }                   // where p transiently vanishes mid-iteration)
             }
             upd2 += (tx - q(i)) * (tx - q(i)) +
                     (ty - q(N + i)) * (ty - q(N + i)) +
