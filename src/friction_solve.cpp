@@ -311,11 +311,16 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
             "solve_tangential: |q_bar| >= mean(s) — at or beyond the "
             "gross-slip limit, no equilibrium exists");
     TangentialResult res;
-    if (target.norm() == 0.0) { // trivial: q = 0, δ = 0
+    // Trivial shortcut only holds cold and without history: with u_hist or a
+    // warm start, a zero-target force solve (e.g. full unload to zero mean
+    // traction after loading) is a REAL solve — the answer has locked-in
+    // nonzero tractions with zero mean, not q = 0. Never fabricate K_io here
+    // either way; leave it untouched (the caller's carried stiffness, if
+    // any, stays valid for the next step).
+    if (target.norm() == 0.0 && !u_hist && !q_init) { // trivial: q = 0, δ = 0
         res = solve_disp(C, s, active, Stotal, Eigen::Vector2d::Zero(),
                          tol, 1, use_pr, precond, nullptr, u_hist, g_floor);
         res.converged = true;
-        if (K_io) *K_io = Eigen::Matrix2d::Identity();
         return res;
     }
 
@@ -338,28 +343,58 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
         if (u_scale <= 0.0) throw std::runtime_error("solve_tangential: degenerate tangential operator (C(s,0) == 0)");
         const double eps = 1e-4 * u_scale; // edge points slip lightly, K slightly soft, first Newton step overshoots
 
-        double eps_probe = eps;
-        for (int tries = 0; tries < 2; ++tries) {
-            TangentialResult px =
-                solve_disp(C, s, active, Stotal, Eigen::Vector2d(eps_probe, 0.0),
-                           tol, max_iter, use_pr, precond, nullptr, u_hist, g_floor);
-            TangentialResult py =
-                solve_disp(C, s, active, Stotal, Eigen::Vector2d(0.0, eps_probe),
-                           tol, max_iter, use_pr, precond, nullptr, u_hist, g_floor);
-            const int total_slip = px.n_slip + py.n_slip;
-            const int total_cand = px.n_slip + px.n_stick + py.n_slip + py.n_stick;
-            if (tries == 0 && total_slip > total_cand / 5) {
-                // probes slipping >20%, halve eps and retry (once only)
-                eps_probe *= 0.5;
-                continue;
+        if (!u_hist) {
+            double eps_probe = eps;
+            for (int tries = 0; tries < 2; ++tries) {
+                TangentialResult px =
+                    solve_disp(C, s, active, Stotal, Eigen::Vector2d(eps_probe, 0.0),
+                               tol, max_iter, use_pr, precond, nullptr, u_hist, g_floor);
+                TangentialResult py =
+                    solve_disp(C, s, active, Stotal, Eigen::Vector2d(0.0, eps_probe),
+                               tol, max_iter, use_pr, precond, nullptr, u_hist, g_floor);
+                const int total_slip = px.n_slip + py.n_slip;
+                const int total_cand = px.n_slip + px.n_stick + py.n_slip + py.n_stick;
+                if (tries == 0 && total_slip > total_cand / 5) {
+                    // probes slipping >20%, halve eps and retry (once only)
+                    eps_probe *= 0.5;
+                    continue;
+                }
+                // K always assigned: either guard passes on first try, or second try
+                // always computes it. Slightly soft K on edge slip is fine—Broyden
+                // updates absorb it.
+                K.col(0) = px.q_mean / eps_probe;
+                K.col(1) = py.q_mean / eps_probe;
+                total_probe_it = px.iterations + py.iterations;
+                break;
             }
-            // K always assigned: either guard passes on first try, or second try
-            // always computes it. Slightly soft K on edge slip is fine—Broyden
-            // updates absorb it.
-            K.col(0) = px.q_mean / eps_probe;
-            K.col(1) = py.q_mean / eps_probe;
-            total_probe_it = px.iterations + py.iterations;
-            break;
+        } else {
+            // With history present, the residual at q=0 is dominated by the
+            // history term, so a cold two-probe scheme (base F(0)=0 assumed
+            // analytically, probes solved from q=0) measures K far from the
+            // actual operating point. Probe DIFFERENTIALLY instead: solve a
+            // base point at the intended starting shift, then two
+            // warm-chained perturbed solves around it, and take the finite
+            // difference of q_mean. No 20%-slip eps-halving retry here —
+            // that guard exists to keep the cold probes in the linear regime
+            // near q=0; differential probes at the operating point don't
+            // need it.
+            const Eigen::Vector2d delta0 =
+                delta_init ? *delta_init : Eigen::Vector2d::Zero();
+            TangentialResult base = solve_disp(
+                C, s, active, Stotal, delta0, tol, max_iter, use_pr, precond,
+                q_init, u_hist, g_floor);
+            TangentialResult px = solve_disp(
+                C, s, active, Stotal, delta0 + Eigen::Vector2d(eps, 0.0), tol,
+                max_iter, use_pr, precond, &base.q, u_hist, g_floor);
+            TangentialResult py = solve_disp(
+                C, s, active, Stotal, delta0 + Eigen::Vector2d(0.0, eps), tol,
+                max_iter, use_pr, precond, &px.q, u_hist, g_floor);
+            K.col(0) = (px.q_mean - base.q_mean) / eps;
+            K.col(1) = (py.q_mean - base.q_mean) / eps;
+            total_probe_it = base.iterations + px.iterations + py.iterations;
+            if (K.determinant() <= 0.0)
+                throw std::runtime_error(
+                    "solve_tangential: probe stiffness degenerate");
         }
     } else {
         K = *K_io;
@@ -375,6 +410,13 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
     // the abandoned unstable scheme).
     const double ftol = 1e-8;
     const int outer_max = 40;
+    // Relative outer tolerances are normalized by target.norm(); that
+    // degenerates to an unreachable exact-zero requirement for a target of
+    // EXACTLY zero (e.g. full unload with history — Finding 1). Floor the
+    // normalization at q_limit (the natural force scale, |mean q| < mean s)
+    // for that edge case only; for any target.norm() > 0 this is identical
+    // to the previous behavior.
+    const double target_scale = (target.norm() > 0.0) ? target.norm() : q_limit;
     Eigen::Vector2d delta = delta_init ? *delta_init : Eigen::Vector2d(K.inverse() * target); // full-stick Newton start
     Eigen::Vector2d delta_prev = Eigen::Vector2d::Zero();
     Eigen::Vector2d F_prev = Eigen::Vector2d::Zero();
@@ -400,7 +442,7 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
             res = std::move(inner);
             res.delta_t = delta;
         }
-        if (F.norm() <= ftol * target.norm()) break;
+        if (F.norm() <= ftol * target_scale) break;
         // floor detection: F no longer responds to delta at the inner
         // solver's resolution — a secant from here is pure noise
         if (have_prev && (F - F_prev).norm() <= 1e-3 * std::max(F.norm(), 1e-300)) break;
@@ -445,7 +487,7 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
                 if (active[i] && interior_point(q(i), q(N + i), s(i))) ++ni;
             }
             const double cx = target(0) * N - qsx, cy = target(1) * N - qsy;
-            if (!ni || (std::abs(cx) + std::abs(cy)) <= 1e-14 * N * target.norm())
+            if (!ni || (std::abs(cx) + std::abs(cy)) <= 1e-14 * N * target_scale)
                 break;
 #pragma omp parallel for schedule(static)
             for (int i = 0; i < N; ++i) {
@@ -477,8 +519,8 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
     }
     // res.error still describes the pre-correction iterate (the KKT-optimal one); the correction's KKT perturbation is O((N/ni)·F_best).
     res.delta_t = delta_best;
-    res.converged = best_converged && F_best <= 1e-3 * target.norm() &&
-                    (res.q_mean - target).norm() <= 1e-10 * target.norm();
+    res.converged = best_converged && F_best <= 1e-3 * target_scale &&
+                    (res.q_mean - target).norm() <= 1e-10 * target_scale;
     res.iterations = total_it;
     if (K_io) *K_io = K;
     return res;
