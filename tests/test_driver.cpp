@@ -166,9 +166,138 @@ static int test_driver_two_step() {
     return 0;
 }
 
+// Monotonic proportional tangential loading is path-independent (Jäger):
+// loading to Q2 in two increments must equal loading in one, and both equal
+// the discrete-exact C-J superposition at nu = 0.
+static int test_path_independence() {
+    const int Ns = 64, N = Ns * Ns;
+    const double L = 1.0, E = 1.0, nu = 0.0, mu = 0.4, p_bar = 0.01;
+    const double q1 = 0.25 * mu * p_bar, q2 = 0.55 * mu * p_bar;
+    hmc::CoulombModel model(mu);
+
+    hmc::FrictionDriver two(Ns, L, E, nu, model);
+    two.set_gap(wavy_gap(Ns, L));
+    hmc::FrictionStepSpec sn;
+    sn.p_bar = p_bar;
+    CHECK(two.step(sn).converged);
+    hmc::FrictionStepSpec st;
+    st.has_q_bar = true;
+    st.q_bar = Eigen::Vector2d(q1, 0.0);
+    CHECK(two.step(st).converged);
+    st.q_bar = Eigen::Vector2d(q2, 0.0);
+    hmc::FrictionStepResult r_two = two.step(st);
+    CHECK(r_two.converged);
+    CHECK(r_two.dissipation >= -1e-12);
+
+    hmc::FrictionDriver one(Ns, L, E, nu, model);
+    one.set_gap(wavy_gap(Ns, L));
+    CHECK(one.step(sn).converged);
+    st.q_bar = Eigen::Vector2d(q2, 0.0);
+    hmc::FrictionStepResult r_one = one.step(st);
+    CHECK(r_one.converged);
+
+    const double d12 = (r_two.tangential.q - r_one.tangential.q).norm() /
+                       r_one.tangential.q.norm();
+    // discrete-exact reference
+    hmc::BoussinesqKernel BK(Ns, L, E);
+    hmc::FFTOperator S(BK);
+    S.build();
+    hmc::MatVec Sop = [&S](const Eigen::VectorXd& x) { return S.matvec(x); };
+    hmc::ContactResult red =
+        hmc::solve_contact(Sop, wavy_gap(Ns, L), p_bar - q2 / mu, 1e-12, 20000);
+    const Eigen::VectorXd q_ref = mu * (one.pressure() - red.pressure);
+    const double e_one = (r_one.tangential.q.head(N) - q_ref).norm() / q_ref.norm();
+    const double e_two = (r_two.tangential.q.head(N) - q_ref).norm() / q_ref.norm();
+    std::printf("path independence: |two-one| %.3e, vs C-J: one %.3e two %.3e\n",
+                d12, e_one, e_two);
+    CHECK(e_one < 1e-3);
+    CHECK(e_two < 2e-3); // two warm-started solves accumulate two floors
+    CHECK(d12 < 3e-3);
+    return 0;
+}
+
+// Mindlin unloading at nu = 0, discrete-exact: unloading from q1 to q2
+// superposes a doubled counter-slip corrective distribution:
+//   q_unl = mu(p - p*(p̄ - q1/mu)) - 2 mu(p - p*(p̄ - (q1-q2)/(2 mu)))
+// (means: q1 - 2(q1-q2)/2 = q2 ✓). This exercises the u_hist path hard —
+// the counter-slip annulus exists ONLY because history is carried.
+static int test_mindlin_unloading() {
+    const int Ns = 64, N = Ns * Ns;
+    const double L = 1.0, E = 1.0, nu = 0.0, mu = 0.4, p_bar = 0.01;
+    const double q1 = 0.6 * mu * p_bar, q2 = 0.2 * mu * p_bar;
+    hmc::CoulombModel model(mu);
+    hmc::FrictionDriver drv(Ns, L, E, nu, model);
+    drv.set_gap(wavy_gap(Ns, L));
+    hmc::FrictionStepSpec sn;
+    sn.p_bar = p_bar;
+    CHECK(drv.step(sn).converged);
+    hmc::FrictionStepSpec st;
+    st.has_q_bar = true;
+    st.q_bar = Eigen::Vector2d(q1, 0.0);
+    CHECK(drv.step(st).converged);
+    st.q_bar = Eigen::Vector2d(q2, 0.0); // UNLOAD
+    hmc::FrictionStepResult r = drv.step(st);
+    CHECK(r.converged);
+    CHECK(r.dissipation >= -1e-12); // counter-slip still dissipates
+
+    hmc::BoussinesqKernel BK(Ns, L, E);
+    hmc::FFTOperator S(BK);
+    S.build();
+    hmc::MatVec Sop = [&S](const Eigen::VectorXd& x) { return S.matvec(x); };
+    hmc::ContactResult red1 =
+        hmc::solve_contact(Sop, wavy_gap(Ns, L), p_bar - q1 / mu, 1e-12, 20000);
+    hmc::ContactResult redr = hmc::solve_contact(
+        Sop, wavy_gap(Ns, L), p_bar - (q1 - q2) / (2.0 * mu), 1e-12, 20000);
+    CHECK(red1.converged && redr.converged);
+    const Eigen::VectorXd q_ref =
+        mu * (drv.pressure() - red1.pressure) -
+        2.0 * mu * (drv.pressure() - redr.pressure);
+    const double rel =
+        (r.tangential.q.head(N) - q_ref).norm() / q_ref.norm();
+    const double qy_rel = r.tangential.q.tail(N).norm() / q_ref.norm();
+    std::printf("mindlin unloading: rel %.3e qy %.3e  D %.3e\n", rel, qy_rel,
+                r.dissipation);
+    CHECK(rel < 3e-3); // two accumulated solver floors + reversal
+    CHECK(qy_rel < 1e-6);
+    return 0;
+}
+
+// Velocity-dependent smoke: rate-weakening Coulomb converges in few
+// threshold passes and the final threshold is self-consistent.
+static int test_velocity_dependent() {
+    const int Ns = 32;
+    const double L = 1.0, E = 1.0, nu = 0.0, mu0 = 0.4, p_bar = 0.01,
+                 v0 = 1e-3;
+    hmc::CallbackModel model(
+        [mu0, v0](const Eigen::VectorXd& p, const Eigen::VectorXd& v,
+                  const Eigen::VectorXd&, Eigen::VectorXd& s) {
+            s = mu0 * p.array().max(0.0) / (1.0 + v.array() / v0);
+        },
+        true);
+    hmc::FrictionDriver drv(Ns, L, E, nu, model);
+    drv.set_gap(wavy_gap(Ns, L));
+    hmc::FrictionStepSpec sn;
+    sn.p_bar = p_bar;
+    CHECK(drv.step(sn).converged);
+    hmc::FrictionStepSpec st;
+    st.has_q_bar = true;
+    st.q_bar = Eigen::Vector2d(0.3 * mu0 * p_bar, 0.0);
+    st.dt = 1.0;
+    hmc::FrictionStepResult r = drv.step(st);
+    std::printf("velocity-dependent: threshold passes %d, D %.3e, conv %d\n",
+                r.threshold_iters, r.dissipation, int(r.converged));
+    CHECK(r.converged);
+    CHECK(r.threshold_iters >= 2 && r.threshold_iters <= 15);
+    CHECK(r.dissipation >= -1e-12);
+    return 0;
+}
+
 int main() {
     if (int rc = test_models()) return rc;
     if (int rc = test_driver_two_step()) return rc;
+    if (int rc = test_path_independence()) return rc;
+    if (int rc = test_mindlin_unloading()) return rc;
+    if (int rc = test_velocity_dependent()) return rc;
     std::printf("test_driver: all checks passed\n");
     return 0;
 }
