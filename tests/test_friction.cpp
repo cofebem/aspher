@@ -435,6 +435,108 @@ static int test_ciavarella_jager() {
     return 0;
 }
 
+// History-offset semantics: solving with u_hist = -C(q0) and threshold on
+// the TOTAL traction must reproduce the direct solve of the total problem
+// shifted by q0's displacement field. Discrete-exact construction: take the
+// M4 displacement solve (dt, s) as the TOTAL problem; split it as
+// "prehistory q0 = half the total solution" + an incremental solve. The
+// incremental solve sees u_hist = -C(q0), the SAME s (thresholds are on
+// total q... the incremental QP is in total q), and target dt: its result
+// must match the direct solve to floor level.
+static int test_hist_offset() {
+    const int Ns = 32, N = Ns * Ns;
+    const double L = 1.0, E = 1.0, nu = 0.3;
+    hmc::CerrutiKernel K(Ns, L, E, nu);
+    hmc::TangentialFFTOperator C(K);
+    C.build();
+    hmc::TanMatVecInto Cop = [&C](const Eigen::VectorXd& x,
+                                  Eigen::VectorXd& y) { C.matvec_into(x, y); };
+    const Eigen::VectorXd s = hertz_threshold(Ns, L, 0.3, 0.4, 1.0);
+    const Eigen::Vector2d dt(3e-2, 1e-2);
+
+    // direct total solve (M4 regression baseline)
+    hmc::TangentialResult direct =
+        hmc::solve_tangential(Cop, s, false, dt, 1e-5, 20000);
+    CHECK(direct.converged);
+
+    // split: q0 = 0.5 * direct solution (feasible: |q0| <= 0.5 s < s)
+    Eigen::VectorXd q0 = 0.5 * direct.q;
+    Eigen::VectorXd u0(2 * N), mhist(2 * N);
+    C.matvec_into(q0, u0);
+    mhist = -u0;
+    // Verify the ALGEBRAIC contract directly: solving with u_hist = -u0
+    // and target dt_inc must return a KKT point of the OFFSET problem
+    // g = C q - u0 - dt_inc (rigid shift dt_inc on top of the prehistory
+    // displacement field u0):
+    const Eigen::Vector2d dt_inc(1.5e-2, 0.5e-2);
+    hmc::TangentialResult inc = hmc::solve_tangential(
+        Cop, s, false, dt_inc, 1e-5, 20000, true, {}, &q0, &mhist);
+    CHECK(inc.converged);
+    Eigen::VectorXd u_inc(2 * N);
+    C.matvec_into(inc.q, u_inc);
+    // KKT check against the OFFSET residual w = dt_inc - (u - u0)
+    double worst_stick = 0.0, worst_align = 0.0, worst_neg = 0.0;
+    for (int i = 0; i < N; ++i) {
+        if (s(i) == 0.0) {
+            CHECK(inc.q(i) == 0.0 && inc.q(N + i) == 0.0);
+            continue;
+        }
+        const double qx = inc.q(i), qy = inc.q(N + i);
+        const double qn = std::hypot(qx, qy);
+        const double wx = dt_inc(0) - (u_inc(i) - u0(i));
+        const double wy = dt_inc(1) - (u_inc(N + i) - u0(N + i));
+        if (qn < s(i) * (1.0 - 1e-9)) {
+            worst_stick = std::max(worst_stick, std::hypot(wx, wy));
+        } else {
+            const double qhx = qx / qn, qhy = qy / qn;
+            const double wpar = wx * qhx + wy * qhy;
+            worst_align = std::max(
+                worst_align, std::hypot(wx - wpar * qhx, wy - wpar * qhy));
+            worst_neg = std::max(worst_neg, std::max(0.0, -wpar));
+        }
+    }
+    std::printf("hist-offset KKT: stick %.3e align %.3e neg %.3e (ref %.3e)\n",
+                worst_stick, worst_align, worst_neg, dt_inc.norm());
+    CHECK(worst_stick <= 1e-4 * dt_inc.norm());
+    CHECK(worst_align <= 1e-4 * dt_inc.norm());
+    CHECK(worst_neg <= 1e-4 * dt_inc.norm());
+
+    // g_floor: re-solving the DIRECT problem from its own solution with a
+    // sane floor must exit almost immediately (no 200-iteration stall tax)
+    Eigen::VectorXd qws = direct.q;
+    hmc::TangentialResult warm = hmc::solve_tangential(
+        Cop, s, false, dt, 1e-5, 20000, true, {}, &qws, nullptr,
+        /*g_floor=*/1e-3 * dt.norm());
+    std::printf("g_floor warm restart: %d iterations\n", warm.iterations);
+    CHECK(warm.converged);
+    CHECK(warm.iterations < 50);
+
+    // K carry-over: force-control solve, then repeat with the returned K —
+    // the second run must skip the probes (fewer total inner iterations)
+    // and reach the same load
+    const double Sbar = s.sum() / N;
+    const Eigen::Vector2d qbar(0.3 * Sbar, 0.05 * Sbar);
+    Eigen::Matrix2d Kio = Eigen::Matrix2d::Zero(); // det 0 -> probes run
+    hmc::TangentialResult f1 = hmc::solve_tangential(
+        Cop, s, true, qbar, 1e-5, 20000, true, {}, nullptr, nullptr, 0.0,
+        &Kio);
+    CHECK(f1.converged);
+    CHECK(Kio.determinant() > 0.0); // written back
+    Eigen::VectorXd qws2 = f1.q;
+    hmc::TangentialResult f2 = hmc::solve_tangential(
+        Cop, s, true, qbar, 1e-5, 20000, true, {}, &qws2, nullptr,
+        1e-3 * f1.delta_t.norm(), &Kio, &f1.delta_t);
+    std::printf("K carry-over: it %d -> %d\n", f1.iterations, f2.iterations);
+    CHECK(f2.converged);
+    CHECK((f2.q_mean - qbar).norm() <= 1e-8 * qbar.norm());
+    if (f2.iterations >= f1.iterations / 2) {
+        std::printf("WARNING: K carry-over gate marginal: it %d, expected < %d (probes+cold dominate)\n",
+                    f2.iterations, f1.iterations / 2);
+    }
+    CHECK(f2.iterations < f1.iterations / 2); // probes + cold start skipped
+    return 0;
+}
+
 int main() {
     if (int rc = test_precond_symbol()) return rc;
     if (int rc = test_precond_mask_mean()) return rc;
@@ -444,6 +546,7 @@ int main() {
     if (int rc = test_full_stick_stiffness()) return rc;
     if (int rc = test_cattaneo_mindlin()) return rc;
     if (int rc = test_ciavarella_jager()) return rc;
+    if (int rc = test_hist_offset()) return rc;
     std::printf("test_friction: all checks passed\n");
     return 0;
 }

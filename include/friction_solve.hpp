@@ -50,6 +50,18 @@ using TanPrecondInto = std::function<void(
 // converged=true is also set on the stagnation exit (200 non-improving iterations):
 // the achievable metric floor was reached and the best iterate is returned —
 // same semantics as solve_contact's stagnation guard.
+//
+// Incremental use (M5): u_hist (size 2N) is added to u in the residual,
+//   g_i = (u_i + u_hist_i) − δ_t;
+// for the step QP min ½(q−qⁿ)ᵀC(q−qⁿ) − Δδ·Σq s.t. |q|≤s pass
+// u_hist = −C qⁿ and read target / delta_t as the INCREMENT Δδ_t.
+// g_floor > 0 floors the it-0 error normalization (warm-started
+// near-converged solves exit immediately instead of paying the stall
+// window). K_io: force control only — if non-null with positive
+// determinant it seeds the outer stiffness (ε-probes skipped); the final
+// stiffness is written back. delta_init overrides the initial shift.
+// With u_hist/q_init present F(0) = −q̄ no longer holds, so the Broyden
+// loop simply skips its update on the first outer round.
 TangentialResult solve_tangential(const TanMatVecInto& C,
                                   const Eigen::VectorXd& s,
                                   bool force_control,
@@ -57,6 +69,10 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
                                   double tol = 1e-8, int max_iter = 5000,
                                   bool use_pr = true,
                                   const TanPrecondInto& precond = {},
-                                  const Eigen::VectorXd* q_init = nullptr);
+                                  const Eigen::VectorXd* q_init = nullptr,
+                                  const Eigen::VectorXd* u_hist = nullptr,
+                                  double g_floor = 0.0,
+                                  Eigen::Matrix2d* K_io = nullptr,
+                                  const Eigen::Vector2d* delta_init = nullptr);
 
 } // namespace hmc

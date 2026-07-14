@@ -27,7 +27,8 @@ static TangentialResult
 solve_disp(const TanMatVecInto& C, const Eigen::VectorXd& s,
            const std::vector<std::uint8_t>& active, double Stotal,
            const Eigen::Vector2d& dt, double tol, int max_iter, bool use_pr,
-           const TanPrecondInto& precond, const Eigen::VectorXd* q_init) {
+           const TanPrecondInto& precond, const Eigen::VectorXd* q_init,
+           const Eigen::VectorXd* u_hist, double g_floor) {
     const int N = static_cast<int>(s.size());
 
     Eigen::VectorXd q(2 * N);
@@ -90,7 +91,9 @@ solve_disp(const TanMatVecInto& C, const Eigen::VectorXd& s,
 #pragma omp parallel for schedule(static) reduction(+ : e) reduction(max : gmax)
         for (int i = 0; i < N; ++i) {
             if (!active[i]) { g(i) = 0.0; g(N + i) = 0.0; continue; }
-            const double gx = u(i) - dt(0), gy = u(N + i) - dt(1);
+            const double hx = u_hist ? (*u_hist)(i) : 0.0;
+            const double hy = u_hist ? (*u_hist)(N + i) : 0.0;
+            const double gx = u(i) + hx - dt(0), gy = u(N + i) + hy - dt(1);
             g(i) = gx;
             g(N + i) = gy;
             const double gn = std::hypot(gx, gy);
@@ -106,7 +109,7 @@ solve_disp(const TanMatVecInto& C, const Eigen::VectorXd& s,
                 e += s(i) * (gperp + std::max(0.0, gpar));
             }
         }
-        if (it == 0) g_scale = (gmax > 0.0) ? gmax : 1.0;
+        if (it == 0) g_scale = std::max((gmax > 0.0) ? gmax : 1.0, g_floor);
         res.error = e / (Stotal * g_scale);
         if (res.error < err_best) {
             err_best = res.error;
@@ -266,7 +269,11 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
                                   const Eigen::Vector2d& target, double tol,
                                   int max_iter, bool use_pr,
                                   const TanPrecondInto& precond,
-                                  const Eigen::VectorXd* q_init) {
+                                  const Eigen::VectorXd* q_init,
+                                  const Eigen::VectorXd* u_hist,
+                                  double g_floor,
+                                  Eigen::Matrix2d* K_io,
+                                  const Eigen::Vector2d* delta_init) {
     const int N = static_cast<int>(s.size());
     if (N == 0) throw std::invalid_argument("solve_tangential: empty s");
     if (s.minCoeff() < 0.0)
@@ -284,7 +291,7 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
 
     if (!force_control)
         return solve_disp(C, s, active, Stotal, target, tol, max_iter,
-                          use_pr, precond, q_init);
+                          use_pr, precond, q_init, u_hist, g_floor);
 
     // ── force control ──
     // δ_t is the Lagrange multiplier of mean(q) = q̄: solve F(δ) = 0 with
@@ -306,36 +313,39 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
     TangentialResult res;
     if (target.norm() == 0.0) { // trivial: q = 0, δ = 0
         res = solve_disp(C, s, active, Stotal, Eigen::Vector2d::Zero(),
-                         tol, 1, use_pr, precond, nullptr);
+                         tol, 1, use_pr, precond, nullptr, u_hist, g_floor);
         res.converged = true;
+        if (K_io) *K_io = Eigen::Matrix2d::Identity();
         return res;
     }
-
-    // displacement scale for the ε-probes: one matvec on the gross-slip
-    // x-directed field q = (s, 0) gives the compliance scale of the problem
-    Eigen::VectorXd qs = Eigen::VectorXd::Zero(2 * N), us(2 * N);
-    qs.head(N) = s;
-    C(qs, us);
-    const double u_scale = us.head(N).cwiseAbs().maxCoeff();
-    if (u_scale <= 0.0) throw std::runtime_error("solve_tangential: degenerate tangential operator (C(s,0) == 0)");
-    const double eps = 1e-4 * u_scale; // edge points slip lightly, K slightly soft, first Newton step overshoots
 
     // full-stick 2×2 stiffness from two ε-probes (F(0) = −q̄ needs no solve:
     // δ = 0 ⇒ q = 0 exactly). Edge points slip lightly, so K is slightly soft
     // and the first Newton step overshoots; absorbed by Broyden updates and
     // floor detection. Robustness guard: if probes slip heavily (>20%), halve
-    // eps and redo.
+    // eps and redo. If K_io is provided with positive determinant, skip probes
+    // and use the provided K.
     Eigen::Matrix2d K;
     int total_probe_it = 0;
-    double eps_probe = eps;
-    {
+    const bool run_probes = !(K_io && K_io->determinant() > 0.0);
+    if (run_probes) {
+        // displacement scale for the ε-probes: one matvec on the gross-slip
+        // x-directed field q = (s, 0) gives the compliance scale of the problem
+        Eigen::VectorXd qs = Eigen::VectorXd::Zero(2 * N), us(2 * N);
+        qs.head(N) = s;
+        C(qs, us);
+        const double u_scale = us.head(N).cwiseAbs().maxCoeff();
+        if (u_scale <= 0.0) throw std::runtime_error("solve_tangential: degenerate tangential operator (C(s,0) == 0)");
+        const double eps = 1e-4 * u_scale; // edge points slip lightly, K slightly soft, first Newton step overshoots
+
+        double eps_probe = eps;
         for (int tries = 0; tries < 2; ++tries) {
             TangentialResult px =
                 solve_disp(C, s, active, Stotal, Eigen::Vector2d(eps_probe, 0.0),
-                           tol, max_iter, use_pr, precond, nullptr);
+                           tol, max_iter, use_pr, precond, nullptr, u_hist, g_floor);
             TangentialResult py =
                 solve_disp(C, s, active, Stotal, Eigen::Vector2d(0.0, eps_probe),
-                           tol, max_iter, use_pr, precond, nullptr);
+                           tol, max_iter, use_pr, precond, nullptr, u_hist, g_floor);
             const int total_slip = px.n_slip + py.n_slip;
             const int total_cand = px.n_slip + px.n_stick + py.n_slip + py.n_stick;
             if (tries == 0 && total_slip > total_cand / 5) {
@@ -351,6 +361,8 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
             total_probe_it = px.iterations + py.iterations;
             break;
         }
+    } else {
+        K = *K_io;
     }
 
     // The inner solver resolves q_mean only to its metric floor (~1e-4
@@ -363,9 +375,10 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
     // the abandoned unstable scheme).
     const double ftol = 1e-8;
     const int outer_max = 40;
-    Eigen::Vector2d delta = K.inverse() * target; // full-stick Newton start
+    Eigen::Vector2d delta = delta_init ? *delta_init : Eigen::Vector2d(K.inverse() * target); // full-stick Newton start
     Eigen::Vector2d delta_prev = Eigen::Vector2d::Zero();
-    Eigen::Vector2d F_prev = -target; // F(0) = -q_bar exactly (q(0) = 0)
+    Eigen::Vector2d F_prev = Eigen::Vector2d::Zero();
+    bool have_prev = false;
     Eigen::VectorXd q_warm;
     if (q_init) q_warm = *q_init; // per-step warm start (M5 driver); solve_disp re-clamps
     int total_it = total_probe_it;
@@ -376,7 +389,7 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
     for (int outer = 0; outer < outer_max; ++outer) {
         TangentialResult inner = solve_disp(
             C, s, active, Stotal, delta, tol, max_iter, use_pr, precond,
-            q_warm.size() ? &q_warm : nullptr);
+            q_warm.size() ? &q_warm : nullptr, u_hist, g_floor);
         total_it += inner.iterations;
         const Eigen::Vector2d F = inner.q_mean - target;
         q_warm = inner.q; // warm-start the next inner solve (copy; res moves)
@@ -390,21 +403,24 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
         if (F.norm() <= ftol * target.norm()) break;
         // floor detection: F no longer responds to delta at the inner
         // solver's resolution — a secant from here is pure noise
-        if ((F - F_prev).norm() <= 1e-3 * std::max(F.norm(), 1e-300)) break;
+        if (have_prev && (F - F_prev).norm() <= 1e-3 * std::max(F.norm(), 1e-300)) break;
 
         // Broyden update of K from the observed secant, then Newton step
         //   K <- K + ((dF - K dd) dd^T) / |dd|^2,  delta <- delta - K^-1 F
-        const Eigen::Vector2d dd = delta - delta_prev;
-        const double dd2 = dd.squaredNorm();
-        if (dd2 > 0.0) {
-            const Eigen::Matrix2d K_upd =
-                K + ((F - F_prev) - K * dd) * dd.transpose() / dd2;
-            // accept the update only while it stays safely non-degenerate
-            if (K_upd.determinant() > 1e-6 * std::abs(K.determinant()))
-                K = K_upd;
+        if (have_prev) {
+            const Eigen::Vector2d dd = delta - delta_prev;
+            const double dd2 = dd.squaredNorm();
+            if (dd2 > 0.0) {
+                const Eigen::Matrix2d K_upd =
+                    K + ((F - F_prev) - K * dd) * dd.transpose() / dd2;
+                // accept the update only while it stays safely non-degenerate
+                if (K_upd.determinant() > 1e-6 * std::abs(K.determinant()))
+                    K = K_upd;
+            }
         }
         delta_prev = delta;
         F_prev = F;
+        have_prev = true;
         const Eigen::Vector2d step = -K.inverse() * F;
         if (!step.allFinite())
             throw std::runtime_error(
@@ -464,6 +480,7 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
     res.converged = best_converged && F_best <= 1e-3 * target.norm() &&
                     (res.q_mean - target).norm() <= 1e-10 * target.norm();
     res.iterations = total_it;
+    if (K_io) *K_io = K;
     return res;
 }
 
