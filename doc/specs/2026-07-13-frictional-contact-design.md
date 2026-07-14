@@ -218,6 +218,27 @@ Verified against two independent sources supplied by the user:
      constraint, `Δδ_t` sits in the RHS (strictly simpler).
 4. **State update** (§6) + per-step result.
 
+> **Implementation note (M4, 2026-07-14)**: the shipped algorithm differs
+> from the sketch above in three load-bearing ways, all forced by measured
+> failures. (1) The projected CG runs over the FULL candidate set
+> A = {s_i > 0} with radial disk clamping (Tamaas PolonskyKeerTan-style),
+> not over the strict stick set: bound points retain a direction DOF that a
+> stick-set CG never updates. (2) A **two-metric projection** strips the
+> outward-radial residual (the Lagrange multiplier −λq̂) from the CG
+> direction at bound points — letting it drive the search corrupts the
+> exact line search (objective oscillation, stall at ~1e-2 error); β
+> restarts only on stick/slip partition changes, the best-error iterate is
+> returned, and a steepest-descent fallback handles non-descent
+> preconditioned directions. (3) **Force control is an outer
+> Newton/Broyden iteration on the rigid shift δ_t** (the Lagrange
+> multiplier of mean(q) = q̄): F(δ) = q_mean(δ) − q̄, stiffness initialized
+> from two small-shift probe solves, noise-guarded Broyden updates, outer
+> stop when F stops responding at the inner resolution, then a terminal
+> additive interior correction meets the load exactly (~1e-16). The
+> per-iteration additive load correction sketched above is UNSTABLE
+> (period-2 feedback with the interior-mean δ_t estimate and the exact
+> line search, gain ≈1.5/it at 40% slip) and was abandoned.
+
 ### 5.2 Reference: de Saxcé–Feng bipotential Uzawa
 
 From `REF/BiPotential/Feng_Saxce_bipotential.pdf`, eqs. (102)–(105),
