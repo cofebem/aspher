@@ -144,6 +144,25 @@ static int test_driver_two_step() {
     std::printf("driver two-step: C-J rel %.3e  dissipation %.3e\n", rel,
                 r2.dissipation);
     CHECK(rel < 1e-3); // driver pipeline floor (warm paths, g_floor)
+
+    // transactionality: a step whose target is beyond the gross-slip limit
+    // makes solve_tangential throw std::invalid_argument (|q_bar| >= mean(s))
+    // rather than return unconverged; the driver must still leave its
+    // persistent state untouched.
+    const Eigen::VectorXd q_before = drv.q();
+    const Eigen::Vector2d delta_t_before = drv.delta_t();
+    hmc::FrictionStepSpec s3;
+    s3.has_q_bar = true;
+    s3.q_bar = Eigen::Vector2d(10.0 * mu * p_bar, 0.0);
+    bool threw = false;
+    try {
+        drv.step(s3);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(drv.q() == q_before);
+    CHECK(drv.delta_t() == delta_t_before);
     return 0;
 }
 

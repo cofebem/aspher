@@ -40,8 +40,18 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
             "FrictionDriver::step: q_bar and delta_t are exclusive");
     if (spec.dt <= 0.0)
         throw std::invalid_argument("FrictionDriver::step: dt <= 0");
+    if (spec.max_threshold_iter <= 0)
+        throw std::invalid_argument(
+            "FrictionDriver::step: max_threshold_iter <= 0");
+    if (spec.T && static_cast<int>(spec.T->size()) != N_)
+        throw std::invalid_argument("FrictionDriver::step: T size");
     FrictionStepResult res;
     bool ok = true;
+
+    // Everything below works on LOCAL candidates; persistent state (p_, q_,
+    // u_t_, delta_t_, w_acc_, slip_prev_, K_) is committed only at the end,
+    // and only if ok — see the transactional contract in the header.
+    Eigen::VectorXd p_new = p_;
 
     // ── (1) normal solve (uncoupled: p never feels q) ──
     if (spec.p_bar > 0.0) {
@@ -56,12 +66,17 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
         res.normal = solve_contact(Sop, g0_, spec.p_bar, spec.tol_normal,
                                    spec.max_iter, true, Pn, warm);
         ok = ok && res.normal.converged;
-        p_ = res.normal.pressure;
+        p_new = res.normal.pressure;
     }
+
+    Eigen::VectorXd q_new = q_, u_t_new = u_t_, w_acc_new = w_acc_,
+                    slip_prev_new = slip_prev_;
+    Eigen::Vector2d delta_t_new = delta_t_;
+    Eigen::Matrix2d K_new = K_;
 
     // ── (2)+(3) threshold loop + incremental tangential solve ──
     if (spec.has_q_bar || spec.has_delta_t) {
-        if (p_.maxCoeff() <= 0.0)
+        if (p_new.maxCoeff() <= 0.0)
             throw std::logic_error(
                 "FrictionDriver::step: tangential step before any contact");
         TanMatVecInto Cop = [this](const Eigen::VectorXd& x,
@@ -74,8 +89,6 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
 
         const Eigen::VectorXd T =
             spec.T ? *spec.T : Eigen::VectorXd::Zero(N_);
-        if (spec.T && static_cast<int>(spec.T->size()) != N_)
-            throw std::invalid_argument("FrictionDriver::step: T size");
 
         // increment targets: solver works in Δδ with u_hist = −uⁿ_t
         const Eigen::Vector2d target = spec.has_q_bar
@@ -89,17 +102,20 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
         // (first pass: previous STEP's — quasi-static continuation)
         Eigen::VectorXd v(N_), s;
         Eigen::VectorXd slip = slip_prev_;
+        Eigen::VectorXd u_new(2 * N_);
         TangentialResult tan;
         double s_change = 1e300;
         int pass = 0;
         const int max_pass =
             model_->velocity_dependent() ? spec.max_threshold_iter : 1;
         Eigen::VectorXd s_old;
+        Eigen::Vector2d dinit;
+        const Eigen::Vector2d* dinit_p = nullptr;
         for (pass = 0; pass < max_pass; ++pass) {
             for (int i = 0; i < N_; ++i)
                 v(i) = std::hypot(slip(i), slip(N_ + i)) / spec.dt;
             Eigen::VectorXd s_new;
-            model_->threshold(p_, v, T, s_new);
+            model_->threshold(p_new, v, T, s_new);
             if (pass == 0) {
                 s = s_new;
             } else {
@@ -107,13 +123,16 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
                 s_change = (s - s_old).norm() / std::max(s.norm(), 1e-300);
             }
             s_old = s;
-            Eigen::VectorXd q_warm = q_;
+            // warm-start from the PREVIOUS PASS's solution (pass 0: the
+            // previous step's committed q_ — quasi-static continuation)
+            Eigen::VectorXd q_warm = (pass == 0) ? q_ : tan.q;
             tan = solve_tangential(Cop, s, spec.has_q_bar, target,
                                    spec.tol_tangential, spec.max_iter, true,
                                    Mop, &q_warm, &u_hist, g_floor,
-                                   spec.has_q_bar ? &K_ : nullptr, nullptr);
+                                   spec.has_q_bar ? &K_new : nullptr, dinit_p);
+            dinit = tan.delta_t;
+            dinit_p = &dinit;
             // slip increment of this candidate solution: Δw = Δδ − (u − uⁿ)
-            Eigen::VectorXd u_new(2 * N_);
             C_.matvec_into(tan.q, u_new);
             for (int i = 0; i < N_; ++i) {
                 slip(i) = tan.delta_t(0) - (u_new(i) - u_t_(i));
@@ -133,9 +152,8 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
              (!model_->velocity_dependent() ||
               s_change < spec.threshold_rtol);
 
-        // ── (4) state update ──
-        Eigen::VectorXd u_new(2 * N_);
-        C_.matvec_into(tan.q, u_new);
+        // ── (4) candidate state update (u_new is the loop's final pass —
+        // no need to recompute C q) ──
         res.slip_inc.resize(2 * N_);
         double D = 0.0;
 #pragma omp parallel for schedule(static) reduction(+ : D)
@@ -148,15 +166,24 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
             D += tan.q(i) * dwx + tan.q(N_ + i) * dwy;
         }
         res.dissipation = D * h_ * h_;
-        q_ = tan.q;
-        u_t_ = u_new;
-        delta_t_ += tan.delta_t; // solver's delta is the increment
-        w_acc_ += res.slip_inc;
-        slip_prev_ = res.slip_inc;
+        q_new = tan.q;
+        u_t_new = u_new;
+        delta_t_new += tan.delta_t; // solver's delta is the increment
+        w_acc_new += res.slip_inc;
+        slip_prev_new = res.slip_inc;
         res.tangential = std::move(tan);
     }
 
     res.converged = ok;
+    if (ok) {
+        p_ = std::move(p_new);
+        q_ = std::move(q_new);
+        u_t_ = std::move(u_t_new);
+        delta_t_ = delta_t_new;
+        w_acc_ = std::move(w_acc_new);
+        slip_prev_ = std::move(slip_prev_new);
+        K_ = K_new;
+    }
     return res;
 }
 

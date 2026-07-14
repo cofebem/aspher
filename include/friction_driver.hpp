@@ -46,6 +46,18 @@ struct FrictionStepResult {
 // (exact operators); both spectral preconditioners on by default.
 // History lives here; callers drive the load program step by step and may
 // update the temperature field between steps. Not thread-safe.
+//
+// Transactional contract: step() works on local candidates and commits the
+// persistent members (p, q, u_t, δ_t, accumulated slip, carried K) only
+// when the step converges. A non-converged step (result.converged == false,
+// including one where solve_tangential throws and step() rethrows) leaves
+// the driver state exactly as it was before the call — the caller may
+// inspect the failure and retry with a modified spec, or call reset().
+//
+// The carried force-control stiffness K is not invalidated when p (hence
+// the threshold field s) changes between steps; the solver's Broyden
+// updates and floor detection self-correct, at worst reporting
+// converged=false rather than silently seeding a bad outer iterate.
 class FrictionDriver {
 public:
     FrictionDriver(int Ns, double L, double E_star, double nu,
