@@ -2,7 +2,9 @@
 
 #include <Eigen/Dense>
 #include <algorithm>
+#include <cmath>
 #include <functional>
+#include <stdexcept>
 
 namespace hmc {
 
@@ -64,9 +66,15 @@ public:
                    const Eigen::VectorXd& T,
                    Eigen::VectorXd& s) const override {
         fn_(p, v, T, s);
+        // Validate size
+        if (s.size() != p.size())
+            throw std::invalid_argument(
+                "CallbackModel: callback returned wrong-size threshold");
         // Sanitize: clamp to >= 0 and zero where p <= 0
+        // (handle NaN: std::max(NaN, 0) returns NaN, so check isfinite)
         for (Eigen::Index i = 0; i < p.size(); ++i) {
-            s(i) = (p(i) > 0.0) ? std::max(s(i), 0.0) : 0.0;
+            s(i) = (p(i) > 0.0 && std::isfinite(s(i)) && s(i) > 0.0) ? s(i)
+                                                                      : 0.0;
         }
     }
     bool velocity_dependent() const override { return vdep_; }

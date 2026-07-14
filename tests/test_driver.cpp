@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <stdexcept>
 
 #define CHECK(cond)                                                        \
     do {                                                                   \
@@ -45,6 +46,34 @@ static int test_models() {
     CHECK(s(3) == 0.0); // raw callback returns -0.03/4: sanitized to 0
     CHECK(s(2) == 0.0 && s(5) == 0.0);
     CHECK(user.velocity_dependent());
+
+    // Test case 1: callback returning NaN at p > 0
+    hmc::CallbackModel nan_callback(
+        [](const Eigen::VectorXd& pp, const Eigen::VectorXd&,
+           const Eigen::VectorXd&, Eigen::VectorXd& ss) {
+            ss = pp.array().isNaN().select(pp.array() * 0.0 / 0.0, pp * 0.1);
+            ss(0) = std::nan(""); // inject NaN at first point
+        },
+        false);
+    nan_callback.threshold(p, v, T, s);
+    CHECK(s(0) == 0.0); // NaN sanitized to 0
+    CHECK(std::abs(s(1) - 0.05) < 1e-15);
+
+    // Test case 2: callback returning wrong-sized threshold
+    hmc::CallbackModel bad_size_callback(
+        [](const Eigen::VectorXd&, const Eigen::VectorXd&,
+           const Eigen::VectorXd&, Eigen::VectorXd& ss) {
+            ss.resize(3); // wrong size
+        },
+        false);
+    bool bad_size_threw = false;
+    try {
+        bad_size_callback.threshold(p, v, T, s);
+    } catch (const std::invalid_argument&) {
+        bad_size_threw = true;
+    }
+    CHECK(bad_size_threw);
+
     return 0;
 }
 
