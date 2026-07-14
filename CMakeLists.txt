@@ -73,6 +73,7 @@ add_library(aspher_core STATIC
   src/nested_solve.cpp
   src/tangential_operator.cpp
   src/friction_solve.cpp
+  src/friction_driver.cpp
 )
 target_include_directories(aspher_core PUBLIC include)
 target_link_libraries(aspher_core PUBLIC Eigen3::Eigen)
