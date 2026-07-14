@@ -108,6 +108,11 @@ Expected ≤ 5–10 passes; max-outer cap + stagnation guard with honest
 `converged` reporting (existing conventions). Tresca/Coulomb: exactly one
 pass (threshold does not depend on the tangential solution).
 
+> **Implementation note (M5)**: plain damped fixed point (s ← ½(s + s_new),
+> stop on rel change < threshold_rtol, default 1e-3) instead of Aitken —
+> measured 7 passes on the rate-weakening smoke test; Aitken remains a
+> follow-up if a production law needs it.
+
 ## 3. Kernels (input: literature closed forms; user cross-check)
 
 ### 3.1 Element-integrated stencils
@@ -279,6 +284,17 @@ C++ `FrictionDriver` owning the operators, the friction model, and state:
 per-step result; `reset()` clears history. Python drives the step sequence
 and may update `T` (user-built thermal loops) or the gap between steps.
 History lives in C++; nothing is recomputed from Python between steps.
+
+> **Implementation note (M5)**: implemented as `FrictionDriver`
+> (`friction_driver.{hpp,cpp}`, FFT backend) with
+> `FrictionStepSpec`/`FrictionStepResult`; `solve_tangential` gained
+> `u_hist` (per-point history offset — the incremental QP residual is
+> g = u − uⁿ_t − Δδ), `g_floor`, and `K_io`/`delta_init` carry-over
+> (per-step force solves skip the ε-probes: measured 1475 → 14 inner
+> iterations). Targets are TOTAL loads/shifts; the driver converts to
+> increments internally. `step()` is TRANSACTIONAL: a non-converged step
+> leaves the driver state unchanged. Dissipation D = h²Σ q·Δw reported per
+> step, gated ≥ 0 in tests.
 
 ## 7. Friction-model interface (and the autodiff decision)
 
