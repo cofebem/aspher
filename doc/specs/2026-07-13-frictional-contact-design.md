@@ -264,6 +264,20 @@ preconditioned metric. Load constraints via multiplier update on `δ`
 Cone generalizations: Tresca ⇒ cylinder of radius `τ_c`; generic model ⇒
 cylinder with `s` frozen from the predictor state per iteration.
 
+> **Implementation note (M6, 2026-07-15)**: shipped as `solve_bipotential`
+> (`bipotential.{hpp,cpp}`), displacement-controlled (imposed α, δ_t — the
+> cross-check obtains both from a production run); ρ = rho_scale/λ_max with
+> λ_max from 20 power iterations on the stacked operators; Coulomb cone +
+> frozen-threshold cylinder (Tresca / generic-with-frozen-s). Measured at
+> Ns=32 (Hertz, partial slip): **790 sweeps** to rel-update 1e-9, agreeing
+> with the production staggered path to rel-L2 5.8e-8 (p) / 4.3e-6 (q), and
+> passing a direct KKT self-check at the 1e-10 level — the two independent
+> solver families confirm each other. Per sweep = 1 normal + 1 tangential
+> matvec (vs the production path's ~2 per CG iteration but far fewer
+> iterations); at Ns=32 the reference costs ~10× the production wall time.
+> Force-controlled and coupled (dissimilar-material) Uzawa variants remain
+> the documented future path.
+
 **Contract in v1**: reference implementation — must reproduce §5.1 solutions
 (rel-L2 gate) on small/medium grids for all three models; performance at
 scale is *benchmarked and reported, not promised* (first-order method; the
