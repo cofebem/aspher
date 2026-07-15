@@ -8,6 +8,7 @@
 #include "contact_solver.hpp"
 #include "fft_operator.hpp"
 #include "fourier_precond.hpp"
+#include "friction_model.hpp"
 #include "h2_operator.hpp"
 #include "hmatrix.hpp"
 #include "nested_solve.hpp"
@@ -38,6 +39,65 @@ py::array_t<double> as_grid(const Eigen::VectorXd& v, int Ns) {
     py::array_t<double> a({Ns, Ns});
     std::memcpy(a.mutable_data(), v.data(), sizeof(double) * v.size());
     return a;
+}
+
+// numpy (N,) or (Ns,Ns) float64 -> flat Eigen vector of length `expected`.
+// (Eigen::Index-sized sibling of to_vector, for the friction path's 2N
+// vectors — reuse to_vector where an int length is already in hand.)
+Eigen::VectorXd to_flat(const py::array_t<double, py::array::c_style |
+                                                     py::array::forcecast>& a,
+                       Eigen::Index expected) {
+    if (a.size() != expected)
+        throw std::invalid_argument("array has " + std::to_string(a.size()) +
+                                    " entries, expected " +
+                                    std::to_string(expected));
+    Eigen::VectorXd v(expected);
+    std::memcpy(v.data(), a.data(), sizeof(double) * expected);
+    return v;
+}
+
+py::array_t<double> as_flat(const Eigen::VectorXd& v) {
+    py::array_t<double> a(v.size());
+    std::memcpy(a.mutable_data(), v.data(), sizeof(double) * v.size());
+    return a;
+}
+
+// UserFriction: a CallbackModel whose C++ threshold functor calls back into a
+// Python callable fn(p, v, T) -> s. The functor RE-ACQUIRES the GIL because
+// FrictionSolver.step() releases it around the (long) C++ solve; this nested
+// acquire is the standard pybind11 pattern. A Python exception raised inside
+// fn surfaces as py::error_already_set, propagates through the transactional
+// driver (state left intact), and is restored by pybind11 at the step()
+// boundary where the GIL is held again. Ownership: the py::function is held
+// by value inside the std::function, so the callable outlives the model.
+std::shared_ptr<hmc::CallbackModel>
+make_user_friction(py::function fn, bool velocity_dependent) {
+    hmc::CallbackModel::Fn cfn =
+        [fn](const Eigen::VectorXd& p, const Eigen::VectorXd& v,
+             const Eigen::VectorXd& T, Eigen::VectorXd& s) {
+            py::gil_scoped_acquire gil;
+            py::object out = fn(as_flat(p), as_flat(v), as_flat(T));
+            s = to_flat(py::cast<py::array_t<double, py::array::c_style |
+                                                         py::array::forcecast>>(
+                            out),
+                        p.size());
+        };
+    return std::make_shared<hmc::CallbackModel>(std::move(cfn),
+                                                velocity_dependent);
+}
+
+// Shared threshold(p, v, T) helper for the model .def below.
+py::array_t<double> model_threshold(const hmc::FrictionModel& m,
+                                    const py::array_t<double, py::array::c_style |
+                                                                 py::array::forcecast>& p,
+                                    const py::array_t<double, py::array::c_style |
+                                                                 py::array::forcecast>& v,
+                                    const py::array_t<double, py::array::c_style |
+                                                                 py::array::forcecast>& T) {
+    const Eigen::Index N = p.size();
+    Eigen::VectorXd pv = to_flat(p, N), vv = to_flat(v, N), Tv = to_flat(T, N), s;
+    m.threshold(pv, vv, Tv, s);
+    return as_flat(s);
 }
 
 struct PyResult {
@@ -369,4 +429,40 @@ PYBIND11_MODULE(aspher, m) {
           "active_delta*scale) through the masked H2 matvec, with per-round "
           "full-grid verification and a full-solve fallback after "
           "active_max_rounds (see .active_rounds/.active_fallback).");
+
+    py::class_<hmc::FrictionModel, std::shared_ptr<hmc::FrictionModel>>(
+        m, "FrictionModel",
+        "Abstract friction threshold model s = tau_c(p, |v|, T). Use "
+        "TrescaFriction, CoulombFriction, or UserFriction.")
+        .def("threshold", &model_threshold, py::arg("p"), py::arg("v"),
+             py::arg("T"),
+             "Evaluate the threshold field s (flat (N,)) from pressure p, slip "
+             "speed v, temperature T (each (N,) or (Ns,Ns)). s = 0 where p<=0.")
+        .def_property_readonly("velocity_dependent",
+                               &hmc::FrictionModel::velocity_dependent);
+
+    py::class_<hmc::TrescaModel, hmc::FrictionModel,
+               std::shared_ptr<hmc::TrescaModel>>(
+        m, "TrescaFriction",
+        "Tresca friction: pressure-independent threshold s = tau_c inside "
+        "contact (0 outside).")
+        .def(py::init<double>(), py::arg("tau_c"));
+
+    py::class_<hmc::CoulombModel, hmc::FrictionModel,
+               std::shared_ptr<hmc::CoulombModel>>(
+        m, "CoulombFriction",
+        "Coulomb friction: s = mu * p (p clamped at 0).")
+        .def(py::init<double>(), py::arg("mu"));
+
+    py::class_<hmc::CallbackModel, hmc::FrictionModel,
+               std::shared_ptr<hmc::CallbackModel>>(
+        m, "UserFriction",
+        "User friction law: fn(p, v, T) -> s, operating on flat float64 "
+        "arrays (each (N,)); the returned s is sanitized (clamped >= 0, "
+        "zeroed where p<=0, non-finite -> 0). Set velocity_dependent=True if "
+        "s depends on the slip speed v (enables the driver's threshold "
+        "fixed-point loop). Derivatives are NOT required (the solvers are "
+        "derivative-free).")
+        .def(py::init(&make_user_friction), py::arg("fn"),
+             py::arg("velocity_dependent") = false);
 }
