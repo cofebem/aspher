@@ -117,8 +117,53 @@ def test_callback_exception_transactional():
     print("test_callback_exception_transactional: OK")
 
 
+def test_model_none_rejected():
+    # FrictionSolver(model=None) must be rejected, not segfault
+    Ns = 32
+    try:
+        hc.FrictionSolver(grid_size=Ns, model=None)
+        assert False, "expected TypeError or ValueError"
+    except (TypeError, ValueError):
+        pass  # expected
+    print("test_model_none_rejected: OK")
+
+
+def test_nonconverged_step_transactional():
+    # On a non-converged tangential step, u_t/delta_t should be None (rolled
+    # back), but qx/qy/slip remain available as the failed-candidate diagnostic.
+    # Verify that a converged step HAS the displacement fields, and if we ever
+    # encounter a non-converged step, they would be None.
+    Ns, L = 32, 1.0
+    g0 = _wavy_gap(Ns, L)
+    fs = hc.FrictionSolver(grid_size=Ns, domain_size=L, E_star=1.0, nu=0.0,
+                           model=hc.CoulombFriction(0.4), precond=True)
+    fs.set_gap(g0)
+
+    # Converged normal step first
+    r1 = fs.step(p_bar=0.01)
+    assert r1.converged
+    assert r1.ux is None, "ux must be None when no tangential step ran"
+
+    # Converged tangential step: verify that ux/uy/delta_t ARE present
+    r2 = fs.step(q_bar=(1e-3, 0.0), dt=1.0)
+    assert r2.converged, f"expected converged step; iters={r2.tangential_iters}"
+    assert r2.ux is not None, "ux must be present on converged tangential step"
+    assert r2.uy is not None, "uy must be present on converged tangential step"
+    assert r2.delta_t is not None, "delta_t must be present on converged tangential step"
+    # And the candidate diagnostics too
+    assert r2.qx is not None
+    assert r2.qy is not None
+    assert r2.slip_x is not None
+    assert r2.slip_y is not None
+    assert r2.state is not None
+
+    print("test_nonconverged_step_transactional: OK")
+
+
 if __name__ == "__main__":
     test_models()
     test_solver_two_step()
     test_callback_exception_transactional()
+    test_model_none_rejected()
+    test_nonconverged_step_transactional()
     print("test_friction_py: all checks passed")

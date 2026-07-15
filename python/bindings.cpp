@@ -332,7 +332,8 @@ struct PyStepResult {
     hmc::FrictionStepResult r;
     int Ns = 0;
     bool tangential = false;    // a tangential solve ran this step
-    Eigen::VectorXd u_t;        // total C q after the step (2N); empty if !tangential
+    bool have_disp = false;     // ux/uy/delta_t are valid (step converged)
+    Eigen::VectorXd u_t;        // total C q after the step (2N); empty if !have_disp
     Eigen::Vector2d delta_total = Eigen::Vector2d::Zero();
 };
 
@@ -400,9 +401,10 @@ public:
             // step and is restored here (GIL held again on scope exit).
             py::gil_scoped_release release;
             out.r = drv_->step(spec);
-            if (out.tangential) {
+            if (out.tangential && out.r.converged) {
                 out.u_t = drv_->u_t();
                 out.delta_total = drv_->delta_t();
+                out.have_disp = true;
             }
         }
         return out;
@@ -619,12 +621,12 @@ PYBIND11_MODULE(aspher, m) {
             })
         .def_property_readonly(
             "ux", [](const PyStepResult& s) -> py::object {
-                if (!s.tangential) return py::none();
+                if (!s.have_disp) return py::none();
                 return half_grid(s.u_t, s.Ns, false);
             })
         .def_property_readonly(
             "uy", [](const PyStepResult& s) -> py::object {
-                if (!s.tangential) return py::none();
+                if (!s.have_disp) return py::none();
                 return half_grid(s.u_t, s.Ns, true);
             })
         .def_property_readonly(
@@ -653,7 +655,8 @@ PYBIND11_MODULE(aspher, m) {
                 return a;
             })
         .def_property_readonly(
-            "delta_t", [](const PyStepResult& s) {
+            "delta_t", [](const PyStepResult& s) -> py::object {
+                if (!s.have_disp) return py::none();
                 py::array_t<double> a(2);
                 a.mutable_data()[0] = s.delta_total(0);
                 a.mutable_data()[1] = s.delta_total(1);
@@ -669,7 +672,7 @@ PYBIND11_MODULE(aspher, m) {
         .def(py::init<int, double, double, double,
                       std::shared_ptr<hmc::FrictionModel>, bool>(),
              py::arg("grid_size"), py::arg("domain_size") = 1.0,
-             py::arg("E_star") = 1.0, py::arg("nu") = 0.3, py::arg("model"),
+             py::arg("E_star") = 1.0, py::arg("nu") = 0.3, py::arg("model").none(false),
              py::arg("precond") = true, py::keep_alive<1, 6>())
         .def("set_gap", &PyFrictionSolver::set_gap, py::arg("gap"),
              "Set the initial gap field (flat (N,) or (Ns,Ns)); resets history.")
@@ -683,7 +686,10 @@ PYBIND11_MODULE(aspher, m) {
              "One quasi-static load step. p_bar>0 runs the normal solve; a "
              "tangential solve runs if q_bar (force control, (qx,qy)) or "
              "delta_t (displacement control, rigid shift) is given (exactly "
-             "one). Targets are TOTAL loads/shifts. Returns FrictionStepResult.")
+             "one). Targets are TOTAL loads/shifts. Returns FrictionStepResult. "
+             "On a non-converged step the driver state is rolled back, so ux/uy/"
+             "delta_t are None; qx/qy/slip_x/slip_y/state expose the failed "
+             "candidate for inspection.")
         .def("reset", &PyFrictionSolver::reset, "Clear all history.")
         .def_property_readonly("pressure", &PyFrictionSolver::pressure)
         .def_property_readonly("q", &PyFrictionSolver::q)
