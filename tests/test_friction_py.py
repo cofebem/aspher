@@ -129,34 +129,35 @@ def test_model_none_rejected():
 
 
 def test_nonconverged_step_transactional():
-    # On a non-converged tangential step, u_t/delta_t should be None (rolled
-    # back), but qx/qy/slip remain available as the failed-candidate diagnostic.
-    # Verify that a converged step HAS the displacement fields, and if we ever
-    # encounter a non-converged step, they would be None.
+    # A converged tangential step exposes the displacement fields; a genuinely
+    # non-converged one returns them as None (driver state rolled back) while
+    # qx/qy/slip stay available as the failed-candidate diagnostic, and the
+    # persistent state fs.q is unchanged (transactional).
     Ns, L = 32, 1.0
     g0 = _wavy_gap(Ns, L)
     fs = hc.FrictionSolver(grid_size=Ns, domain_size=L, E_star=1.0, nu=0.0,
                            model=hc.CoulombFriction(0.4), precond=True)
     fs.set_gap(g0)
 
-    # Converged normal step first
     r1 = fs.step(p_bar=0.01)
     assert r1.converged
-    assert r1.ux is None, "ux must be None when no tangential step ran"
+    assert r1.ux is None                 # no tangential ran -> None
 
-    # Converged tangential step: verify that ux/uy/delta_t ARE present
     r2 = fs.step(q_bar=(1e-3, 0.0), dt=1.0)
-    assert r2.converged, f"expected converged step; iters={r2.tangential_iters}"
-    assert r2.ux is not None, "ux must be present on converged tangential step"
-    assert r2.uy is not None, "uy must be present on converged tangential step"
-    assert r2.delta_t is not None, "delta_t must be present on converged tangential step"
-    # And the candidate diagnostics too
-    assert r2.qx is not None
-    assert r2.qy is not None
-    assert r2.slip_x is not None
-    assert r2.slip_y is not None
-    assert r2.state is not None
+    assert r2.converged
+    assert r2.ux is not None and r2.uy is not None and r2.delta_t is not None
+    assert r2.qx is not None and r2.slip_x is not None and r2.state is not None
 
+    # force a non-converged tangential step (max_iter=1 cannot reach tol)
+    q_before = np.asarray(fs.q).copy()
+    r3 = fs.step(q_bar=(2e-3, 0.0), dt=1.0, max_iter=1)
+    assert not r3.converged, f"expected non-converged; iters={r3.tangential_iters}"
+    # displacement/shift rolled back -> None
+    assert r3.ux is None and r3.uy is None and r3.delta_t is None
+    # failed-candidate traction diagnostics still available
+    assert r3.qx is not None and r3.qy is not None and r3.slip_x is not None
+    # transactional: persistent state unchanged by the failed step
+    assert np.array_equal(np.asarray(fs.q), q_before)
     print("test_nonconverged_step_transactional: OK")
 
 
