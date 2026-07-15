@@ -336,10 +336,10 @@ revisit only if a semi-smooth Newton solver is added.
 ```python
 import aspher as hc
 
-model = hc.CoulombFriction(mu=0.3)           # hc.TrescaFriction(tau_c=0.01)
-# hc.UserFriction(lambda p, v, T: mu0*p/(1+v/v0), d_dp=None, d_dv=None)
+model = hc.CoulombFriction(mu=0.3)           # or hc.TrescaFriction(tau_c=0.01)
+# hc.UserFriction(lambda p, v, T: mu0*p/(1+v/v0), velocity_dependent=True)
 
-fs = hc.FrictionSolver(grid_size=1024, backend="fft",   # or "h2" (+ q, leaf_side)
+fs = hc.FrictionSolver(grid_size=1024, domain_size=1.0,
                        E_star=1.0, nu=0.3, model=model, precond=True)
 fs.set_gap(g0)                                # gap = -surface, as today
 

@@ -493,7 +493,10 @@ PYBIND11_MODULE(aspher, m) {
     m.doc() = "ASPHER - Accelerated SPectral and HiERarchical contact solver. "
               "BEM normal contact on an elastic half-space (Boussinesq kernel, "
               "Love element integration, H-matrix/H2-FMM operators, "
-              "FFTW |q| preconditioner, Polonsky-Keer CG)";
+              "FFTW |q| preconditioner, Polonsky-Keer CG). Frictional contact "
+              "(Tresca/Coulomb/user-defined, Cattaneo-Mindlin partial slip) via "
+              "FrictionSolver + the friction models; de Saxcé-Feng bipotential "
+              "reference via solve_bipotential.";
 
     py::class_<PyResult>(m, "ContactResult")
         .def_property_readonly(
