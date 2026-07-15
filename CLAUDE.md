@@ -120,6 +120,7 @@ Exact zero-padded (Hockney) circular convolution of the pressure with the Love e
 - **M4 done**: `friction_solve.{hpp,cpp}` — `solve_tangential` (projected CG over {s>0} with two-metric projection: the bound points' multiplier residual is stripped from the direction; β-restart on partition changes only; best-iterate return; steepest-descent fallback on non-descent) + force control via **outer Newton/Broyden on δ_t** (probe-initialized 2×2 stiffness, F-floor detection, terminal exact-load correction ~1e-16) + `TangentialFourierPreconditioner` in `fourier_precond.{hpp,cpp}` (inverse symbol |k|(I + γ k̂k̂ᵀ), γ = ν/(1−ν); odd wxy zeroed at self-conjugate Nyquist modes). The displacement-control metric floor is ~1e-5–1e-4 (grows with slip fraction — slip directions rotate and clamps perturb the CG); force-control KKT gated at 1e-2 with the SHARP validation at ν=0 (directions frozen): Ciavarella–Jäger. Gates in `test_friction`.
 - **M5 done**: `friction_model.hpp` (Tresca/Coulomb/CallbackModel — callback output sanitized: s ≥ 0, s = 0 where p ≤ 0, NaN→0, size-checked) + `friction_driver.{hpp,cpp}` (`FrictionDriver::step`, TRANSACTIONAL: normal PK solve → damped fixed-point threshold loop (velocity-dependent laws, warm-chained passes) → incremental tangential solve with `u_hist = −C qⁿ`, K carry-over, g_floor → state commit only on convergence + dissipation `D = h²Σq·Δw ≥ 0`). `solve_tangential` extended (all optional, M4-default-compatible): `u_hist`, `g_floor`, `K_io`, `delta_init`; zero-target-with-history = full unload preserves locked-in shear; differential 3-solve probes at the operating point when history present. Gates in `test_driver`: two-step C-J, path independence, **Mindlin unloading discrete-exact superposition**, velocity smoke.
 - **M6 done**: `bipotential.{hpp,cpp}` — de Saxcé–Feng bipotential Uzawa reference solver (`solve_bipotential`, displacement-controlled; predictor `τ_t = q + ρw`, `τ_n = p − ρ(g + μ|w|)` with the paper→codebase sign map derived in the header; analytic Coulomb-cone projection eq. (105) ≡ Tamaas `Kato::enforcePressureCoulomb`, + frozen-threshold cylinder for Tresca/generic; ρ from power iteration). Cross-checks in `test_uzawa`: agrees with the production staggered path to 5.8e-8 (p) / 4.3e-6 (q) rel-L2 at Ns=32 Coulomb, and passes a direct KKT self-check at ~1e-10. The Tresca cross-check gap (7.3e-3) is the PRODUCTION side's floor on the uniform-threshold all-slip case, not the Uzawa's.
+- **M7 done**: pybind11 bindings — `FrictionSolver` (keyword-arg `step(p_bar=/q_bar=/delta_t=/dt=/T=)`, GIL released around the solve), `CoulombFriction/TrescaFriction/UserFriction` (the last wraps a GIL-safe Python callable), `FrictionStepResult`, and `solve_bipotential`. `example_friction.py` + `tests/test_friction_py.py`. Python names follow spec §8 (C++ internals keep `FrictionDriver/…Model`).
 
 ### Polonsky–Keer (1999) PCG
 Projected CG for the QP `min ½p'Sp + p'g₀  s.t. p≥0, mean(p)=p_bar`.
@@ -319,6 +320,31 @@ print(res.contact_area)                                   # Ac/A  (also contact.
 
 `python example_rough_contact.py` writes `example_rough_contact.png`
 (surface | pressure | contact-area panels).
+
+### Frictional contact (M7)
+
+```python
+import aspher as hc, numpy as np
+model = hc.CoulombFriction(mu=0.3)   # or hc.TrescaFriction(tau_c=0.01)
+# hc.UserFriction(lambda p, v, T: mu0*p/(1+v/v0), velocity_dependent=True)
+fs = hc.FrictionSolver(grid_size=256, E_star=1.0, nu=0.3, model=model)
+fs.set_gap(-surface)                 # gap = -height (rigid flat), as normal
+fs.step(p_bar=0.05)                  # normal load step
+r = fs.step(q_bar=(0.01, 0.0), dt=1.0)          # tangential force (total)
+#   fs.step(delta_t=(1e-4, 0.0), dt=1.0)        # or displacement control
+#   fs.step(q_bar=(...), dt=1.0, T=Tfield)      # + temperature field
+print(r.n_stick, r.n_slip, r.q_mean, r.dissipation)   # partial-slip split
+qx, qy = np.asarray(r.qx), np.asarray(r.qy)            # shear tractions (Ns,Ns)
+```
+
+`FrictionStepResult`: `qx/qy/ux/uy/slip_x/slip_y/state` (grids, `None` on a
+normal-only step), `q_mean/delta_t` (2-vectors), `dissipation`, `n_stick/
+n_slip`, `converged`, `normal_converged`, `mean_pressure/contact_area/
+approach`, `normal_iters/tangential_iters/threshold_iters`. State is carried
+across steps (accessors `fs.pressure/.q/.u_t/.w_acc/.delta_t`); a
+non-converged step leaves it unchanged. `hc.solve_bipotential(...)` is the
+de Saxcé–Feng reference cross-check (slow; not for production).
+`example_friction.py` runs a Cattaneo–Mindlin partial-slip demo.
 
 ---
 

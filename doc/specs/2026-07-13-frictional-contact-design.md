@@ -356,6 +356,15 @@ fs.reset()
 as today. `fs.step(..., solver="uzawa")` selects the reference path.
 Existing `ContactSolver` / `solve_nested` are untouched.
 
+### 8 Reconciliation note (M7 implementation)
+
+The shipped Python names are `FrictionSolver`, `CoulombFriction`, `TrescaFriction`, `UserFriction`
+(matching the brief names); `step()` uses keyword arguments (`p_bar=/q_bar=/delta_t=/dt=/T=`,
+no visible spec `FrictionStepSpec` struct). The §8 derivative callables `d_dp`/`d_dv` specified
+for `UserFriction` are **DROPPED in the shipped implementation** — the solvers are derivative-free
+(per §7/M5 decision), and `UserFriction(fn, velocity_dependent=)` accepts only the threshold
+function itself, using a safeguarded secant for any implicit solve.
+
 ## 9. Code layout
 
 | File | Contents |
