@@ -291,7 +291,7 @@ C++ `FrictionDriver` owning the operators, the friction model, and state:
 |---|---|
 | `p`, `q` | total tractions at last accepted step |
 | `u_t` | tangential elastic displacement `C q` (avoids a rebuild matvec) |
-| `w_acc` | accumulated slip (output/diagnostics; wear-model hook) |
+| `w_acc` | accumulated slip (output/diagnostics) |
 | `δ_t`, `δ_z` | rigid shifts |
 
 `step(Δload, Δt, T)` executes §5.1 (or §5.2 on request) and returns a
