@@ -8,6 +8,7 @@
 #include "contact_solver.hpp"
 #include "fft_operator.hpp"
 #include "fourier_precond.hpp"
+#include "friction_driver.hpp"
 #include "friction_model.hpp"
 #include "h2_operator.hpp"
 #include "hmatrix.hpp"
@@ -325,6 +326,115 @@ PyResult py_solve_nested(
     return out;
 }
 
+// Read-only view over a FrictionStepResult plus the driver Ns and, for a
+// tangential step, snapshots of the post-step total tangential displacement.
+struct PyStepResult {
+    hmc::FrictionStepResult r;
+    int Ns = 0;
+    bool tangential = false;    // a tangential solve ran this step
+    Eigen::VectorXd u_t;        // total C q after the step (2N); empty if !tangential
+    Eigen::Vector2d delta_total = Eigen::Vector2d::Zero();
+};
+
+class PyFrictionSolver {
+public:
+    PyFrictionSolver(int grid_size, double domain_size, double E_star,
+                     double nu, std::shared_ptr<hmc::FrictionModel> model,
+                     bool precond)
+        : model_(std::move(model)),
+          drv_(std::make_unique<hmc::FrictionDriver>(
+              grid_size, domain_size, E_star, nu, *model_, precond)),
+          Ns_(grid_size) {}
+
+    void set_gap(const py::array_t<double, py::array::c_style |
+                                              py::array::forcecast>& g0) {
+        drv_->set_gap(to_flat(g0, static_cast<Eigen::Index>(Ns_) * Ns_));
+    }
+    void reset() { drv_->reset(); }
+
+    // Keyword-arg step: exactly one of p_bar / (q_bar or delta_t) drives the
+    // tangential problem; p_bar>0 (also) runs the normal solve.
+    PyStepResult step(double p_bar, const py::object& q_bar,
+                      const py::object& delta_t, double dt,
+                      const py::object& T, double tol_normal,
+                      double tol_tangential, int max_iter,
+                      int max_threshold_iter, double threshold_rtol) {
+        hmc::FrictionStepSpec spec;
+        spec.p_bar = p_bar;
+        spec.dt = dt;
+        spec.tol_normal = tol_normal;
+        spec.tol_tangential = tol_tangential;
+        spec.max_iter = max_iter;
+        spec.max_threshold_iter = max_threshold_iter;
+        spec.threshold_rtol = threshold_rtol;
+        auto as_vec2 = [](const py::object& o, const char* what) {
+            auto t = o.cast<std::pair<double, double>>();
+            (void)what;
+            return Eigen::Vector2d(t.first, t.second);
+        };
+        Eigen::Vector2d qb, db;
+        if (!q_bar.is_none()) {
+            spec.has_q_bar = true;
+            qb = as_vec2(q_bar, "q_bar");
+            spec.q_bar = qb;
+        }
+        if (!delta_t.is_none()) {
+            spec.has_delta_t = true;
+            db = as_vec2(delta_t, "delta_t");
+            spec.delta_t = db;
+        }
+        Eigen::VectorXd Tvec;
+        if (!T.is_none()) {
+            Tvec = to_flat(
+                T.cast<py::array_t<double, py::array::c_style |
+                                               py::array::forcecast>>(),
+                static_cast<Eigen::Index>(Ns_) * Ns_);
+            spec.T = &Tvec;
+        }
+        PyStepResult out;
+        out.Ns = Ns_;
+        out.tangential = spec.has_q_bar || spec.has_delta_t;
+        {
+            // release the GIL around the C++ solve; the UserFriction callback
+            // re-acquires it. A callback exception unwinds the transactional
+            // step and is restored here (GIL held again on scope exit).
+            py::gil_scoped_release release;
+            out.r = drv_->step(spec);
+            if (out.tangential) {
+                out.u_t = drv_->u_t();
+                out.delta_total = drv_->delta_t();
+            }
+        }
+        return out;
+    }
+
+    py::array_t<double> pressure() const { return as_flat(drv_->pressure()); }
+    py::array_t<double> q() const { return as_flat(drv_->q()); }
+    py::array_t<double> u_t() const { return as_flat(drv_->u_t()); }
+    py::array_t<double> w_acc() const { return as_flat(drv_->w_acc()); }
+    py::array_t<double> delta_t() const {
+        const Eigen::Vector2d d = drv_->delta_t();
+        py::array_t<double> a(2);
+        a.mutable_data()[0] = d(0);
+        a.mutable_data()[1] = d(1);
+        return a;
+    }
+
+private:
+    std::shared_ptr<hmc::FrictionModel> model_; // kept alive for the driver
+    std::unique_ptr<hmc::FrictionDriver> drv_;
+    int Ns_;
+};
+
+// split a stacked 2N vector's x/y halves into (Ns,Ns) grids
+py::object half_grid(const Eigen::VectorXd& v2, int Ns, bool second) {
+    const int N = Ns * Ns;
+    py::array_t<double> a({Ns, Ns});
+    std::memcpy(a.mutable_data(), v2.data() + (second ? N : 0),
+                sizeof(double) * N);
+    return a;
+}
+
 } // namespace
 
 PYBIND11_MODULE(aspher, m) {
@@ -465,4 +575,119 @@ PYBIND11_MODULE(aspher, m) {
         "derivative-free).")
         .def(py::init(&make_user_friction), py::arg("fn"),
              py::arg("velocity_dependent") = false);
+
+    py::class_<PyStepResult>(m, "FrictionStepResult")
+        .def_property_readonly("converged",
+                               [](const PyStepResult& s) { return s.r.converged; })
+        .def_property_readonly(
+            "normal_converged",
+            [](const PyStepResult& s) { return s.r.normal.converged; })
+        .def_property_readonly(
+            "mean_pressure",
+            [](const PyStepResult& s) { return s.r.normal.mean_pressure; })
+        .def_property_readonly(
+            "contact_area",
+            [](const PyStepResult& s) { return s.r.normal.contact_fraction; })
+        .def_property_readonly(
+            "approach", [](const PyStepResult& s) { return s.r.normal.approach; })
+        .def_property_readonly(
+            "dissipation", [](const PyStepResult& s) { return s.r.dissipation; })
+        .def_property_readonly(
+            "threshold_iters",
+            [](const PyStepResult& s) { return s.r.threshold_iters; })
+        .def_property_readonly(
+            "normal_iters",
+            [](const PyStepResult& s) { return s.r.normal.iterations; })
+        .def_property_readonly(
+            "tangential_iters",
+            [](const PyStepResult& s) { return s.r.tangential.iterations; })
+        .def_property_readonly(
+            "n_stick",
+            [](const PyStepResult& s) { return s.tangential ? s.r.tangential.n_stick : 0; })
+        .def_property_readonly(
+            "n_slip",
+            [](const PyStepResult& s) { return s.tangential ? s.r.tangential.n_slip : 0; })
+        .def_property_readonly(
+            "qx", [](const PyStepResult& s) -> py::object {
+                if (!s.tangential) return py::none();
+                return half_grid(s.r.tangential.q, s.Ns, false);
+            })
+        .def_property_readonly(
+            "qy", [](const PyStepResult& s) -> py::object {
+                if (!s.tangential) return py::none();
+                return half_grid(s.r.tangential.q, s.Ns, true);
+            })
+        .def_property_readonly(
+            "ux", [](const PyStepResult& s) -> py::object {
+                if (!s.tangential) return py::none();
+                return half_grid(s.u_t, s.Ns, false);
+            })
+        .def_property_readonly(
+            "uy", [](const PyStepResult& s) -> py::object {
+                if (!s.tangential) return py::none();
+                return half_grid(s.u_t, s.Ns, true);
+            })
+        .def_property_readonly(
+            "slip_x", [](const PyStepResult& s) -> py::object {
+                if (!s.tangential) return py::none();
+                return half_grid(s.r.slip_inc, s.Ns, false);
+            })
+        .def_property_readonly(
+            "slip_y", [](const PyStepResult& s) -> py::object {
+                if (!s.tangential) return py::none();
+                return half_grid(s.r.slip_inc, s.Ns, true);
+            })
+        .def_property_readonly(
+            "state", [](const PyStepResult& s) -> py::object {
+                if (!s.tangential) return py::none();
+                py::array_t<int> a({s.Ns, s.Ns});
+                for (int i = 0; i < s.Ns * s.Ns; ++i)
+                    a.mutable_data()[i] = s.r.tangential.state[i];
+                return a;
+            })
+        .def_property_readonly(
+            "q_mean", [](const PyStepResult& s) {
+                py::array_t<double> a(2);
+                a.mutable_data()[0] = s.r.tangential.q_mean(0);
+                a.mutable_data()[1] = s.r.tangential.q_mean(1);
+                return a;
+            })
+        .def_property_readonly(
+            "delta_t", [](const PyStepResult& s) {
+                py::array_t<double> a(2);
+                a.mutable_data()[0] = s.delta_total(0);
+                a.mutable_data()[1] = s.delta_total(1);
+                return a;
+            });
+
+    py::class_<PyFrictionSolver>(
+        m, "FrictionSolver",
+        "Incremental quasi-static frictional-contact driver (uncoupled "
+        "elasticity, FFT backend). Call set_gap(g0) once, then drive a load "
+        "program with step(...). History (pressure, tractions, slip) is "
+        "carried between steps; a non-converged step leaves state unchanged.")
+        .def(py::init<int, double, double, double,
+                      std::shared_ptr<hmc::FrictionModel>, bool>(),
+             py::arg("grid_size"), py::arg("domain_size") = 1.0,
+             py::arg("E_star") = 1.0, py::arg("nu") = 0.3, py::arg("model"),
+             py::arg("precond") = true, py::keep_alive<1, 6>())
+        .def("set_gap", &PyFrictionSolver::set_gap, py::arg("gap"),
+             "Set the initial gap field (flat (N,) or (Ns,Ns)); resets history.")
+        .def("step", &PyFrictionSolver::step, py::kw_only(),
+             py::arg("p_bar") = -1.0, py::arg("q_bar") = py::none(),
+             py::arg("delta_t") = py::none(), py::arg("dt") = 1.0,
+             py::arg("T") = py::none(), py::arg("tol_normal") = 1e-8,
+             py::arg("tol_tangential") = 1e-5, py::arg("max_iter") = 20000,
+             py::arg("max_threshold_iter") = 20,
+             py::arg("threshold_rtol") = 1e-3,
+             "One quasi-static load step. p_bar>0 runs the normal solve; a "
+             "tangential solve runs if q_bar (force control, (qx,qy)) or "
+             "delta_t (displacement control, rigid shift) is given (exactly "
+             "one). Targets are TOTAL loads/shifts. Returns FrictionStepResult.")
+        .def("reset", &PyFrictionSolver::reset, "Clear all history.")
+        .def_property_readonly("pressure", &PyFrictionSolver::pressure)
+        .def_property_readonly("q", &PyFrictionSolver::q)
+        .def_property_readonly("u_t", &PyFrictionSolver::u_t)
+        .def_property_readonly("w_acc", &PyFrictionSolver::w_acc)
+        .def_property_readonly("delta_t", &PyFrictionSolver::delta_t);
 }

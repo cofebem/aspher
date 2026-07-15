@@ -4,6 +4,20 @@ import numpy as np
 import aspher as hc
 
 
+def _wavy_gap(Ns, L):
+    h = L / Ns
+    ix = (np.arange(Ns) + 0.5) * h / L
+    x, y = np.meshgrid(ix, ix, indexing="ij")
+    mj = [(1, 2), (3, 1), (2, 4), (5, 3), (4, 6), (7, 2)]
+    Aj = [0.8, 0.45, 0.3, 0.18, 0.12, 0.08]
+    ph = [0.3, 1.1, 2.0, 4.2, 5.1, 0.7]
+    z = sum(A * np.cos(2 * np.pi * (mx * x + my * y) + p)
+            for (mx, my), A, p in zip(mj, Aj, ph))
+    g0 = 0.02 * z
+    g0 -= g0.min()
+    return g0.ravel()
+
+
 def test_models():
     p = np.array([1.0, 0.5, 0.0, -0.1, 2.0, 0.0])
     v = np.array([0.0, 1.0, 2.0, 3.0, 0.5, 0.0])
@@ -38,6 +52,73 @@ def test_models():
     print("test_models: OK")
 
 
+def test_solver_two_step():
+    Ns, L, E, nu, mu, p_bar = 64, 1.0, 1.0, 0.0, 0.4, 0.01
+    g0 = _wavy_gap(Ns, L)
+    fs = hc.FrictionSolver(grid_size=Ns, domain_size=L, E_star=E, nu=nu,
+                           model=hc.CoulombFriction(mu), precond=True)
+    fs.set_gap(g0)
+
+    r1 = fs.step(p_bar=p_bar)                      # normal only
+    assert r1.converged and r1.normal_converged
+    assert abs(r1.mean_pressure - p_bar) < 1e-12
+    assert r1.qx is None                           # no tangential ran
+
+    r2 = fs.step(q_bar=(0.5 * mu * p_bar, 0.0), dt=1.0)   # tangential force
+    assert r2.converged
+    assert r2.threshold_iters == 1                 # Coulomb: single pass
+    qbar = np.array([0.5 * mu * p_bar, 0.0])
+    assert np.linalg.norm(r2.q_mean - qbar) <= 1e-8 * np.linalg.norm(qbar)
+    assert r2.dissipation >= -1e-12
+    assert r2.n_slip > 0 and r2.n_stick > 0
+    assert r2.qx.shape == (Ns, Ns) and r2.qy.shape == (Ns, Ns)
+
+    # discrete-exact Ciavarella-Jager reference (nu=0): q_x = mu (p - p*)
+    S = hc.ContactSolver(grid_size=Ns, domain_size=L, E_star=E, backend="fft")
+    red = S.solve(_wavy_gap(Ns, L), p_bar - 0.5 * p_bar, tol=1e-12,
+                  max_iter=20000)
+    q_ref = mu * (np.asarray(fs.pressure) - np.asarray(red.pressure).ravel())
+    rel = np.linalg.norm(r2.qx.ravel() - q_ref) / np.linalg.norm(q_ref)
+    print(f"solver two-step: C-J rel {rel:.3e}  dissipation {r2.dissipation:.3e}")
+    assert rel < 1e-3
+
+    # displacement control + state accessors
+    r3 = fs.step(delta_t=(1e-4, 0.0), dt=1.0)
+    assert r3.converged
+    assert np.asarray(fs.delta_t).shape == (2,)
+    assert np.asarray(fs.q).shape == (2 * Ns * Ns,)
+
+    fs.reset()
+    assert float(np.asarray(fs.q).max()) == 0.0 if np.asarray(fs.q).size else True
+    print("test_solver_two_step: OK")
+
+
+def test_callback_exception_transactional():
+    # a Python callback that raises must propagate cleanly and leave the
+    # driver state unchanged (transactional step)
+    Ns, L = 32, 1.0
+    g0 = _wavy_gap(Ns, L)
+
+    def boom(p, v, T):
+        raise ValueError("user law failed")
+
+    fs = hc.FrictionSolver(grid_size=Ns, domain_size=L, nu=0.0,
+                           model=hc.UserFriction(boom, velocity_dependent=False))
+    fs.set_gap(g0)
+    fs.step(p_bar=0.01)
+    q_before = np.asarray(fs.q).copy()
+    raised = False
+    try:
+        fs.step(q_bar=(1e-3, 0.0), dt=1.0)
+    except ValueError:
+        raised = True
+    assert raised
+    assert np.array_equal(np.asarray(fs.q), q_before)   # state intact
+    print("test_callback_exception_transactional: OK")
+
+
 if __name__ == "__main__":
     test_models()
+    test_solver_two_step()
+    test_callback_exception_transactional()
     print("test_friction_py: all checks passed")
