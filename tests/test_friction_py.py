@@ -160,10 +160,34 @@ def test_nonconverged_step_transactional():
     print("test_nonconverged_step_transactional: OK")
 
 
+def test_bipotential_reference():
+    Ns, L, E, nu, mu, p_bar = 32, 1.0, 1.0, 0.3, 0.4, 3e-3
+    h = L / Ns
+    ix = (np.arange(Ns) + 0.5) * h - 0.5 * L
+    x, y = np.meshgrid(ix, ix, indexing="ij")
+    g0 = ((x * x + y * y) / (2.0 * 2.0)).ravel()      # parabolic gap, R=2
+
+    S = hc.ContactSolver(grid_size=Ns, domain_size=L, E_star=E, backend="fft")
+    nr = S.solve(g0, p_bar, tol=1e-12, max_iter=20000)
+
+    br = hc.solve_bipotential(grid_size=Ns, gap=g0, mu=mu,
+                              approach=nr.approach, delta_t=(6e-4, 2e-4),
+                              domain_size=L, E_star=E, nu=nu, tol=1e-9)
+    assert br.converged
+    relp = (np.linalg.norm(np.asarray(br.pressure).ravel() -
+                           np.asarray(nr.pressure).ravel()) /
+            np.linalg.norm(np.asarray(nr.pressure).ravel()))
+    print(f"bipotential vs normal: rel p {relp:.3e}  it {br.iterations}")
+    assert relp < 5e-3
+    assert br.n_stick > 0 and br.n_slip > 0
+    print("test_bipotential_reference: OK")
+
+
 if __name__ == "__main__":
     test_models()
     test_solver_two_step()
     test_callback_exception_transactional()
     test_model_none_rejected()
     test_nonconverged_step_transactional()
+    test_bipotential_reference()
     print("test_friction_py: all checks passed")

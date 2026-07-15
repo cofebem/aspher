@@ -3,7 +3,9 @@
 #include <pybind11/eigen.h>
 #include <pybind11/pybind11.h>
 
+#include "bipotential.hpp"
 #include "boussinesq_kernel.hpp"
+#include "cerruti_kernel.hpp"
 #include "cluster_tree.hpp"
 #include "contact_solver.hpp"
 #include "fft_operator.hpp"
@@ -13,6 +15,7 @@
 #include "h2_operator.hpp"
 #include "hmatrix.hpp"
 #include "nested_solve.hpp"
+#include "tangential_operator.hpp"
 
 #include <cstring>
 #include <memory>
@@ -437,6 +440,53 @@ py::object half_grid(const Eigen::VectorXd& v2, int Ns, bool second) {
     return a;
 }
 
+struct PyBipotResult {
+    hmc::BipotentialResult r;
+    int Ns = 0;
+};
+
+PyBipotResult py_solve_bipotential(
+    int grid_size, const py::array_t<double, py::array::c_style |
+                                                py::array::forcecast>& gap,
+    double mu, double approach, std::pair<double, double> delta_t,
+    double domain_size, double E_star, double nu, double tol, int max_iter,
+    double rho_scale, const py::object& s_frozen, int npower) {
+    const Eigen::Index N = static_cast<Eigen::Index>(grid_size) * grid_size;
+    Eigen::VectorXd g0 = to_flat(gap, N);
+    auto BK = std::make_shared<hmc::BoussinesqKernel>(grid_size, domain_size,
+                                                      E_star);
+    auto S = std::make_shared<hmc::FFTOperator>(*BK);
+    S->build();
+    auto CK = std::make_shared<hmc::CerrutiKernel>(grid_size, domain_size,
+                                                   E_star, nu);
+    auto C = std::make_shared<hmc::TangentialFFTOperator>(*CK);
+    C->build();
+    auto Sinto = [S](const Eigen::VectorXd& x, Eigen::VectorXd& y) {
+        y = S->matvec(x);
+    };
+    auto Cinto = [C](const Eigen::VectorXd& x, Eigen::VectorXd& y) {
+        C->matvec_into(x, y);
+    };
+    Eigen::VectorXd sf;
+    const Eigen::VectorXd* sfp = nullptr;
+    if (!s_frozen.is_none()) {
+        sf = to_flat(s_frozen.cast<py::array_t<double, py::array::c_style |
+                                                          py::array::forcecast>>(),
+                     N);
+        sfp = &sf;
+    }
+    PyBipotResult out;
+    out.Ns = grid_size;
+    {
+        py::gil_scoped_release release;
+        out.r = hmc::solve_bipotential(
+            Sinto, Cinto, g0, mu, approach,
+            Eigen::Vector2d(delta_t.first, delta_t.second), tol, max_iter,
+            rho_scale, sfp, npower);
+    }
+    return out;
+}
+
 } // namespace
 
 PYBIND11_MODULE(aspher, m) {
@@ -541,6 +591,35 @@ PYBIND11_MODULE(aspher, m) {
           "active_delta*scale) through the masked H2 matvec, with per-round "
           "full-grid verification and a full-solve fallback after "
           "active_max_rounds (see .active_rounds/.active_fallback).");
+
+    py::class_<PyBipotResult>(m, "BipotentialResult")
+        .def_property_readonly(
+            "pressure", [](const PyBipotResult& s) { return as_grid(s.r.p, s.Ns); })
+        .def_property_readonly(
+            "qx", [](const PyBipotResult& s) { return half_grid(s.r.q, s.Ns, false); })
+        .def_property_readonly(
+            "qy", [](const PyBipotResult& s) { return half_grid(s.r.q, s.Ns, true); })
+        .def_property_readonly("error", [](const PyBipotResult& s) { return s.r.error; })
+        .def_property_readonly(
+            "iterations", [](const PyBipotResult& s) { return s.r.iterations; })
+        .def_property_readonly(
+            "converged", [](const PyBipotResult& s) { return s.r.converged; })
+        .def_property_readonly("n_open", [](const PyBipotResult& s) { return s.r.n_open; })
+        .def_property_readonly("n_stick", [](const PyBipotResult& s) { return s.r.n_stick; })
+        .def_property_readonly("n_slip", [](const PyBipotResult& s) { return s.r.n_slip; });
+
+    m.def("solve_bipotential", &py_solve_bipotential, py::arg("grid_size"),
+          py::arg("gap"), py::arg("mu"), py::arg("approach"),
+          py::arg("delta_t"), py::arg("domain_size") = 1.0,
+          py::arg("E_star") = 1.0, py::arg("nu") = 0.3, py::arg("tol") = 1e-8,
+          py::arg("max_iter") = 200000, py::arg("rho_scale") = 1.0,
+          py::arg("s_frozen") = py::none(), py::arg("npower") = 20,
+          "de Saxce-Feng bipotential Uzawa REFERENCE solver (displacement "
+          "controlled: imposed approach + rigid shift delta_t). First-order, "
+          "SLOW (hundreds-thousands of sweeps) -- a cross-check of the "
+          "production FrictionSolver, not for production use. s_frozen (N,) "
+          "supplies a fixed threshold (Tresca / generic); omit for Coulomb "
+          "(threshold mu*p from the coupled solve). Returns BipotentialResult.");
 
     py::class_<hmc::FrictionModel, std::shared_ptr<hmc::FrictionModel>>(
         m, "FrictionModel",
