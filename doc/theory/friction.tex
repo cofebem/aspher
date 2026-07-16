@@ -1,0 +1,1340 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{amsmath,amsthm,amssymb}
+\usepackage{booktabs}
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+\usepackage{geometry}
+\geometry{margin=2.5cm}
+\usepackage{microtype}
+
+% ---------- theorem environments ----------
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{example}[theorem]{Example}
+
+% ---------- notation macros ----------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\bq}{\mathbf{q}}
+\newcommand{\bp}{\mathbf{p}}
+\newcommand{\bu}{\mathbf{u}}
+\newcommand{\bw}{\mathbf{w}}
+\newcommand{\bg}{\mathbf{g}}
+\newcommand{\bt}{\mathbf{t}}
+\newcommand{\bz}{\mathbf{z}}
+\newcommand{\bs}{\mathbf{s}}
+\newcommand{\bk}{\mathbf{k}}
+\newcommand{\bC}{\mathbf{C}}
+\newcommand{\bS}{\mathbf{S}}
+\newcommand{\bK}{\mathbf{K}}
+\newcommand{\bM}{\mathbf{M}}
+\newcommand{\bI}{\mathbf{I}}
+\newcommand{\bF}{\mathbf{F}}
+\newcommand{\bdelta}{\boldsymbol{\delta}}
+\newcommand{\btau}{\boldsymbol{\tau}}
+\newcommand{\bzero}{\mathbf{0}}
+\newcommand{\khat}{\hat{\bk}}
+\newcommand{\qhat}{\hat{\bq}}
+\newcommand{\norm}[1]{\|#1\|}
+\newcommand{\abs}[1]{\lvert#1\rvert}
+\newcommand{\tr}{\top}
+\newcommand{\Estar}{E^{*}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+% ---------- algorithm2e style ----------
+\SetAlgoLined
+\DontPrintSemicolon
+\SetKwComment{Comment}{// }{}
+
+% =========================================================
+\begin{document}
+
+\title{\textbf{Frictional Contact on the Elastic Half-Space}\\[0.5em]
+       \large Tangential Kernels, the Incremental Stick--Slip Problem,\\
+       Projected Conjugate Gradients, and the Bipotential Reference Solver}
+\author{ASPHER project (formerly Hcontact) --- technical reference}
+\date{July 2026}
+\maketitle
+
+\begin{abstract}
+\noindent
+This note documents the frictional (tangential) contact capability of the
+ASPHER boundary-element contact solver. It is written to be readable by
+someone new to computational contact mechanics: every object is introduced
+from its physical meaning, small worked examples with numbers accompany the
+key ideas, and the algorithms are stated exactly as implemented (file names
+are given in the margin of the text as \code{typewriter} references). The
+frictionless normal problem and its Polonsky--Keer projected conjugate
+gradient (CG) solver are documented in the companion note \code{pcg.tex};
+the fast operators (H$^2$/FMM, FFT convolution) in
+\code{h2\_fmm\_detailed.tex}. Here we cover: the Cerruti tangential
+elasticity kernels and their element integrals
+(\S\ref{sec:cerruti}), friction laws and the threshold field
+(\S\ref{sec:laws}), the quasi-static incremental stick--slip problem and its
+formulation as a convex quadratic program (\S\ref{sec:incremental}), the
+production solver --- a vector projected CG with a two-metric projection,
+spectral preconditioning, and an outer Newton iteration for force control
+(\S\ref{sec:solver}), the incremental driver with history and dissipation
+tracking (\S\ref{sec:driver}), the de~Saxc\'e--Feng bipotential Uzawa
+reference solver (\S\ref{sec:uzawa}), and the analytical benchmarks
+(Cattaneo--Mindlin, Mindlin stiffness, Ciavarella--J\"ager) used as
+validation gates (\S\ref{sec:benchmarks}).
+\end{abstract}
+
+\tableofcontents
+
+% ---------------------------------------------------------
+\section{Introduction: What Friction Adds to Contact}
+\label{sec:intro}
+
+\subsection{A tabletop experiment}
+
+Press your hand flat on a table and push it sideways, gently at first. Two
+things happen in sequence. While the push is small, the hand does not move:
+the interface transmits a \emph{shear traction} (a tangential force per unit
+area) that exactly balances your push. This is \emph{stick}. Increase the
+push and at some point the hand starts to slide: the interface cannot
+transmit more shear than a threshold, and beyond it the surfaces move
+relative to each other. This is \emph{slip}. The classical
+\emph{Coulomb law} says the threshold is proportional to how hard the
+surfaces are pressed together: slip starts when the shear traction $q$
+reaches $\mu p$, where $p$ is the local contact pressure and $\mu$ is the
+friction coefficient (typically $0.1$--$1$ for dry engineering surfaces).
+
+The interesting --- and mathematically rich --- regime is the one in
+between, called \emph{partial slip}: because elastic bodies deform, some
+parts of a contact patch can slip while others still stick. Press a rubber
+eraser on paper and twist or push it slightly: the edge of the contact
+slips (you may see wear marks) while the centre remains stuck. Partial slip
+is not a curiosity; it governs fretting fatigue, the damping of bolted
+joints, the stiffness of wheel--rail and tyre--road contacts, and the
+nucleation of earthquakes on faults.
+
+Two consequences of the threshold behaviour drive the entire structure of
+this document:
+
+\begin{enumerate}
+\item \textbf{History dependence.} Where slip has occurred, the interface
+  ``remembers'' it: shear tractions do not return to zero when the load is
+  removed (they become \emph{locked in}). The state of the interface depends
+  on the whole loading \emph{path}, not just the current load. Hence we must
+  solve a \emph{sequence of load increments}, carrying state from step to
+  step (\S\ref{sec:driver}).
+\item \textbf{Dissipation.} Slip against friction converts mechanical work
+  into heat. Every load increment must dissipate a non-negative energy
+  $D \ge 0$; this is both a physical statement (second law) and a sharp
+  correctness test for the solver (\S\ref{sec:dissipation}).
+\end{enumerate}
+
+\subsection{From the frictionless to the frictional problem}
+
+The frictionless solver (see \code{pcg.tex}) finds the contact pressure
+$p(x,y) \ge 0$ between a rigid rough surface and an elastic half-space,
+using the Boussinesq relation ``pressure $\to$ normal surface displacement''
+and a projected CG. The frictional extension adds the tangential direction:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+ & normal (existing) & tangential (new) \\
+\midrule
+traction unknown       & $p$ (scalar, $\ge 0$)  & $\bq = (q_x, q_y)$ (2-vector, $\abs{\bq} \le s$) \\
+surface displacement   & $u_z = \bS p$            & $\bu_t = (u_x,u_y) = \bC \bq$ \\
+rigid-body unknown     & approach $\alpha$        & tangential shift $\bdelta_t = (\delta_x,\delta_y)$ \\
+elastic kernel         & Boussinesq/Love          & Cerruti (\S\ref{sec:cerruti}) \\
+inequality law         & no adhesion, no overlap  & stick--slip friction (\S\ref{sec:laws}) \\
+constraint on unknown  & $p_i \ge 0$              & $\abs{\bq_i} \le s_i$ (disk) \\
+solver                 & scalar projected CG      & vector projected CG (\S\ref{sec:solver}) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The structure is deliberately parallel: the tangential problem is again a
+convex quadratic program (QP) with simple per-point constraints, solved by
+the same family of projected CG methods, accelerated by the same kind of
+FFT spectral preconditioner, on the same fast operators (FFT convolution or
+H$^2$/FMM).
+
+\subsection{Scope and assumptions (v1)}
+\label{sec:scope}
+
+\begin{itemize}
+\item \textbf{Uncoupled elasticity.} For contact between \emph{similar}
+  materials (equal elastic constants, or the special combinations with
+  Dundurs' $\beta = 0$), pressure produces no tangential surface
+  displacement and shear produces no normal displacement. The normal and
+  tangential elastic problems then decouple: $u_z = \bS p$ and
+  $\bu_t = \bC \bq$ with no cross terms. ASPHER v1 assumes this; the
+  coupled (dissimilar-material) case is a documented follow-up, for which
+  the bipotential solver of \S\ref{sec:uzawa} is the designated strategy.
+  The friction \emph{law} still couples the two problems one way: the
+  slip threshold depends on $p$.
+\item \textbf{Quasi-static, small displacements.} Loads change slowly
+  (no inertia); the contact geometry is not advected by the tangential
+  shift (the gap field is fixed within a step). Time enters only through
+  the slip \emph{velocity} in rate-dependent friction laws, via the step
+  duration $\Delta t$.
+\item \textbf{Rigid rough counterpart.} As in the normal problem, one body
+  is rigid and rough, the other is an elastic half-space with effective
+  modulus $\Estar$ and Poisson ratio $\nu$; the roughness enters through
+  the initial gap field $g_0(x,y)$.
+\end{itemize}
+
+\subsection{Notation}
+
+Discretisation: an $N_s \times N_s$ uniform grid of square elements of side
+$h = L/N_s$, $N = N_s^2$ points. Per-point 2-vectors are written in bold
+with a subscript $i$: $\bq_i = (q_{x,i}, q_{y,i})$. The full tangential
+traction vector is stored \emph{stacked},
+$\bq = [\,q_x\,;\,q_y\,] \in \R^{2N}$ (all $x$-components first). The
+tangential influence operator $\bC \in \R^{2N \times 2N}$ is symmetric
+positive definite (SPD) with $2 \times 2$ block structure
+$\bigl(\begin{smallmatrix} \bC_{xx} & \bC_{xy} \\ \bC_{xy} & \bC_{yy}
+\end{smallmatrix}\bigr)$. $\qhat_i = \bq_i / \abs{\bq_i}$ is the unit vector
+along $\bq_i$. Superscript $n$ marks the previous accepted load step;
+$\Delta(\cdot)$ is the increment over the current step. $G$ is the shear
+modulus, related to the effective modulus by $\Estar (1-\nu) = 2G$ for the
+rigid--elastic pair (used repeatedly below).
+
+% ---------------------------------------------------------
+\section{Tangential Elasticity: the Cerruti Kernels}
+\label{sec:cerruti}
+
+\subsection{Reminder: the normal (Boussinesq--Love) problem}
+
+The half-space is the standard idealisation for contact: when the contact
+patch is small compared to the bodies, each body responds as if it were an
+elastic solid filling a half of space, loaded on its flat boundary. For a
+point force $P$ pressing \emph{normally} on the surface at the origin,
+Boussinesq's solution gives the normal displacement of the surface at
+distance $\rho$:
+\begin{equation}
+  u_z(\rho) = \frac{P}{\pi \Estar \rho}.
+\end{equation}
+Superposition over a distributed pressure $p(x',y')$ turns this into a
+convolution, $u_z = \bS p$; integrating the $1/\rho$ kernel exactly over
+each square element gives Love's closed form and the discrete influence
+matrix used by ASPHER (see \code{pcg.tex} \S6 and
+\code{boussinesq\_kernel.cpp}).
+
+\subsection{Cerruti's point-force solution}
+
+Cerruti~\cite{Cerruti1882} solved the companion problem: a point force $Q_x$
+applied \emph{tangentially} to the surface (along $x$). On the surface
+($z=0$), at position $(x,y)$ with $\rho = \sqrt{x^2 + y^2}$, the tangential
+surface displacements are
+\begin{equation}
+  u_x = \frac{Q_x}{2\pi G}\left[ \frac{1-\nu}{\rho}
+        + \nu\,\frac{x^2}{\rho^3} \right],
+  \qquad
+  u_y = \frac{Q_x}{2\pi G}\; \nu\,\frac{x y}{\rho^3}.
+  \label{eq:cerruti-point}
+\end{equation}
+Three features deserve attention before any algebra:
+\begin{itemize}
+\item Like Boussinesq's, the kernel decays as $1/\rho$ --- the tangential
+  problem has exactly the same long-range character, so all the fast-operator
+  machinery (H-matrices, FMM, FFT) applies unchanged.
+\item Unlike the normal case, the response is \emph{anisotropic}: the
+  displacement along the force ($u_x$) differs from the transverse response,
+  and a force along $x$ produces a (smaller, $\propto \nu$) displacement
+  along $y$. The influence operator is therefore a $2\times2$ tensor.
+\item At $\nu = 0$ the coupling term vanishes and
+  $u_x = Q_x/(2\pi G \rho)$: the tangential problem becomes two independent
+  copies of the normal problem up to a constant factor. This limit is the
+  key to the sharpest validation tests (\S\ref{sec:cj}).
+\end{itemize}
+The prefactor identity used throughout the code is worth one line: with
+$\Estar = E/(1-\nu^2)$ (rigid counterpart) and $2G = E/(1+\nu)$,
+\begin{equation}
+  \Estar(1-\nu) = \frac{E(1-\nu)}{1-\nu^2} = \frac{E}{1+\nu} = 2G
+  \qquad\Longrightarrow\qquad
+  \frac{1}{2\pi G} = \frac{1}{\pi \Estar (1-\nu)} .
+  \label{eq:prefactor}
+\end{equation}
+
+\subsection{Element-integrated kernels (Pohrt--Li closed forms)}
+\label{sec:element}
+
+As in the normal problem, we do not use the singular point kernel directly:
+each element carries a \emph{uniform} traction, and the influence
+coefficient is the exact integral of \eqref{eq:cerruti-point} over the
+source rectangle $[-a,a]\times[-b,b]$. Closed forms are taken from
+Pohrt \& Li~\cite{PohrtLi2014} (with Dydo \& Busby~\cite{DydoBusby1995} as
+an independent source). Introduce the corner shorthands
+\begin{equation}
+  k = \abs{x}+a,\quad l = \abs{x}-a,\quad m = \abs{y}+b,\quad n = \abs{y}-b,
+  \qquad R(u,v) = \sqrt{u^2+v^2},
+\end{equation}
+and the two ``log brackets''
+\begin{align}
+  X_{\log} &= k \ln\!\frac{m + R(k,m)}{n + R(k,n)}
+            + l \ln\!\frac{n + R(l,n)}{m + R(l,m)}, \\
+  Y_{\log} &= m \ln\!\frac{k + R(k,m)}{l + R(l,m)}
+            + n \ln\!\frac{l + R(l,n)}{k + R(k,n)}.
+\end{align}
+Then the three rectangle integrals of the point-kernel ingredients are
+\begin{equation}
+  \int\!\!\int \frac{dA'}{\rho} = X_{\log} + Y_{\log}
+  \quad\text{(this is Love's normal bracket)},\qquad
+  \int\!\!\int \frac{(x-x')^2}{\rho^3}\, dA' = Y_{\log},
+\end{equation}
+\begin{equation}
+  \int\!\!\int \frac{(x-x')(y-y')}{\rho^3}\, dA'
+  = R(k,n) - R(k,m) + R(l,m) - R(l,n).
+\end{equation}
+Combining with \eqref{eq:cerruti-point}, the element-integrated tangential
+displacements due to unit $q_x$ on the rectangle are
+\begin{equation}
+  \boxed{\;
+  u_x = \frac{(1-\nu)\,X_{\log} + Y_{\log}}{2\pi G},
+  \qquad
+  u_y = \frac{\nu}{2\pi G}
+        \bigl[ R(k,n) - R(k,m) + R(l,m) - R(l,n) \bigr].
+  \;}
+  \label{eq:element}
+\end{equation}
+(The $u_x$ bracket is $(1-\nu)(X_{\log}+Y_{\log}) + \nu\,Y_{\log}
+= (1-\nu)X_{\log} + Y_{\log}$.) These are \code{cerruti\_uxx} and
+\code{cerruti\_uxy} in \code{cerruti\_kernel.cpp}. Loading along $y$ follows
+by the $x \leftrightarrow y$ symmetry.
+
+\begin{remark}[A typo in the literature, and why we verify]
+Equation (18) of \cite{PohrtLi2014} as printed carries spurious $h^2$
+factors, dimensionally inconsistent with their own eq.~(13). The corner form
+in \eqref{eq:element} is the correct rectangle integral of
+$x'y'/\rho^3$; it was verified against adaptive $64^2$-point Gauss--Legendre
+quadrature of the point kernel (relative error $< 10^{-9}$ on all sampled
+offsets, including self-terms; test \code{test\_cerruti}) and against an
+independent thesis derivation (Duquesne 2025, Annexe~G, in the project's
+reference collection \code{REF/Tangential/}), whose corner primitives reduce
+to \eqref{eq:element} exactly. The lesson generalises: \emph{never} transcribe
+closed-form kernels from a paper without an independent numerical
+cross-check.
+\end{remark}
+
+\begin{example}[The self-term, and the Mindlin compliance ratio]
+\label{ex:selfterm}
+Evaluate \eqref{eq:element} at the centre of the loaded square element
+($x=y=0$, $a=b=h/2$). Then $k=m=a$, $l=n=-a$, all four $R$'s equal
+$a\sqrt2$, and both log brackets collapse to
+$X_{\log} = Y_{\log} = 4a \ln(1+\sqrt2)$, giving
+\begin{equation}
+  u_x^{\text{self}} = \frac{(2-\nu)\, 2h \ln(1+\sqrt2)}{2\pi G},
+  \qquad u_y^{\text{self}} = 0 .
+\end{equation}
+Compare the normal self-term $u_z^{\text{self}} = 4h\ln(1+\sqrt2)/(\pi\Estar)$:
+using \eqref{eq:prefactor},
+\begin{equation}
+  \frac{u_x^{\text{self}}}{u_z^{\text{self}}}
+  = \frac{2-\nu}{2(1-\nu)}
+  \;\approx\; 1.21 \quad (\nu = 0.3).
+\end{equation}
+The surface is about 20\% \emph{more} compliant tangentially than normally
+--- precisely Mindlin's classical ratio of tangential to normal contact
+compliance~\cite{Mindlin1949,Johnson1985}. A one-element sanity check thus
+already reproduces a landmark result of contact mechanics.
+\end{example}
+
+\subsection{Symmetries, storage, and the discrete operator}
+\label{sec:symmetries}
+
+On the uniform grid the influence coefficients depend only on the offset
+$(\Delta_x, \Delta_y)$ between target and source elements (translation
+invariance), so each of the three components is an $N_s\times N_s$ lookup
+table, as for Love. Parities cut storage further
+(\code{CerrutiKernel}):
+\begin{itemize}
+\item $K_{xx}(\Delta_x,\Delta_y)$ is even in both arguments;
+\item $K_{yy}(\Delta_x,\Delta_y) = K_{xx}(\Delta_y,\Delta_x)$ (the
+  $x\leftrightarrow y$ transpose --- not stored);
+\item $K_{xy}$ is odd in $\Delta_x$ and odd in $\Delta_y$ (stored for
+  non-negative offsets; signs restored at lookup; exactly zero on the axes,
+  which the lookup guards explicitly).
+\end{itemize}
+The dense operator (used only for testing) is the $2N\times2N$ SPD matrix
+with blocks $[\,\bC_{xx}, \bC_{xy}; \bC_{xy}, \bC_{yy}\,]$ acting on the
+stacked $[\,q_x; q_y\,]$ layout.
+
+\subsection{The Fourier symbol}
+\label{sec:symbol}
+
+For periodic or whole-plane problems, convolution operators are diagonal in
+Fourier space; the ``symbol'' (the Fourier multiplier) is the single most
+useful analytical object we have --- it drives the preconditioner
+(\S\ref{sec:precond}), validates the tables, and estimates operator norms
+(\S\ref{sec:uzawa}). The 2-D surface Fourier transforms of the point-kernel
+ingredients are
+\begin{equation}
+  \widehat{\left(\tfrac1\rho\right)} = \frac{2\pi}{\abs\bk},\qquad
+  \widehat{\left(\tfrac{x^2}{\rho^3}\right)} = \frac{2\pi k_y^2}{\abs\bk^3},\qquad
+  \widehat{\left(\tfrac{xy}{\rho^3}\right)} = -\frac{2\pi k_x k_y}{\abs\bk^3},
+\end{equation}
+which assemble into the $2\times2$ matrix symbol of $\bC$
+(\code{CerrutiKernel::symbol}):
+\begin{equation}
+  \boxed{\;
+  \widehat\bC(\bk) = \frac{2}{\Estar (1-\nu)\,\abs\bk}
+  \left[ \bI - \nu\, \khat\,\khat^{\tr} \right],
+  \qquad \khat = \bk/\abs\bk .
+  \;}
+  \label{eq:symbol}
+\end{equation}
+Its eigenvectors are the directions along and transverse to the wave vector:
+\begin{equation}
+  \widehat\bC\,\khat = \underbrace{\frac{2}{\Estar \abs\bk}}_{\text{longitudinal}} \khat,
+  \qquad
+  \widehat\bC\,\khat^{\perp} = \underbrace{\frac{2}{\Estar (1-\nu)\abs\bk}}_{\text{transverse}} \khat^{\perp}.
+\end{equation}
+The longitudinal eigenvalue equals \emph{exactly} the Love symbol
+$2/(\Estar\abs\bk)$ of the normal operator --- a strong internal consistency
+check tying the tangential constants to the long-validated normal path, and
+the identity that makes the $\nu = 0$ limit collapse onto the normal
+problem. The discrete tables reproduce \eqref{eq:symbol} to the same
+truncation accuracy as the Love table reproduces its symbol
+(\code{test\_cerruti}: diagonal modes to $0.6$--$1.2\%$, dominated by the
+finite-table truncation, not by the closed forms).
+
+\subsection{Fast operators: FFT convolution and H$^2$/FMM}
+\label{sec:operators}
+
+Both production operators from the normal problem carry over
+(\code{tangential\_operator.cpp}); the dense matrix exists for tests only.
+
+\paragraph{FFT convolution (\code{TangentialFFTOperator}).}
+The same zero-padded (Hockney) scheme as the scalar \code{FFTOperator}:
+the three kernel tables are embedded in wrap-around order on the padded
+$(2N_s)^2$ grid and transformed once at build. A useful subtlety: although
+$K_{xy}$ is odd in each axis separately, all three tables are even under
+\emph{joint} negation $(\Delta_x,\Delta_y) \to (-\Delta_x,-\Delta_y)$, so
+all three spectra are \emph{real} (matching the real continuum symbol
+\eqref{eq:symbol}; asserted at build). One matvec is then: two zero-pad
+scatters $\to$ two forward FFTs $\to$ an all-real per-mode $2\times2$ mix
+\begin{equation}
+  \widehat u_x = \widehat K_{xx} \widehat q_x + \widehat K_{xy} \widehat q_y,
+  \qquad
+  \widehat u_y = \widehat K_{xy} \widehat q_x + \widehat K_{yy} \widehat q_y,
+\end{equation}
+$\to$ two inverse FFTs $\to$ two gathers. This operator is \emph{exact}
+(matches the dense matvec to $2.9\times10^{-16}$ relative $L_2$;
+\code{test\_tangential}) and is what the production driver uses.
+
+\paragraph{H$^2$/FMM (\code{TangentialH2Operator}).}
+Three scalar \code{H2Operator} instances (xx, yy, xy) built through the
+kernel-functor constructor --- the far field interpolates the smooth
+off-origin Cerruti kernels with Chebyshev polynomials exactly as it does
+Love. A blocked matvec costs four scalar applies
+($u_x = \bC_{xx} q_x + \bC_{xy} q_y$, etc.). Accuracy mirrors the normal
+path: relative $L_2$ vs dense $1.7\times10^{-4}$ at Chebyshev order $q{=}4$,
+$7.0\times10^{-6}$ at $q{=}6$. Preferred at very large $N_s$ (O($N$) memory).
+
+% ---------------------------------------------------------
+\section{Friction Laws and the Threshold Field}
+\label{sec:laws}
+
+\subsection{The threshold abstraction}
+
+All friction laws in ASPHER reduce to one object: a per-point scalar
+\emph{threshold field} $s_i \ge 0$, the largest shear traction magnitude
+point $i$ can sustain,
+\begin{equation}
+  s_i = \tau_c\!\left(p_i,\; \abs{\dot\bw_i},\; T_i\right),
+\end{equation}
+which may depend on the local pressure $p_i$, the slip velocity magnitude
+$\abs{\dot\bw_i}$, and a temperature (or any auxiliary) field $T_i$. The
+implemented models (\code{friction\_model.hpp}) are:
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+model & threshold & typical use \\
+\midrule
+Tresca & $s_i = \tau_c$ where $p_i > 0$, else $0$ &
+  analysis, limits, plasticity-like interfaces \\
+Coulomb & $s_i = \mu \max(p_i, 0)$ &
+  the standard dry-friction law \\
+generic callback & $s_i = \tau_c(p_i, v_i, T_i)$, user function &
+  rate-and-state-like, thermal weakening, \dots \\
+\bottomrule
+\end{tabular}
+\end{center}
+Two contractual properties are enforced no matter what the user law
+returns: $s_i \ge 0$ everywhere, and $s_i = 0$ wherever $p_i \le 0$ (no
+shear transmission without contact --- an open point cannot carry
+traction). The callback wrapper sanitises its output accordingly (clamps
+negatives and NaNs to zero, zeroes non-contact points, size-checks), so no
+user law can hand the solver an inadmissible threshold field.
+
+\subsection{Cone and disk}
+\label{sec:cone}
+
+Geometrically, the Coulomb law confines the full traction vector
+$(q_x, q_y, p)$ at each point to the convex \emph{friction cone}
+\begin{equation}
+  K_\mu = \left\{ (\bq_t, p) : \abs{\bq_t} \le \mu\, p \right\},
+\end{equation}
+a cone in 3-D traction space with its axis along $p$ and half-opening
+$\arctan\mu$. The production solver (\S\ref{sec:solver}) is
+\emph{staggered}: it solves the normal problem first, freezes $p$, and then
+solves the tangential problem. With $p_i$ (hence $s_i$) frozen, the cone
+constraint at each point becomes a horizontal slice --- a \emph{disk}
+$\abs{\bq_i} \le s_i$ in the $(q_x,q_y)$ plane. Disks are the tangential
+analogue of the normal problem's half-line $p_i \ge 0$, and ``project onto
+the disk'' (radially rescale a too-long vector back to length $s_i$)
+replaces ``clamp negative pressures to zero''. The bipotential solver
+(\S\ref{sec:uzawa}) instead works with the full cone directly and never
+staggers.
+
+Within one increment, Coulomb with frozen $p$ \emph{is} a Tresca problem
+with spatially varying threshold. The genuinely Coulomb-specific coupling
+(slip threshold changing as $p$ changes) re-enters across load steps
+through the driver.
+
+% ---------------------------------------------------------
+\section{The Quasi-Static Incremental Problem}
+\label{sec:incremental}
+
+\subsection{Kinematics and sign conventions}
+\label{sec:kinematics}
+
+Let $\bdelta_t$ be the rigid tangential shift of the (rigid) counterpart and
+$\bu_{t,i} = (\bC\bq)_i$ the elastic tangential displacement of surface
+point $i$. The \emph{local slip} of the counterpart relative to the surface
+point is
+\begin{equation}
+  \bw_i = \bdelta_t - (\bC \bq)_i .
+  \label{eq:slip}
+\end{equation}
+Sign convention (the single most error-prone spot in any friction code; it
+is fixed here once and used consistently, including in the bipotential sign
+map of \S\ref{sec:uzawa}): $\bq_i$ is the traction exerted \emph{on the
+half-space}. Friction \emph{drags the surface along with the slipping
+counterpart}, so during slip the traction is parallel to the slip,
+$\bq_i \parallel +\bw_i$ (and the reaction on the counterpart opposes its
+motion, as intuition demands).
+
+The friction law, per point, on the total traction:
+\begin{equation}
+  \underbrace{\abs{\bq_i} < s_i \;\Rightarrow\; \dot\bw_i = \bzero}_{\text{stick}},
+  \qquad
+  \underbrace{\abs{\bq_i} = s_i \;\text{and}\; \dot\bw_i = \lambda_i \qhat_i,\ \lambda_i \ge 0}_{\text{slip}},
+  \qquad
+  \underbrace{p_i = 0 \;\Rightarrow\; s_i = 0 \;\Rightarrow\; \bq_i = \bzero}_{\text{open}}.
+  \label{eq:law}
+\end{equation}
+Quasi-statics has no natural time scale, so ``rates'' are discretised by
+backward Euler over a load step $n \to n{+}1$ of duration $\Delta t$: the
+\emph{slip increment} is
+\begin{equation}
+  \Delta\bw_i = \Delta\bdelta_t - \bigl(\bC\,(\bq - \bq^n)\bigr)_i,
+  \qquad \text{slip velocity } \abs{\Delta\bw_i}/\Delta t .
+  \label{eq:slipinc}
+\end{equation}
+$\Delta t$ matters only for velocity-dependent laws; for Tresca/Coulomb the
+steps are pure sequence, no clock.
+
+\subsection{Warm-up: a one-point toy problem}
+\label{sec:toy1}
+
+Strip the problem to one point and one direction: a single ``elastic
+asperity'' of stiffness $k$ (traction per unit displacement, standing in for
+$\bC^{-1}$), threshold $s$, dragged by a base shift $\delta$. The traction
+is $q = k(\delta - w)$ where $w$ is accumulated slip. Start from rest and
+increase~$\delta$:
+\begin{equation}
+  q(\delta) = \min(k\delta,\, s), \qquad
+  w(\delta) = \max\!\left(0,\ \delta - s/k\right).
+\end{equation}
+The point sticks until $\delta = s/k$, then slips with constant traction.
+Now reverse the shift after loading to $\delta_{\max} > s/k$. The point
+first re-sticks (elastic unloading, $q = s - k(\delta_{\max}-\delta)$) and
+only re-slips backwards when $q$ reaches $-s$, i.e.\ after a reversal of
+$2s/k$ --- \emph{twice} the forward stick range. Three lessons scale up
+unchanged to the full field problem:
+\begin{enumerate}
+\item \textbf{Hysteresis}: the $(\delta, q)$ curve on unloading is not the
+  loading curve reversed; the enclosed loop area is dissipated energy.
+\item \textbf{Locked-in traction}: choose $k = 1$, $s = 1$, load to
+  $\delta = 2$ ($q = 1$, $w = 1$), then unload to $\delta = 1$: the point
+  sticks the whole way back and ends with $q = 0$ but $w = 1$ ---
+  \emph{zero traction, non-zero permanent slip}. Unloading to $\delta = 0$
+  ends with $q = -1$: a locked-in \emph{negative} traction at zero applied
+  shift. The interface state cannot be reconstructed from the current load.
+\item \textbf{Path dependence has structure}: for \emph{monotonic}
+  proportional loading the response is history-free (this is what makes the
+  Ciavarella--J\"ager superposition of \S\ref{sec:cj} possible); history
+  effects appear on unloading and reloading.
+\end{enumerate}
+
+\subsection{The incremental quadratic program}
+\label{sec:qp}
+
+For a \emph{frozen} threshold field $s$ (one Tresca-like pass; the
+velocity-dependent outer loop is \S\ref{sec:threshold-loop}), the load
+step's tangential problem is the convex QP
+\begin{equation}
+  \boxed{\;
+  \min_{\bq}\ J(\bq) = \tfrac12\,(\bq - \bq^n)^\tr \bC\, (\bq - \bq^n)
+                       \;-\; \Delta\bdelta_t \cdot \sum_i \bq_i
+  \qquad \text{s.t.}\quad \abs{\bq_i} \le s_i \ \ \forall i .
+  \;}
+  \label{eq:qp}
+\end{equation}
+Under \textbf{displacement control} $\Delta\bdelta_t$ is prescribed. Under
+\textbf{force control} $\Delta\bdelta_t$ is unknown and the mean traction is
+constrained instead, $\frac1N \sum_i \bq_i = \bar\bq$ (equivalently, the
+total tangential force $Q = h^2 \sum_i \bq_i = L^2 \bar\bq$); $\bdelta_t$
+then plays the role of the Lagrange multiplier of the load constraint,
+exactly as the rigid approach $\alpha$ does in the normal problem.
+
+Where does \eqref{eq:qp} come from? It is the standard incremental
+variational statement for this class of dissipative laws: the first
+(elastic) term is the energy of the traction \emph{increment}, and the
+constraint set encodes the maximal admissible traction. One does not need
+that pedigree to use it, though, because its optimality conditions can be
+checked directly against the friction law --- which we now do, since it is
+also exactly how the solver's convergence metric is built.
+
+\subsection{KKT conditions $\Leftrightarrow$ stick--slip law}
+\label{sec:kkt}
+
+The gradient of $J$ at point $i$ is
+\begin{equation}
+  \bg_i = \nabla_{\bq_i} J = \bigl(\bC(\bq - \bq^n)\bigr)_i - \Delta\bdelta_t
+        = -\,\Delta\bw_i
+  \label{eq:gradient}
+\end{equation}
+by \eqref{eq:slipinc}: \emph{the residual of the QP is minus the slip
+increment}. Form the Lagrangian with multipliers $\lambda_i \ge 0$ for the
+disk constraints $\abs{\bq_i} - s_i \le 0$:
+\begin{equation}
+  \mathcal L = J(\bq) + \sum_i \lambda_i \left( \abs{\bq_i} - s_i \right).
+\end{equation}
+Stationarity at a point with $\bq_i \ne \bzero$ gives
+$\bg_i + \lambda_i \qhat_i = \bzero$. Reading off the two cases:
+\begin{itemize}
+\item \textbf{Interior} ($\abs{\bq_i} < s_i$): complementary slackness
+  forces $\lambda_i = 0$, so $\bg_i = \bzero$, i.e.\
+  $\Delta\bw_i = \bzero$ --- the point \emph{sticks}. \checkmark
+\item \textbf{On the bound} ($\abs{\bq_i} = s_i$):
+  $\Delta\bw_i = -\bg_i = \lambda_i \qhat_i$ with $\lambda_i \ge 0$ --- the
+  point \emph{slips}, by a non-negative amount, \emph{parallel to} $+\qhat_i$.
+  \checkmark
+\end{itemize}
+So the KKT conditions of \eqref{eq:qp} are precisely the incremental form of
+the friction law \eqref{eq:law}: solving the QP \emph{is} enforcing
+friction. Uniqueness of $\bq$ follows from strict convexity ($\bC$ is SPD).
+This equivalence also dictates the solver's error metric
+(\S\ref{sec:metric}): at an interior point any non-zero $\bg_i$ is a
+violation; at a bound point the violations are the component of $\bg_i$
+\emph{perpendicular} to $\qhat_i$ (slip not aligned with traction) and any
+\emph{positive} component along $\qhat_i$ (a wrong-sign multiplier ---
+slip opposing the traction).
+
+\subsection{Dissipation}
+\label{sec:dissipation}
+
+The frictional work of one increment (per unit area $h^2$ of each element)
+is
+\begin{equation}
+  D = h^2 \sum_i \bq_i \cdot \Delta\bw_i .
+\end{equation}
+At the QP solution: stick points contribute $0$ ($\Delta\bw_i = \bzero$),
+slip points contribute
+$\bq_i \cdot \lambda_i \qhat_i = \lambda_i \abs{\bq_i} = \lambda_i s_i \ge 0$.
+Hence
+\begin{equation}
+  D = h^2 \sum_{i \,\in\, \text{slip}} \lambda_i\, s_i \;\ge\; 0 ,
+\end{equation}
+with equality iff no slip occurs. The driver computes and reports $D$ every
+step, and the test suite asserts $D \ge 0$ (up to the solver's floor) on
+every scenario --- a cheap, global, physics-grounded regression net that has
+no analogue in the frictionless problem.
+
+\subsection{A two-point worked example}
+\label{sec:toy2}
+
+The smallest problem that exhibits \emph{partial slip} has two points and
+elastic coupling. Take one direction only ($q_y \equiv 0$), compliance
+matrix and thresholds
+\begin{equation}
+  \bC = \begin{pmatrix} 2 & 1 \\ 1 & 2 \end{pmatrix},
+  \qquad s = (1,\ 3),
+\end{equation}
+(in arbitrary consistent units), no history ($\bq^n = 0$), displacement
+control with $\delta = 3.6$.
+
+\emph{Try full stick}: $\bC \bq = \delta \mathbf 1$ gives
+$\bq = \delta\,\bC^{-1}\mathbf 1 = (1.2,\ 1.2)$. Point 2 is fine
+($1.2 \le 3$) but point 1 violates its bound ($1.2 > 1$): full stick is
+inconsistent, the contact \emph{must} partially slip.
+
+\emph{Correct partition}: point 1 slips at its bound $q_1 = s_1 = 1$;
+point 2 sticks, so its slip is zero:
+$w_2 = \delta - (q_1 + 2 q_2) = 0 \Rightarrow q_2 = (3.6 - 1)/2 = 1.3 \le 3$
+\checkmark. Verify point 1's slip direction:
+$w_1 = \delta - (2 q_1 + q_2) = 3.6 - 3.3 = 0.3 > 0$, same sign as $q_1$
+\checkmark. Both KKT cases check out; dissipation
+$D = q_1 w_1 = 0.3 > 0$.
+
+Note what the elastic coupling did: the slipping point 1 sheds load onto its
+sticking neighbour ($q_2 = 1.3 >$ the full-stick $1.2$). In a real contact
+this load shedding is what makes the stick zone shrink smoothly from the
+edges inward as the load grows --- the Cattaneo--Mindlin annulus of
+\S\ref{sec:cm} is exactly this mechanism with $N$ large.
+
+\subsection{Velocity-dependent thresholds: the outer fixed point}
+\label{sec:threshold-loop}
+
+If $\tau_c$ depends on the slip velocity, the threshold field depends on the
+solution: $s = \tau_c(p, \abs{\Delta\bw(\bq)}/\Delta t, T)$. The driver
+resolves this with a damped fixed point: solve the QP with the current
+$s^{(k)}$, evaluate the law at the resulting slip rate, and average,
+\begin{equation}
+  s^{(k+1)} = \tfrac12\left( s^{(k)}
+            + \tau_c\!\left(p, \abs{\Delta\bw^{(k)}}/\Delta t, T\right)\right),
+\end{equation}
+warm-starting each inner QP from the previous pass, until the relative
+change of $s$ drops below \code{threshold\_rtol} (default $10^{-3}$).
+Rate-independent laws take exactly one pass; a rate-weakening smoke test
+converges in 7 damped passes. (The velocity in pass 0 is taken from the
+\emph{previous step's} slip increment --- quasi-static continuation.)
+
+% ---------------------------------------------------------
+\section{The Production Solver: Vector Projected CG}
+\label{sec:solver}
+
+\subsection{The staggered step}
+
+Because the elasticity is uncoupled (\S\ref{sec:scope}), each load step
+splits cleanly (\code{friction\_driver.cpp}):
+\begin{enumerate}
+\item \textbf{Normal solve}: the existing Polonsky--Keer PCG at the target
+  mean pressure, warm-started from the previous step. $p$ never feels $\bq$.
+\item \textbf{Threshold}: $s = \tau_c(p, \cdot, T)$, with the outer loop of
+  \S\ref{sec:threshold-loop} if velocity-dependent.
+\item \textbf{Tangential QP} \eqref{eq:qp}: the vector projected CG below.
+\item \textbf{State update}: commit $\bq$, $\bu_t$, $\bdelta_t$, accumulated
+  slip, dissipation (transactionally --- \S\ref{sec:transactional}).
+\end{enumerate}
+
+The tangential solver (\code{friction\_solve.cpp}, entry
+\code{solve\_tangential}) is the vector generalisation of Polonsky--Keer:
+same skeleton (projected CG + exact line search + restart logic), with the
+scalar bound $p_i \ge 0$ replaced by the disk $\abs{\bq_i} \le s_i$. Three
+design points differ from a naive transcription, each forced by a measured
+failure mode; they are worth understanding because they generalise to any
+projected CG on disk-like constraints.
+
+\subsection{Candidate set and disk projection}
+
+The CG iterates over the full \emph{candidate set}
+$\mathcal A = \{ i : s_i > 0 \}$ (all points that can carry any traction),
+\emph{not} over the current stick set. After each CG step the update is
+projected point-wise onto the disks (radial clamp):
+\begin{equation}
+  \bq_i \leftarrow
+  \begin{cases}
+    \bq_i, & \abs{\bq_i} \le s_i,\\[2pt]
+    s_i\, \bq_i / \abs{\bq_i}, & \abs{\bq_i} > s_i .
+  \end{cases}
+\end{equation}
+Why not iterate only on the stick set, mimicking the normal solver's
+free-set logic? Because a bound point is not ``done'': it still owns a
+\emph{direction} degree of freedom. $\abs{\bq_i} = s_i$ pins the magnitude,
+but $\qhat_i$ must rotate until it aligns with the slip --- and a stick-set
+CG never updates it. Keeping all candidate points in the CG lets slip
+directions converge; the clamp enforces the magnitudes. (This matches the
+approach of Tamaas' \code{PolonskyKeerTan}.)
+
+\subsection{The two-metric projection}
+\label{sec:twometric}
+
+At a bound (slipping) point the residual is, by \S\ref{sec:kkt},
+\begin{equation}
+  \bg_i = -\lambda_i\, \qhat_i + \bg_i^{\perp},
+\end{equation}
+an outward-radial\footnote{The CG convention here is
+$\bq \leftarrow \bq - \tau\, \bt$ with $\bt$ built from $\bg$; a component
+of $\bt$ along $-\qhat_i$ moves $\bq_i$ \emph{outward}, i.e.\ against the
+constraint.} multiplier part plus a tangential misalignment part. The
+multiplier part is not an error --- at the exact solution it is the only
+thing left --- yet a naive CG feeds it into the search direction, where it
+does pure harm: the outward push is annihilated by the clamp, but it has
+already polluted the \emph{exact line search}, whose $\tau$ minimises the
+objective along the unclamped ray. Measured effect: objective oscillation
+and stall at $\sim 10^{-2}$ relative error. The remedy, classical under the
+name \emph{two-metric projection}~\cite{Bertsekas1982}, is to strip the
+offending component from the direction source $\bz$ at every bound point:
+\begin{equation}
+  \zeta_i = \bz_i \cdot \qhat_i < 0
+  \quad\Longrightarrow\quad
+  \bz_i \leftarrow \bz_i - \zeta_i\, \qhat_i ,
+\end{equation}
+keeping inward components ($\zeta_i > 0$: the point may return to stick)
+and all transverse components (direction rotation). The projection
+(clamping) and the direction metric thus differ --- hence the name.
+
+Two companion safeguards, both from observed failures:
+\begin{itemize}
+\item \textbf{$\beta$-restart on partition change only.} Conjugacy is reset
+  ($\beta = 0$) when a point changes stick/slip status --- the objective's
+  active geometry changed. But \emph{re-clamping an already-bound point is
+  not a partition change}: while slip directions rotate, points are
+  re-clamped every iteration, and restarting $\beta$ there degrades CG to
+  steepest descent (measured: stall at $\sim 10^{-2}$).
+\item \textbf{Descent fallback.} If the preconditioned, conjugated direction
+  loses descent ($\bg^\tr \bt \le 0$), one retry is made with the plain
+  projected residual (steepest descent); without the retry the iteration can
+  deadlock recomputing the same non-descent direction forever.
+\end{itemize}
+
+\subsection{Line search, error metric, and best-iterate return}
+\label{sec:metric}
+
+The step length is the exact minimiser on the candidate set,
+$\tau = (\bg^\tr\bt)\,/\,(\bt^\tr \bC\, \bt)$, with all grid-length
+reductions accumulated in double (the float-safety conventions of
+\code{pcg.tex} \S6 apply verbatim). The convergence metric is the
+complementarity form of the KKT conditions of \S\ref{sec:kkt}:
+\begin{equation}
+  e \;=\; \frac{1}{\bigl(\sum_i s_i\bigr)\, g_{\text{scale}}}
+  \left[
+  \sum_{i\,\text{interior}} (s_i - \abs{\bq_i})\, \abs{\bg_i}
+  \;+\;
+  \sum_{i\,\text{bound}} s_i \left( \abs{\bg_i^{\perp}}
+      + \max(0,\ \bg_i\cdot\qhat_i) \right)
+  \right],
+  \label{eq:metric}
+\end{equation}
+the direct analogue of Polonsky--Keer's $\sum p_i \abs{g_i}$: every term
+vanishes exactly at the solution and each measures a specific law violation
+(interior slip; misaligned slip; wrong-sign multiplier).
+$g_{\text{scale}}$ is the first-iteration residual scale (optionally floored
+--- see \S\ref{sec:warm}).
+
+Near its floor ($\sim 10^{-5}$--$10^{-4}$ relative on hard partial-slip
+problems --- the clamps perturb CG conjugacy, and rotating slip directions
+keep injecting small residual) the exact line search becomes
+noise-dominated and the iterate can wander \emph{away} from the best point
+visited (measured: error touches $7\times10^{-6}$, then oscillates at
+$10^{-3}$--$10^{-2}$). The solver therefore tracks and returns the
+\emph{best iterate seen}, and a stagnation guard (200 non-improving
+iterations) converts a floor-limited run into an honest converged-at-floor
+exit, mirroring \code{solve\_contact}.
+
+\begin{algorithm}[t]
+\caption{Vector projected CG, displacement control
+  (\code{solve\_disp} in \code{friction\_solve.cpp})}
+\label{alg:pcgtan}
+\KwIn{operator $\bC$ (matvec), thresholds $s \ge 0$, shift $\Delta\bdelta_t$,
+      optional warm start $\bq^{(0)}$, history $\bu_{\mathrm{hist}}$, tol}
+$\mathcal A \leftarrow \{ i : s_i > 0\}$;\quad
+clamp $\bq^{(0)}$ onto the disks; $\beta_{\mathrm{on}} \leftarrow 0$\;
+\For{$k = 0, 1, 2, \dots$}{
+  $\bu \leftarrow \bC \bq$;\quad
+  $\bg_i \leftarrow \bu_i + \bu_{\mathrm{hist},i} - \Delta\bdelta_t$
+  on $\mathcal A$ \Comment{$\bg = -\Delta\bw$}
+  evaluate error \eqref{eq:metric}; track best iterate; stop on tol or
+  200-iteration stagnation\;
+  $\bz \leftarrow \bM^{-1}\bg$ on $\mathcal A$
+  \Comment{spectral preconditioner \S\ref{sec:precond}, or $\bz = \bg$}
+  \textbf{two-metric strip} at bound points:
+  $\bz_i \mathrel{-}= \min(0, \bz_i\cdot\qhat_i)\, \qhat_i$\;
+  $\beta \leftarrow \beta_{\mathrm{on}} \cdot
+    \max\bigl(0, \bz^\tr(\bg - \bg_{\mathrm{prev}})\bigr) / G_{\mathrm{old}}$
+    \Comment{PR+; FR optional}
+  $\bt \leftarrow \bz + \beta\, \bt$;\quad
+  $\tau \leftarrow (\bg^\tr\bt) / (\bt^\tr \bC \bt)$
+  \Comment{fallback to steepest descent if $\bg^\tr\bt \le 0$}
+  $\bq_i \leftarrow \Pi_{\mathrm{disk}}\!\left( \bq_i - \tau\, \bt_i \right)$
+  on $\mathcal A$ \Comment{radial clamp}
+  $\beta_{\mathrm{on}} \leftarrow 0$ if the stick/slip partition changed,
+  else $1$\;
+}
+\Return best iterate, stick/slip/open classification, $\bq$-mean\;
+\end{algorithm}
+
+\subsection{The $2\times2$ spectral preconditioner}
+\label{sec:precond}
+
+The normal solver's iteration count is tamed by preconditioning with the
+inverse symbol $\abs\bk$ (see \code{pcg.tex} \S6); the tangential operator
+needs the matrix version. From \eqref{eq:symbol},
+$\widehat\bC \propto \abs\bk^{-1} (\bI - \nu \khat\khat^\tr)$. Since
+$\khat\khat^\tr$ is a projector ($P^2 = P$), the inverse of $\bI - \nu P$
+is found by the ansatz $\bI + \gamma P$:
+\begin{equation}
+  (\bI - \nu P)(\bI + \gamma P) = \bI + (\gamma - \nu - \nu\gamma) P
+  = \bI
+  \iff
+  \gamma = \frac{\nu}{1-\nu},
+\end{equation}
+so (dropping the overall scale, which cancels in CG)
+\begin{equation}
+  \boxed{\;
+  \bM^{-1}(\bk) = \abs\bk \left( \bI + \frac{\nu}{1-\nu}\,
+  \khat\khat^{\tr} \right).
+  \;}
+\end{equation}
+Application (\code{TangentialFourierPreconditioner} in
+\code{fourier\_precond.cpp}) follows the scalar preconditioner exactly:
+mask the stacked residual to the candidate set, two forward FFTs, the
+per-mode symmetric $2\times2$ multiply, two inverse FFTs, masked gather;
+the per-component mean is removed only under force control (where the load
+constraint, not CG, fixes the mean). Like its scalar sibling this is an
+\emph{approximate} inverse (non-padded, masked), affecting only direction
+quality --- never the converged solution. One implementation subtlety: at
+the self-conjugate Nyquist modes the odd off-diagonal entry $w_{xy}$ must
+be zeroed (an odd real symbol cannot be represented there). Measured on an
+$N_s = 64$ partial-slip problem: $271 \to 126$ iterations ($2.15\times$),
+identical solutions at the KKT level.
+
+\subsection{Force control: outer Newton on the rigid shift}
+\label{sec:force}
+
+Under force control the constraint $\operatorname{mean}(\bq) = \bar\bq$
+must be met with $\bdelta_t$ as its multiplier. The scalar normal solver
+enforces its load constraint \emph{inside} the CG loop by an additive
+correction each iteration; the direct transcription of that trick to
+friction is \textbf{unstable} and was abandoned after measurement: the
+additive load correction, the interior-mean estimate of $\bdelta_t$, and
+the exact line search form a feedback loop with period-2 oscillation
+(measured gain $\approx 1.5$ per iteration at 40\% slip --- each correction
+overshoots the previous one). The stable architecture separates concerns:
+
+\begin{enumerate}
+\item \textbf{Inner}: displacement-controlled solves
+  (Algorithm~\ref{alg:pcgtan}) at a given shift $\bdelta$.
+\item \textbf{Outer}: solve the 2-dimensional root problem
+  \begin{equation}
+    \bF(\bdelta) = \operatorname{mean}\bigl(\bq(\bdelta)\bigr) - \bar\bq
+    = \bzero
+  \end{equation}
+  by Newton's method with a Broyden-updated $2\times2$ stiffness $\bK$.
+  The map $\bdelta \mapsto \operatorname{mean}(\bq)$ is monotone (SPD
+  full-stick stiffness, softening as slip develops), so Newton from the
+  \emph{full-stick} stiffness under-shoots and approaches the root stably.
+\end{enumerate}
+
+Supporting machinery, each piece answering a measured failure:
+\begin{itemize}
+\item \textbf{Probe initialisation.} $\bK$ is initialised from two
+  small-shift displacement solves ($\varepsilon$-probes along $x$ and $y$;
+  $F(\bzero) = -\bar\bq$ needs no solve since $\bdelta = \bzero \Rightarrow
+  \bq = \bzero$ cold). The probe scale comes from one matvec on the
+  gross-slip traction field; if the probes slip more than $20\%$,
+  $\varepsilon$ is halved once. With history present (\S\ref{sec:warm}) the
+  probes are taken \emph{differentially} around the operating point instead.
+\item \textbf{Noise-guarded Broyden updates.} The inner solver resolves
+  $\operatorname{mean}(\bq)$ only to its metric floor; a secant computed
+  from sub-floor differences is pure noise and can collapse $\bK$
+  (observed: $\det \bK$ decaying $10^{-1} \to 10^{-17} \to$ Newton
+  blow-up). Updates are rejected unless the updated determinant stays
+  safely non-degenerate, and the outer loop \textbf{stops when $\bF$ stops
+  responding} to $\bdelta$ at the inner resolution (floor detection).
+\item \textbf{Terminal exact-load correction.} The best-$\abs\bF$ iterate is
+  kept, and the residual load ($\sim 10^{-4}\,\abs{\bar\bq}$, the inner
+  floor) is then distributed \emph{additively over the interior (stick)
+  points} --- the same correction that is unstable inside the loop is
+  perfectly safe as a one-shot post-step (two or three re-clamping passes
+  reach machine precision; final load met to $\sim 3\times10^{-16}$
+  relative). The KKT residual absorbs a perturbation of the same harmless
+  order.
+\item \textbf{Gross-slip guard.} No equilibrium exists if
+  $\abs{\bar\bq} \ge \operatorname{mean}(s)$ (the whole interface at its
+  threshold is the largest transmissible mean traction); the solver rejects
+  such targets up front rather than diverging.
+\end{itemize}
+
+\begin{algorithm}[t]
+\caption{Force control: outer Newton/Broyden on $\bdelta_t$
+  (\code{solve\_tangential})}
+\label{alg:force}
+\KwIn{target mean traction $\bar\bq$ with
+  $\abs{\bar\bq} < \operatorname{mean}(s)$; optional carried stiffness
+  $\bK$, warm start, history}
+\lIf{no valid $\bK$ carried}{initialise $\bK$ from two
+  $\varepsilon$-probe inner solves (differential at the operating point if
+  history is present)}
+$\bdelta \leftarrow \bK^{-1} \bar\bq$ (or the carried/supplied initial
+shift)\;
+\For{$\mathrm{outer} = 1, \dots, 40$}{
+  $\bq \leftarrow$ inner solve (Algorithm~\ref{alg:pcgtan}) at $\bdelta$,
+  warm-started\;
+  $\bF \leftarrow \operatorname{mean}(\bq) - \bar\bq$; keep best-$\abs\bF$
+  iterate\;
+  stop if $\abs\bF \le$ tol, or if $\bF$ stopped responding to $\bdelta$
+  (inner floor reached)\;
+  Broyden: $\bK \mathrel{+}= \bigl((\Delta\bF - \bK\,\Delta\bdelta)\,
+    \Delta\bdelta^{\tr}\bigr)/\abs{\Delta\bdelta}^2$,
+    \emph{rejected} if it degenerates $\det\bK$\;
+  $\bdelta \mathrel{-}= \bK^{-1}\bF$\;
+}
+terminal correction: distribute the residual load over interior points,
+re-clamp (2--3 passes $\to$ exact load)\;
+\Return best iterate, its $\bdelta$, updated $\bK$ (carried to the next
+step)\;
+\end{algorithm}
+
+% ---------------------------------------------------------
+\section{Load Stepping: the Friction Driver}
+\label{sec:driver}
+
+\subsection{State and history}
+\label{sec:warm}
+
+History dependence (\S\ref{sec:toy1}) means the solver must carry state
+between steps. \code{FrictionDriver} owns:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+state & meaning & role \\
+\midrule
+$p$ & pressures at last accepted step & normal warm start; thresholds \\
+$\bq$ & total tangential tractions & the history in \eqref{eq:qp}; warm start \\
+$\bu_t = \bC\bq$ & tangential displacements & avoids one rebuild matvec per step \\
+$\bdelta_t$ & accumulated rigid shift & converts total targets to increments \\
+$\bw_{\mathrm{acc}}$ & accumulated slip & output/diagnostics (e.g.\ fretting maps) \\
+$\bK$ & carried force-control stiffness & skips the $\varepsilon$-probes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The incremental QP \eqref{eq:qp} is fed to the solver in \emph{total}
+variables through one device: since
+$\nabla J = \bC\bq - \bC\bq^n - \Delta\bdelta_t$, passing the
+\textbf{history offset} $\bu_{\mathrm{hist}} = -\bC\bq^n = -\bu_t^n$ into
+the residual, $\bg_i = (\bC\bq)_i + \bu_{\mathrm{hist},i} -
+\Delta\bdelta_t$, makes Algorithm~\ref{alg:pcgtan} solve the incremental
+problem while iterating directly on the total traction $\bq$ (so the disk
+constraints, which act on \emph{totals}, are natural). User-facing targets
+are totals; the driver converts to increments internally.
+
+Warm starts do most of the practical work in a load program: the previous
+step's $\bq$ seeds the CG, the previous shift seeds $\bdelta$, and the
+carried $\bK$ skips the probe solves --- measured on a repeated force-solve:
+$1475 \to 14$ inner iterations. A warm-started, nearly converged step would
+pay the full stagnation window just to certify itself; the driver floors the
+error normalisation ($g_{\mathrm{floor}}$, from the history scale) so such
+steps exit immediately. Note the unit discipline: under force control the
+target is a \emph{traction} and must not enter the
+displacement-residual floor (unit mixing at non-unit $\Estar$).
+
+\subsection{The transactional step}
+\label{sec:transactional}
+
+\code{step()} computes everything on local candidates and commits the
+persistent state \emph{only if the whole step converged} (normal solve,
+threshold loop, tangential solve). A non-converged step returns
+\code{converged = false} and leaves the driver exactly as before the call
+--- the caller may retry with a smaller increment, a looser tolerance, or
+\code{reset()}. This mirrors transactional semantics in databases and
+spares the user the subtle corruption of half-updated friction history
+(which, being path-dependent, could not be repaired afterwards).
+
+\begin{algorithm}[t]
+\caption{One driver step (\code{FrictionDriver::step})}
+\label{alg:driver}
+\KwIn{targets: mean pressure $\bar p$ and/or total $\bar\bq$ \emph{or}
+  total $\bdelta_t$; step duration $\Delta t$; optional field $T$}
+\If{$\bar p$ given}{
+  $p \leftarrow$ Polonsky--Keer PCG (warm start: previous $p$);
+  abort (unchanged state) if not converged\;
+}
+\If{tangential target given}{
+  target increment $\leftarrow$ total target $-$ carried total;\quad
+  $\bu_{\mathrm{hist}} \leftarrow -\bu_t^n$\;
+  \Repeat{$s$ change $<$ \code{threshold\_rtol}
+    \emph{(single pass for rate-independent laws)}}{
+    $v_i \leftarrow \abs{\Delta\bw_i}/\Delta t$ (pass 0: previous step's
+    slip)\;
+    $s \leftarrow \tfrac12 (s + \tau_c(p, v, T))$ (pass 0: direct)\;
+    $\bq \leftarrow$ \code{solve\_tangential} (Algorithms
+    \ref{alg:pcgtan}/\ref{alg:force}; warm-chained across passes)\;
+    $\Delta\bw_i \leftarrow \Delta\bdelta_t - \bigl(\bC(\bq -
+    \bq^n)\bigr)_i$\;
+  }
+  $D \leftarrow h^2 \sum_i \bq_i \cdot \Delta\bw_i$
+  \Comment{report; tests assert $D \ge 0$}
+}
+\textbf{commit} $p, \bq, \bu_t, \bdelta_t, \bw_{\mathrm{acc}}, \bK$
+\emph{only if everything converged}\;
+\end{algorithm}
+
+% ---------------------------------------------------------
+\section{The Bipotential Uzawa Reference Solver}
+\label{sec:uzawa}
+
+\subsection{Why a second, completely different solver}
+
+The staggered path of \S\ref{sec:solver} is fast but rests on a stack of
+choices (staggering, two-metric projection, outer Newton) that could, in
+principle, all be consistently wrong together. The project therefore
+maintains an independent reference solver built on entirely different
+mathematics --- the \emph{bipotential} method of de~Saxc\'e \&
+Feng~\cite{DeSaxceFeng1998} --- and gates releases on the two families
+agreeing. A second motivation is strategic: Coulomb friction is a
+\emph{non-associated} law (the slip direction has no component ``opening''
+the contact, unlike what a normal-dissipation postulate on the cone would
+predict), so the coupled normal--tangential problem does not derive from a
+single convex minimisation. The bipotential framework was designed
+precisely for such laws, treats normal contact and friction
+\emph{simultaneously} through one implicit rule, is derivative-free, and is
+indifferent to operator symmetry --- making it the designated strategy for
+the future coupled (dissimilar-material) case, where staggering loses its
+justification.
+
+\subsection{The algorithm: predictor--corrector with a cone projection}
+
+Per sweep, for every point, the traction triple $(q_x, q_y, p)_i$ is
+updated by a step of an Uzawa iteration
+(eqs.~(102)--(105) of \cite{DeSaxceFeng1998}, transplanted onto the BEM
+operators in \code{bipotential.cpp}): an \emph{augmented predictor} that
+mixes the current traction with the current kinematic violation, followed
+by an exact projection onto the friction cone. In this codebase's
+conventions (the sign map is derived in \code{bipotential.hpp}: the paper's
+relative velocity is $-\bw$ and its separation velocity is the gap
+$g = u_z + g_0 - \alpha \ge 0$),
+\begin{equation}
+  \btau_{t} = \bq_i + \rho\, \bw_i,
+  \qquad
+  \tau_n = p_i - \rho \left( g_i + \mu \abs{\bw_i} \right),
+  \label{eq:predictor}
+\end{equation}
+followed by the analytic orthogonal projection of
+$(\btau_t, \tau_n)$ onto $K_\mu$, which has three mutually exclusive cases
+with transparent physical meaning:
+\begin{equation}
+  (\bq_i, p_i) \leftarrow
+  \begin{cases}
+    (\bzero,\, 0), & \mu\abs{\btau_t} < -\tau_n
+      \quad\text{(inside the polar cone: separation)},\\[4pt]
+    (\btau_t,\, \tau_n), & \abs{\btau_t} \le \mu\, \tau_n
+      \quad\text{(inside the cone: stick)},\\[4pt]
+    \left( k\mu\, \hat\btau_t,\ k \right),\;
+    k = \dfrac{\tau_n + \mu \abs{\btau_t}}{1 + \mu^2},
+      & \text{otherwise}
+      \quad\text{(radial return to the cone: slip)}.
+  \end{cases}
+  \label{eq:cone}
+\end{equation}
+The $\mu\abs{\bw}$ term inside the \emph{normal} predictor
+\eqref{eq:predictor} is the bipotential signature --- it is what encodes
+the non-associated coupling (the ``implicit subnormality rule'') and
+distinguishes the method from solving an associated cone law. The same
+projection formula is used by Tamaas
+(\code{Kato::enforcePressureCoulomb}), which was one of the cross-checks
+that pinned the constants. Tresca and generic laws replace the cone by a
+\emph{cylinder}: $p \ge 0$ and $\abs{\bq_i} \le s_i$ project independently,
+with $s$ frozen per iteration.
+
+The step size $\rho$ must satisfy an inverse-operator-norm bound for
+convergence; it is set as $\rho = \rho_{\mathrm{scale}} / \lambda_{\max}$
+with $\lambda_{\max}$ estimated by 20 power iterations on the stacked
+operators $\operatorname{diag}(\bC, \bS)$ (both symbols peak at the lowest
+wavenumber, so power iteration converges in a few sweeps).
+
+\subsection{Behaviour and the cross-check gate}
+
+The reference is a first-order method: expect thousands of sweeps
+(each sweep is one normal plus one tangential matvec). Measured at
+$N_s = 32$, Hertz + Coulomb, partial slip: 790 sweeps to a relative update
+of $10^{-9}$, agreeing with the production staggered path to relative
+$L_2$ of $5.8\times10^{-8}$ in $p$ and $4.3\times10^{-6}$ in $\bq$, and
+passing an independent direct KKT self-check at the $10^{-10}$ level.
+That two solver families with disjoint mathematics and disjoint failure
+modes agree to these levels is the strongest correctness statement in the
+friction test suite. (On an all-slip uniform-threshold Tresca case the
+cross-check gap of $7.3\times10^{-3}$ is the \emph{production} side's
+documented metric floor, not the Uzawa's --- identified by checking which
+side moves when tolerances tighten.) The reference is $\sim 10\times$ the
+production wall time at $N_s = 32$ and is not intended for production runs.
+
+% ---------------------------------------------------------
+\section{Analytical Benchmarks}
+\label{sec:benchmarks}
+
+Frictional contact is blessed with a family of exact solutions that probe
+different parts of the implementation. Each is a permanent gate in
+\code{test\_friction} / \code{test\_driver}.
+
+\subsection{Cattaneo--Mindlin: the partial-slip sphere}
+\label{sec:cm}
+
+The flagship problem~\cite{Cattaneo1938,Mindlin1949,Johnson1985}: a sphere
+pressed by normal force $P$ (Hertz contact of radius $a$, peak pressure
+$p_0$), then pushed tangentially by $Q < \mu P$. Slip starts at the contact
+edge (where the pressure --- hence the threshold $\mu p$ --- vanishes) and
+an annulus $c \le r \le a$ slips while the core $r < c$ sticks, with
+\begin{equation}
+  \boxed{\;
+  \frac{c}{a} = \left( 1 - \frac{Q}{\mu P} \right)^{1/3},
+  \;}
+  \qquad
+  q(r) = \mu\, p_{\mathrm{Hertz}}(r; a)
+       - \mu\, \frac{c}{a}\, p_{\mathrm{Hertz}}\!\left(r; c\right)
+       \ \ (r < c),
+\end{equation}
+i.e.\ the shear traction is the difference of two scaled Hertz pressure
+distributions --- the simplest instance of the superposition idea of
+\S\ref{sec:cj}. As $Q \to \mu P$, $c \to 0$: gross sliding. Measured
+($N_s = 128$, $\nu = 0$, $Q = 0.5\,\mu P$): stick radius $c/a = 0.7972$ vs
+the analytic $0.7937$, traction field relative $L_2$ error $0.0074$, and
+$q_y$ \emph{exactly} zero (at $\nu = 0$ the $xy$ coupling kernel vanishes
+identically, so any non-zero $q_y$ would flag a parity bug).
+
+\subsection{Mindlin's full-stick tangential stiffness}
+
+Before any slip, a circular contact of radius $a$ loaded tangentially
+responds linearly~\cite{Mindlin1949}:
+\begin{equation}
+  Q = \frac{8 G a}{2-\nu}\, \delta_x ,
+\end{equation}
+the tangential analogue of the normal contact stiffness $2\Estar a$ (their
+ratio is the compliance ratio already met in
+Example~\ref{ex:selfterm}). Measured at $N_s = 128$, $a = 0.25L$,
+$\nu = 0.3$: stiffness ratio $0.9982$ ($0.18\%$ error, consistent with the
+grid resolution of the contact edge).
+
+\subsection{Ciavarella--J\"ager superposition and rough surfaces}
+\label{sec:cj}
+
+Ciavarella~\cite{Ciavarella1998} and J\"ager~\cite{Jager1998} discovered
+independently that for \emph{monotonic} tangential loading of a Coulomb
+interface, the shear traction is the difference of two \emph{normal}
+solutions of the same geometry:
+\begin{equation}
+  \bq = \mu \left[ p(F_z) - p^{*}(F^{*}) \right],
+  \qquad
+  F^{*} = F_z - \frac{F_x}{\mu},
+  \label{eq:cj}
+\end{equation}
+where $p(F_z)$ is the pressure at the actual normal load and $p^*$ is the
+pressure the \emph{same} normal problem would produce at the reduced load
+$F^*$; the stick zone is exactly the contact zone of the reduced problem
+(so $A_{\mathrm{stick}}/A_0 = 1 - F_x/(\mu F_z)$ under the appropriate
+load-area law~\cite{PaggiPohrtPopov2014}). The result holds when the
+tangential and normal influence operators are proportional and uncoupled
+--- on the discrete grid, exactly at $\nu = 0$, where by
+\S\ref{sec:symbol} $\bC = \frac{1}{1-\nu}\,\operatorname{diag}(\bS,\bS)
+\big|_{\nu=0} = \operatorname{diag}(\bS, \bS)$ up to the constant
+absorbed in \eqref{eq:prefactor}, and $\bC_{xy} \equiv 0$.
+
+This yields validation of \emph{discrete-exact} type, the most valuable
+kind: the friction solver's output is compared against two runs of the
+long-validated \emph{normal} solver on the same grid --- no discretisation
+error enters the comparison, only solver error. Measured: $q_x$ relative
+$L_2 = 3.2\times10^{-6}$ on a rough surface at $N_s = 64$ (gate $10^{-4}$),
+with the stick set matching the reduced contact set point-for-point
+(206 = 206). The same mechanism validates the \emph{driver}: two-step
+loading vs one-step vs \eqref{eq:cj} agree to $10^{-5}$--$4\times10^{-5}$
+(monotonic path independence), and a Mindlin-type unloading sequence
+matches its own discrete superposition (load $\bq_1$, reverse to $\bq_2$:
+the unloading solution is $\bq_1 - 2\mu[p - p^{**}]$-type with counter-slip
+from the edge) to $8.8\times10^{-5}$ with $D > 0$ at every step.
+
+\subsection{Limits worth memorising}
+
+\begin{itemize}
+\item $\tau_c \to \infty$ (or $\mu \to \infty$): full stick everywhere ---
+  the tangential flat-punch analogue; checks the pure elastic path.
+\item $Q \to \mu P$: gross sliding onset; the force-control guard of
+  \S\ref{sec:force} triggers exactly at the mean-threshold bound.
+\item $\mu = 0$: zero shear, and the normal solution must be bit-identical
+  to the frictionless solver (regression anchor).
+\item $\nu = 0$: tangential problem $\equiv$ two copies of the normal
+  problem; $q_y \equiv 0$ under $x$-loading.
+\end{itemize}
+
+% ---------------------------------------------------------
+\section{Validated Numbers and Practical Notes}
+\label{sec:numbers}
+
+\subsection{Friction-specific validated numbers}
+
+(The project-wide table lives in \code{CLAUDE.md}; this subset is the
+friction feature's permanent record. All measured 2026-07 on the 20-core
+reference workstation.)
+
+\begin{center}
+\small
+\begin{tabular}{ll}
+\toprule
+quantity & value \\
+\midrule
+Cerruti closed forms vs $64^2$ GL quadrature (6 offsets, incl.\ self) & rel.\ err $< 10^{-9}$ \\
+tangential FFT matvec vs dense ($N_s=8/16$) & $2.9\times10^{-16}$ rel.\ $L_2$ \\
+tangential H$^2$ matvec vs dense ($N_s=32$, $q{=}4$ / $q{=}6$) & $1.67\times10^{-4}$ / $6.97\times10^{-6}$ \\
+KKT, displacement control ($N_s=32$, 28 slip pts, tol $10^{-5}$) & 21 iterations; stick $\abs{\bw}$ $7.7\times10^{-7}$ \\
+force control ($N_s=32$, $40\%$ slip, outer Broyden) & load met to $3\times10^{-16}$ rel. \\
+preconditioner A/B ($N_s=64$ partial slip) & $271 \to 126$ iterations ($2.15\times$) \\
+Mindlin full-stick stiffness $Q = 8Ga\delta/(2-\nu)$ ($N_s=128$) & ratio $0.9982$ \\
+Cattaneo--Mindlin $\nu=0$ ($N_s=128$, $Q=0.5\mu P$) & $c/a$ $0.7972$ vs $0.7937$; $q_y \equiv 0$ \\
+Ciavarella--J\"ager, rough, $\nu=0$ ($N_s=64$) & $q_x$ rel.\ $L_2$ $3.2\times10^{-6}$; stick set exact \\
+force-control $\bK$ carry-over (repeat solve) & $1475 \to 14$ inner iterations \\
+driver two-step C--J ($N_s=64$, rough, Coulomb) & rel.\ $4.2\times10^{-5}$; $D > 0$ \\
+monotonic path independence (2-inc / 1-inc / C--J) & $1.4$/$4.0$/$3.1 \times10^{-5}$ \\
+Mindlin unloading superposition ($\nu=0$, counter-slip) & rel.\ $8.8\times10^{-5}$; $q_y \equiv 0$; $D>0$ \\
+velocity-dependent threshold loop (rate-weakening) & 7 damped passes; $D > 0$ \\
+bipotential Uzawa vs production ($N_s=32$, Coulomb) & 790 sweeps; $p$: $5.8\times10^{-8}$, $\bq$: $4.3\times10^{-6}$ \\
+bipotential KKT self-check & $\sim 10^{-10}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Tolerances and floors (what to expect in practice)}
+
+\begin{itemize}
+\item The displacement-control KKT metric floor is
+  $\sim 10^{-5}$--$10^{-4}$ relative, growing with the slip fraction (slip
+  directions rotate; clamps perturb conjugacy). The default
+  \code{tol\_tangential} of $10^{-5}$ is calibrated to it.
+\item Under force control the \emph{load} is met to machine precision
+  (terminal correction), while the pointwise KKT residual floors at
+  $10^{-6}$--$10^{-4}$ (with OpenMP-reduction jitter); the validation gate
+  is $10^{-2}$ with the sharp discrete-exact validation delegated to the
+  $\nu = 0$ Ciavarella--J\"ager tests.
+\item Dissipation is reported per step; tiny negative values at the solver
+  floor ($\abs{D} \lesssim$ floor $\times$ load scale) would indicate a
+  genuine bug, not noise --- the tests treat $D \ge 0$ strictly.
+\end{itemize}
+
+\subsection{Python quick reference}
+
+\begin{verbatim}
+import aspher as hc, numpy as np
+model = hc.CoulombFriction(mu=0.3)        # TrescaFriction(tau_c=...), UserFriction(fn)
+fs = hc.FrictionSolver(grid_size=256, E_star=1.0, nu=0.3, model=model)
+fs.set_gap(-surface)                      # gap = -height (rigid flat)
+fs.step(p_bar=0.05)                       # normal preload
+r = fs.step(q_bar=(0.01, 0.0), dt=1.0)    # force-controlled tangential step
+#   fs.step(delta_t=(1e-4, 0.0), dt=1.0)  # displacement-controlled variant
+print(r.n_stick, r.n_slip, r.q_mean, r.dissipation)
+\end{verbatim}
+
+State is carried across steps; a non-converged step leaves it unchanged
+(\S\ref{sec:transactional}). \code{hc.solve\_bipotential(...)} exposes the
+reference solver of \S\ref{sec:uzawa} for cross-checks.
+
+% ---------------------------------------------------------
+\section*{Acknowledgement of sources}
+
+The element-integrated kernels follow Pohrt \& Li~\cite{PohrtLi2014} and
+Dydo \& Busby~\cite{DydoBusby1995}; the incremental variational framing is
+classical (see Johnson~\cite{Johnson1985} for the mechanics and
+Nocedal--Wright~\cite{NocWri2006} for the optimisation); the projected-CG
+skeleton extends Polonsky \& Keer~\cite{PolKeer1999}; the two-metric
+projection idea is Bertsekas'~\cite{Bertsekas1982}; the reference solver is
+de~Saxc\'e \& Feng's~\cite{DeSaxceFeng1998}; the benchmark solutions are
+due to Cattaneo~\cite{Cattaneo1938}, Mindlin~\cite{Mindlin1949},
+Ciavarella~\cite{Ciavarella1998}, J\"ager~\cite{Jager1998}, and, for the
+rough-surface form, Paggi, Pohrt \& Popov~\cite{PaggiPohrtPopov2014}.
+
+\bibliographystyle{unsrt}
+\bibliography{references}
+
+\end{document}
