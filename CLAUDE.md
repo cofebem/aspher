@@ -60,6 +60,30 @@ plans (not worth it for single solves).
 
 ---
 
+## Benchmarks
+
+`bench/harness.py` + `bench/analyze.py` implement the validation plan §8
+measurement protocol; see `bench/README.md`. Full provenance per row
+(revision — dirty *tracked* sources are refused — compiler/flags, **FFT
+engine via ldd**, CPU, affinity, threads, surface hash, every solver argument,
+status/tolerances/scope, independently recomputed errors, per-stage and
+per-phase data, solver byte accounting, fresh-process peak RSS, pressure
+hash), paired **ABBA** ordering with medians + bootstrap CI on the paired
+difference, a resumable JSONL ledger (`data/bench_ledger.jsonl`), and a
+**preflight memory budget** that constructs the operator at two small grids
+and fits `a + b·N` to its A07 accounting (H2 storage is *not* ∝ N — near
+stencils are 4.5 MiB fixed at ℓ=16). `analyze.py` disqualifies rows whose
+`(status, validation_scope, requested_tol, effective_tol)` differ **before**
+comparing any timing.
+
+```bash
+python bench/harness.py preflight --ns 16384 --variant h2-f32-active
+python bench/harness.py run --workload rough-H0.8 --ns 1024     --variants h2-f64,h2-f64-active --reps 5
+python bench/analyze.py --pair h2-f64,h2-f64-active --metric wall_cold_s
+# long jobs: detach, do NOT background inside a tool call
+OMP_NUM_THREADS=20 nohup python bench/harness.py run ...     > data/bench_16384.log 2>&1 < /dev/null & disown
+```
+
 ## Run Tests
 
 ```bash
@@ -409,6 +433,8 @@ Fix: use plain `\begin{enumerate}` and `\begin{itemize}` without optional argume
 | Float achievable certificate (Ns=256 rough, fft) | 2e-7 converges (102 it); tighter stalls at 1.88e-7; pressure error vs double saturates at ~5e-6 either way |
 | Precision policy at Ns=256, requested 1e-8 (vs double tol=1e-12) | double 31 it / rel 8.0e-9 / 0.074 s; float 23 it / rel 5.0e-6 / **stagnated**; float_then_double 23+8 it / rel **2.1e-8** / 0.056 s |
 | float_then_double polish gain (T17 fixture, Ns=64) | pressure rel vs double 2.03e-5 → **1.76e-9** for 4 extra double iterations |
+| Harness paired A/B, active-set vs standard (rough-H0.8, 5 paired samples, corrected solver) | wall −57.8% CI[−61.7,−55.4] at Ns=512; −69.4% CI[−71.3,−64.6] at Ns=1024; peak RSS −13.5% / −29.3%; contact-area spread exactly 0 |
+| Preflight prediction vs measured RSS at Ns=16384 | 8.29/14.82/8.99/21.82 GiB predicted vs 10.9/18.3/12.5/OOM measured (model = library buffers only; 1.25 headroom covers the Python heap) |
 
 ---
 
