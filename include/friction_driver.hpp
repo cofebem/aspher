@@ -11,14 +11,37 @@
 
 #include <Eigen/Dense>
 
+#include <string>
+
 namespace hmc {
 
+// Tangential boundary condition held while the NORMAL load changes and no
+// tangential target is given (spec A15 §10.1). These are physical boundary
+// conditions, not a choice of numerical clipping: changing p changes the
+// friction thresholds, so the stored shear must be re-solved, not clipped.
+enum class TangentialHold {
+    displacement, // hold the total tangential rigid shift delta_t (default)
+    force,        // hold the previously controlled mean traction q_bar
+};
+
 struct FrictionStepSpec {
+    // Normal load control (spec A15 §10.1):
+    //   has_p_bar = false           -> no normal update; hold the current p
+    //   has_p_bar = true, p_bar > 0 -> solve for that mean pressure
+    //   has_p_bar = true, p_bar = 0 -> COMPLETE normal unloading (separation)
+    //   p_bar < 0                   -> invalid
+    // Compatibility: the historical p_bar = -1 sentinel (has_p_bar unset)
+    // still means "no normal update", and a positive p_bar with has_p_bar
+    // unset is still honoured as a load request. p_bar = 0 with has_p_bar
+    // unset is rejected: it used to be silently skipped, which is exactly the
+    // conflation of "zero load" with "no update" this API removes.
+    bool has_p_bar = false;
     double p_bar = -1.0;
     bool has_q_bar = false;
     Eigen::Vector2d q_bar = Eigen::Vector2d::Zero();
     bool has_delta_t = false;
     Eigen::Vector2d delta_t = Eigen::Vector2d::Zero();
+    TangentialHold tangential_hold = TangentialHold::displacement;
     double dt = 1.0;
     const Eigen::VectorXd* T = nullptr;
     double tol_normal = 1e-8, tol_tangential = 1e-5;
@@ -33,6 +56,12 @@ struct FrictionStepResult {
     double dissipation = 0.0;
     int threshold_iters = 0;
     bool converged = false;
+    // Set when a normal-only step re-solved the tangential problem under the
+    // new thresholds (the held boundary condition), rather than the caller
+    // driving it. `hold_relaxation` names which quantity was held.
+    bool tangential_hold_applied = false;
+    TangentialHold hold_applied = TangentialHold::displacement;
+    std::string status_reason; // empty on success
 };
 
 // Incremental quasi-static frictional-contact driver (spec §6): per step,
@@ -74,6 +103,12 @@ public:
     const Eigen::VectorXd& w_acc() const { return w_acc_; }
 
 private:
+    // Fill `res.normal` for the fully separated (p_bar = 0) state: zero
+    // pressure and displacement, and the just-touching approach min(g0) —
+    // the unconstrained separated approach is not unique, so this is the
+    // documented convention and it keeps the reported gap >= 0.
+    void fill_separated_normal(ContactResult& n) const;
+
     int Ns_, N_;
     double L_, h_;
     const FrictionModel* model_;
@@ -89,6 +124,9 @@ private:
     Eigen::VectorXd p_, q_, u_t_, w_acc_, slip_prev_;
     Eigen::Vector2d delta_t_ = Eigen::Vector2d::Zero();
     Eigen::Matrix2d K_ = Eigen::Matrix2d::Zero(); // det 0 = no carry-over yet
+    // last CONTROLLED mean traction, for tangential_hold = force
+    Eigen::Vector2d q_bar_last_ = Eigen::Vector2d::Zero();
+    bool has_q_bar_last_ = false;
 };
 
 } // namespace hmc

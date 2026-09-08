@@ -356,15 +356,46 @@ public:
     }
     void reset() { drv_->reset(); }
 
-    // Keyword-arg step: exactly one of p_bar / (q_bar or delta_t) drives the
-    // tangential problem; p_bar>0 (also) runs the normal solve.
-    PyStepResult step(double p_bar, const py::object& q_bar,
-                      const py::object& delta_t, double dt,
+    // Keyword-arg step. Normal control (spec A15 §10.1):
+    //   p_bar=None -> hold the current normal load (no normal solve)
+    //   p_bar=0    -> COMPLETE normal unloading (separation)
+    //   p_bar>0    -> solve for that mean pressure
+    //   p_bar<0    -> invalid, except the documented legacy -1 sentinel
+    // A tangential solve runs when q_bar or delta_t is given; on a
+    // normal-only step the tangential boundary condition named by
+    // tangential_hold is re-solved under the new thresholds.
+    PyStepResult step(const py::object& p_bar, const py::object& q_bar,
+                      const py::object& delta_t,
+                      const std::string& tangential_hold, double dt,
                       const py::object& T, double tol_normal,
                       double tol_tangential, int max_iter,
                       int max_threshold_iter, double threshold_rtol) {
         hmc::FrictionStepSpec spec;
-        spec.p_bar = p_bar;
+        if (p_bar.is_none()) {
+            spec.has_p_bar = false;
+            spec.p_bar = -1.0;
+        } else {
+            const double pb = p_bar.cast<double>();
+            if (pb == -1.0) { // documented legacy sentinel
+                spec.has_p_bar = false;
+                spec.p_bar = -1.0;
+            } else if (pb < 0.0) {
+                throw std::invalid_argument(
+                    "FrictionSolver.step: p_bar must be >= 0 (0 = complete "
+                    "normal unloading) or None to hold the current load");
+            } else {
+                spec.has_p_bar = true;
+                spec.p_bar = pb;
+            }
+        }
+        if (tangential_hold == "displacement")
+            spec.tangential_hold = hmc::TangentialHold::displacement;
+        else if (tangential_hold == "force")
+            spec.tangential_hold = hmc::TangentialHold::force;
+        else
+            throw std::invalid_argument(
+                "FrictionSolver.step: tangential_hold must be 'displacement' "
+                "or 'force'");
         spec.dt = dt;
         spec.tol_normal = tol_normal;
         spec.tol_tangential = tol_tangential;
@@ -404,6 +435,8 @@ public:
             // step and is restored here (GIL held again on scope exit).
             py::gil_scoped_release release;
             out.r = drv_->step(spec);
+            // a held tangential relaxation also produces fresh displacements
+            if (out.r.tangential_hold_applied) out.tangential = true;
             if (out.tangential && out.r.converged) {
                 out.u_t = drv_->u_t();
                 out.delta_total = drv_->delta_t();
@@ -800,6 +833,16 @@ PYBIND11_MODULE(aspher, m) {
                 return a;
             })
         .def_property_readonly(
+            "status_reason",
+            [](const PyStepResult& s) { return s.r.status_reason; },
+            "Empty on success; otherwise why the step was refused (the "
+            "driver state is unchanged in that case).")
+        .def_property_readonly(
+            "tangential_hold_applied",
+            [](const PyStepResult& s) { return s.r.tangential_hold_applied; },
+            "True when a normal-only step re-solved the tangential problem "
+            "under the held boundary condition (new friction thresholds).")
+        .def_property_readonly(
             "delta_t", [](const PyStepResult& s) -> py::object {
                 if (!s.have_disp) return py::none();
                 py::array_t<double> a(2);
@@ -822,19 +865,29 @@ PYBIND11_MODULE(aspher, m) {
         .def("set_gap", &PyFrictionSolver::set_gap, py::arg("gap"),
              "Set the initial gap field (flat (N,) or (Ns,Ns)); resets history.")
         .def("step", &PyFrictionSolver::step, py::kw_only(),
-             py::arg("p_bar") = -1.0, py::arg("q_bar") = py::none(),
-             py::arg("delta_t") = py::none(), py::arg("dt") = 1.0,
+             py::arg("p_bar") = py::none(), py::arg("q_bar") = py::none(),
+             py::arg("delta_t") = py::none(),
+             py::arg("tangential_hold") = "displacement", py::arg("dt") = 1.0,
              py::arg("T") = py::none(), py::arg("tol_normal") = 1e-8,
              py::arg("tol_tangential") = 1e-5, py::arg("max_iter") = 20000,
              py::arg("max_threshold_iter") = 20,
              py::arg("threshold_rtol") = 1e-3,
-             "One quasi-static load step. p_bar>0 runs the normal solve; a "
-             "tangential solve runs if q_bar (force control, (qx,qy)) or "
-             "delta_t (displacement control, rigid shift) is given (exactly "
-             "one). Targets are TOTAL loads/shifts. Returns FrictionStepResult. "
-             "On a non-converged step the driver state is rolled back, so ux/uy/"
-             "delta_t are None; qx/qy/slip_x/slip_y/state expose the failed "
-             "candidate for inspection.")
+             "One quasi-static load step.\n"
+             "Normal control: p_bar=None holds the current normal load, "
+             "p_bar=0 is COMPLETE normal unloading (separation: p=q=u_t=0, "
+             "approach = min(gap), accumulated slip and the controlled rigid "
+             "shift preserved), p_bar>0 solves for that mean pressure; "
+             "p_bar<0 is invalid (the legacy -1 sentinel still means 'hold').\n"
+             "Tangential control: give q_bar (force, (qx,qy)) or delta_t "
+             "(displacement, rigid shift) — exactly one; targets are TOTAL "
+             "loads/shifts. On a normal-only step the boundary condition named "
+             "by tangential_hold ('displacement', the default, or 'force') is "
+             "re-solved under the new friction thresholds, so shear cannot "
+             "survive on points that just opened; an infeasible held force "
+             "fails transactionally (see result.status_reason).\n"
+             "Returns FrictionStepResult. On a non-converged step the driver "
+             "state is rolled back, so ux/uy/delta_t are None; qx/qy/slip_x/"
+             "slip_y/state expose the failed candidate for inspection.")
         .def("reset", &PyFrictionSolver::reset, "Clear all history.")
         .def_property_readonly("pressure", &PyFrictionSolver::pressure)
         .def_property_readonly("q", &PyFrictionSolver::q)

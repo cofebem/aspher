@@ -30,6 +30,30 @@ void FrictionDriver::reset() {
     slip_prev_ = Eigen::VectorXd::Zero(2 * N_);
     delta_t_.setZero();
     K_.setZero();
+    q_bar_last_.setZero();
+    has_q_bar_last_ = false;
+}
+
+void FrictionDriver::fill_separated_normal(ContactResult& n) const {
+    n.pressure = Eigen::VectorXd::Zero(N_);
+    n.displacement = Eigen::VectorXd::Zero(N_);
+    n.approach = g0_.minCoeff(); // just-touching convention (documented)
+    n.gap = g0_.array() - n.approach;
+    n.objective = 0.0;
+    n.error = 0.0;
+    n.pk_error = 0.0;
+    n.fw_gap = 0.0;
+    n.fw_error = 0.0;
+    n.load_error = 0.0;
+    n.pressure_violation = 0.0;
+    n.penetration_error = 0.0;
+    n.contact_fraction = 0.0;
+    n.mean_pressure = 0.0;
+    n.iterations = 0;
+    n.status = SolveStatus::converged;
+    n.converged = true;
+    n.g_ref = std::max(g0_.maxCoeff() - g0_.minCoeff(), 1e-300);
+    n.p_ref = 0.0;
 }
 
 FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
@@ -49,6 +73,29 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
         throw std::invalid_argument(
             "FrictionDriver::step: with velocity-dependent model, "
             "max_threshold_iter must be >= 2");
+    // ── normal load request (spec A15 §10.1) ──
+    // "no update", "zero load" and "load X" are three different requests;
+    // the old code mapped p_bar <= 0 to "skip", so asking for zero normal
+    // load silently kept the previous pressure (review §13.2).
+    bool want_normal;
+    const double pb = spec.p_bar;
+    if (spec.has_p_bar) {
+        if (!(pb >= 0.0))
+            throw std::invalid_argument(
+                "FrictionDriver::step: p_bar must be >= 0 (0 = complete "
+                "normal unloading); leave has_p_bar unset to hold the load");
+        want_normal = true;
+    } else if (pb > 0.0) {
+        want_normal = true; // legacy positional use
+    } else if (pb < 0.0) {
+        want_normal = false; // legacy -1 sentinel
+    } else {
+        throw std::invalid_argument(
+            "FrictionDriver::step: p_bar = 0 needs has_p_bar = true "
+            "(complete normal unloading); leave p_bar unset (or -1) to hold "
+            "the current normal load");
+    }
+
     FrictionStepResult res;
     bool ok = true;
 
@@ -57,8 +104,39 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
     // and only if ok — see the transactional contract in the header.
     Eigen::VectorXd p_new = p_;
 
+    // ── (0) complete normal unloading: p = q = u = 0 ──
+    if (want_normal && pb == 0.0) {
+        if (spec.has_q_bar && spec.q_bar.norm() > 0.0) {
+            // a nonzero prescribed tangential force cannot be carried with
+            // zero normal load in a nonadhesive model
+            res.converged = false;
+            res.status_reason = "nonzero q_bar at zero normal load";
+            return res;
+        }
+        fill_separated_normal(res.normal);
+        Eigen::Vector2d delta_new = delta_t_;
+        if (spec.has_delta_t) delta_new = spec.delta_t; // rigid shift is free
+        res.slip_inc = Eigen::VectorXd::Zero(2 * N_);
+        res.dissipation = 0.0;
+        res.converged = true;
+        // Commit: zero fields, cleared traction-dependent warm state (so a
+        // later recontact cannot resurrect stale tractions or a stale probe
+        // stiffness), but the controlled rigid shift and the accumulated
+        // slip history are preserved — separation does not undo what already
+        // slipped (spec A15 §10.1).
+        p_.setZero();
+        q_.setZero();
+        u_t_.setZero();
+        slip_prev_.setZero();
+        delta_t_ = delta_new;
+        K_.setZero();
+        has_q_bar_last_ = false;
+        q_bar_last_.setZero();
+        return res;
+    }
+
     // ── (1) normal solve (uncoupled: p never feels q) ──
-    if (spec.p_bar > 0.0) {
+    if (want_normal) {
         MatVec Sop = [this](const Eigen::VectorXd& x) { return S_.matvec(x); };
         Precond Pn;
         if (precond_)
@@ -67,10 +145,14 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
                 return Mn_.apply(g, contact);
             };
         const Eigen::VectorXd* warm = (p_.maxCoeff() > 0.0) ? &p_ : nullptr;
-        res.normal = solve_contact(Sop, g0_, spec.p_bar, spec.tol_normal,
+        res.normal = solve_contact(Sop, g0_, pb, spec.tol_normal,
                                    spec.max_iter, true, Pn, warm);
         ok = ok && res.normal.converged;
-        if (!ok) { res.converged = false; return res; }
+        if (!ok) {
+            res.converged = false;
+            res.status_reason = "normal solve: " + std::string(to_string(res.normal.status));
+            return res;
+        }
         p_new = res.normal.pressure;
     }
 
@@ -79,8 +161,42 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
     Eigen::Vector2d delta_t_new = delta_t_;
     Eigen::Matrix2d K_new = K_;
 
+    // ── held tangential boundary condition on a normal-only step ──
+    // Changing p changes the thresholds s = model(p,...), so stored shear
+    // that now exceeds mu*p is out of equilibrium. The old code left it
+    // untouched: after unloading p_bar 0.01 -> 0.0001 at Ns=32, 76 OPEN
+    // points still carried shear with max excess |q| - mu p = 0.02362
+    // (review §13.1). Clipping alone would enforce the cone but not
+    // equilibrium, so the incremental problem is re-solved under the held
+    // boundary condition.
+    bool do_tan = spec.has_q_bar || spec.has_delta_t;
+    bool tan_force = spec.has_q_bar;
+    Eigen::Vector2d tan_target =
+        spec.has_q_bar ? spec.q_bar : (spec.delta_t - delta_t_);
+    bool is_hold = false;
+    if (!do_tan && want_normal && q_.cwiseAbs().maxCoeff() > 0.0) {
+        is_hold = true;
+        do_tan = true;
+        res.tangential_hold_applied = true;
+        res.hold_applied = spec.tangential_hold;
+        if (spec.tangential_hold == TangentialHold::force) {
+            if (!has_q_bar_last_) {
+                res.converged = false;
+                res.status_reason =
+                    "tangential_hold=force but no controlled force was ever "
+                    "prescribed";
+                return res;
+            }
+            tan_force = true;
+            tan_target = q_bar_last_;
+        } else {
+            tan_force = false;
+            tan_target.setZero(); // hold the TOTAL shift: increment is zero
+        }
+    }
+
     // ── (2)+(3) threshold loop + incremental tangential solve ──
-    if (spec.has_q_bar || spec.has_delta_t) {
+    if (do_tan) {
         if (p_new.maxCoeff() <= 0.0)
             throw std::logic_error(
                 "FrictionDriver::step: tangential step before any contact");
@@ -96,17 +212,16 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
             spec.T ? *spec.T : Eigen::VectorXd::Zero(N_);
 
         // increment targets: solver works in Δδ with u_hist = −uⁿ_t
-        const Eigen::Vector2d target = spec.has_q_bar
-                                           ? spec.q_bar
-                                           : (spec.delta_t - delta_t_);
+        const Eigen::Vector2d target = tan_target;
         Eigen::VectorXd u_hist = -u_t_;
-        const double g_floor =
-            1e-6 * (u_t_.cwiseAbs().maxCoeff() +
-                    (spec.has_q_bar ? target.norm() : 0.0));
-        // displacement units only: under force control the target is a
-        // traction and must NOT enter the displacement-residual floor (unit
-        // mixing at non-unit E*); a cold first force step gets floor 0 — its
-        // it-0 gmax is an honest scale.
+        // DISPLACEMENT units only. The old expression added |q_bar| — a
+        // traction — to |u_t|, contradicting its own adjacent comment and
+        // mixing units at non-unit E* (review §13.3). A cold first force
+        // step gets floor 0; its it-0 gmax is an honest scale. If a
+        // force-controlled floor is ever wanted it must come through a
+        // documented compliance scale, not by adding a pressure to a
+        // displacement.
+        const double g_floor = 1e-6 * u_t_.cwiseAbs().maxCoeff();
 
         // velocity for the threshold: previous pass's slip increment
         // (first pass: previous STEP's — quasi-static continuation)
@@ -121,7 +236,7 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
         Eigen::VectorXd s_old;
         Eigen::Vector2d dinit0;
         const Eigen::Vector2d* dinit0_p = nullptr;
-        if (spec.has_q_bar && K_new.determinant() > 0.0) {
+        if (tan_force && K_new.determinant() > 0.0) {
             const Eigen::Vector2d q_mean_now(q_.head(N_).mean(),
                                              q_.tail(N_).mean());
             dinit0 = K_new.inverse() * (target - q_mean_now);
@@ -144,11 +259,22 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
             // warm-start from the PREVIOUS PASS's solution (pass 0: the
             // previous step's committed q_ — quasi-static continuation)
             Eigen::VectorXd q_warm = (pass == 0) ? q_ : tan.q;
-            tan = solve_tangential(Cop, s, spec.has_q_bar, target,
-                                   spec.tol_tangential, spec.max_iter, true,
-                                   Mop, &q_warm, &u_hist, g_floor,
-                                   spec.has_q_bar ? &K_new : nullptr,
-                                   pass == 0 ? dinit0_p : dinit_p);
+            try {
+                tan = solve_tangential(Cop, s, tan_force, target,
+                                       spec.tol_tangential, spec.max_iter, true,
+                                       Mop, &q_warm, &u_hist, g_floor,
+                                       tan_force ? &K_new : nullptr,
+                                       pass == 0 ? dinit0_p : dinit_p);
+            } catch (const std::invalid_argument& e) {
+                // e.g. an infeasible held force (|q_bar| >= mean s after the
+                // normal change). A request the caller did not make directly
+                // fails transactionally instead of throwing.
+                if (!is_hold) throw;
+                res.converged = false;
+                res.status_reason =
+                    std::string("held tangential force infeasible: ") + e.what();
+                return res;
+            }
             dinit = tan.delta_t;
             dinit_p = &dinit;
             // slip increment of this candidate solution: Δw = Δδ − (u − uⁿ)
@@ -202,6 +328,12 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
         w_acc_ = std::move(w_acc_new);
         slip_prev_ = std::move(slip_prev_new);
         K_ = K_new;
+        if (tan_force && do_tan) {
+            q_bar_last_ = tan_target;
+            has_q_bar_last_ = true;
+        }
+    } else if (res.status_reason.empty()) {
+        res.status_reason = "tangential solve did not converge";
     }
     return res;
 }
