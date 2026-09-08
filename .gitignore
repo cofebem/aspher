@@ -46,3 +46,4 @@ dist/
 
 # local reference screenshots (not part of the repo)
 extras/Screenshot*
+experiments/__pycache__/
