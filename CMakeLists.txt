@@ -99,12 +99,15 @@ endif()
 
 if(NOT SKBUILD)
   enable_testing()
-  foreach(t kernel hmatrix contact h2 precond fft active cerruti tangential friction driver uzawa certification precision contracts)
+  foreach(t kernel hmatrix contact h2 precond fft active cerruti tangential friction driver uzawa certification precision contracts kernel_stability)
     add_executable(test_${t} tests/test_${t}.cpp)
     target_link_libraries(test_${t} PRIVATE aspher_core)
     target_compile_options(test_${t} PRIVATE -Wall -Wextra)
     add_test(NAME ${t} COMMAND test_${t})
   endforeach()
+  # the kernel-stability gate reads the offline high-precision fixture
+  target_compile_definitions(test_kernel_stability PRIVATE
+    ASPHER_TEST_DATA="${CMAKE_SOURCE_DIR}/tests/data")
   # masked-matvec gate benchmark (not a test; driven by bench_masked_gate.py)
   add_executable(bench_masked tests/bench_masked.cpp)
   target_link_libraries(bench_masked PRIVATE aspher_core)

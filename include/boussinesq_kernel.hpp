@@ -12,6 +12,11 @@ namespace hmc {
 // (Johnson, Contact Mechanics, eq. 3.25).
 double love_uz(double x, double y, double a, double b);
 
+// asinh(u) - asinh(v) without cancellation, given the exactly known
+// difference du = u - v. See the derivation in boussinesq_kernel.cpp; shared
+// with the Cerruti brackets, which have the same corner-logarithm structure.
+double asinh_diff(double u, double v, double du);
+
 // Boussinesq influence matrix S for an Ns x Ns grid of square elements of
 // side h = L / Ns carrying uniform pressure. The kernel is translation
 // invariant: S_ij depends only on (|ix - jx|, |iy - jy|), so all N^2 entries
