@@ -2,6 +2,8 @@
 
 #include <cmath>
 #include <cstdio>
+#include <limits>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace hmc {
@@ -19,12 +21,39 @@ H2Operator::H2Operator(const BoussinesqKernel& kernel, H2Params params)
                  },
                  params) {}
 
+// Parameter validation happens BEFORE any allocation or tree construction
+// (spec A19): an invalid grid/leaf/order combination is a programming error,
+// not something to discover halfway through a build.
+static void validate_h2_params(int Ns, double h, const H2Params& p) {
+    auto pow2 = [](int v) { return v > 0 && (v & (v - 1)) == 0; };
+    if (Ns <= 0 || !pow2(Ns))
+        throw std::invalid_argument("H2Operator: Ns must be a positive power of two");
+    if (p.leaf_side <= 0 || !pow2(p.leaf_side))
+        throw std::invalid_argument(
+            "H2Operator: leaf_side must be a positive power of two");
+    if (p.leaf_side > Ns)
+        throw std::invalid_argument("H2Operator: leaf_side > Ns");
+    if (p.q < 2)
+        throw std::invalid_argument("H2Operator: q must be >= 2");
+    if (p.near_radius < 1)
+        throw std::invalid_argument(
+            "H2Operator: near_radius must be >= 1 (the admissibility rule "
+            "assumes the 3x3 leaf neighbourhood is evaluated directly)");
+    if (!(h > 0.0) || !std::isfinite(h))
+        throw std::invalid_argument("H2Operator: element size must be positive");
+    // checked sizes: N and the q2 x nbox scratch must fit the index types used
+    const std::int64_t N = static_cast<std::int64_t>(Ns) * Ns;
+    if (N > static_cast<std::int64_t>(std::numeric_limits<int>::max()))
+        throw std::invalid_argument("H2Operator: Ns*Ns exceeds int range");
+}
+
 H2Operator::H2Operator(int Ns, double h, FarKernelFn far, NearKernelFn near,
                        H2Params params)
     : p_(params), Ns_(Ns), q_(params.q), q2_(params.q * params.q),
       ls_(params.leaf_side), ls2_(params.leaf_side * params.leaf_side), h_(h),
       far_fn_(std::move(far)), near_fn_(std::move(near)),
-      cheb_(params.q), tree_(Ns, params.leaf_side) {}
+      cheb_((validate_h2_params(Ns, h, params), params.q)),
+      tree_(Ns, params.leaf_side) {}
 
 std::vector<double> H2Operator::centers_norm(int side) const {
     // element-center k (k = 0..side-1) normalized into the box geometric extent:
@@ -50,6 +79,7 @@ static inline std::int64_t near_key(int dx, int dy) {
 }
 
 void H2Operator::build() {
+    if (built_) return; // idempotent for an immutable parameter set
     const auto& boxes = tree_.boxes();
     const int nbox = static_cast<int>(boxes.size());
 
@@ -168,6 +198,7 @@ void H2Operator::build() {
     info_.bytes_near = 8LL * info_.n_near_stencils * ls2_ * ls2_;
     info_.bytes_buffers = 8LL * 2 * nbox * q2_;
     info_.bytes_total = info_.bytes_coupling + info_.bytes_near + info_.bytes_buffers;
+    built_ = true;
 }
 
 Eigen::VectorXd H2Operator::matvec(const Eigen::VectorXd& x) const {

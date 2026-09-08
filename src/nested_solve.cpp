@@ -14,9 +14,8 @@
 #include <utility>
 #include <vector>
 
-#ifdef __GLIBC__
-#include <malloc.h>
-#endif
+#include <cmath>
+#include <limits>
 
 namespace hmc {
 
@@ -419,18 +418,61 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                                    double p_bar,
                                    double tol, int max_iter, bool use_pr,
                                    const NestedParams& np) {
-    if (static_cast<int>(g0.size()) != Ns * Ns)
+    // ── input validation before any allocation or iteration (spec A19) ─────
+    auto pow2 = [](int v) { return v > 0 && (v & (v - 1)) == 0; };
+    if (Ns <= 0)
+        throw std::invalid_argument("solve_contact_nested: Ns must be positive");
+    if (!(L > 0.0) || !std::isfinite(L))
+        throw std::invalid_argument("solve_contact_nested: L must be positive");
+    if (!(E_star > 0.0) || !std::isfinite(E_star))
+        throw std::invalid_argument(
+            "solve_contact_nested: E_star must be positive");
+    // checked size arithmetic: N and the FFT/H2 padded products must fit the
+    // index types before anything of that size is allocated
+    const std::int64_t N64 = static_cast<std::int64_t>(Ns) * Ns;
+    if (N64 > static_cast<std::int64_t>(std::numeric_limits<int>::max()))
+        throw std::invalid_argument(
+            "solve_contact_nested: Ns*Ns exceeds the int index range");
+    if (4 * N64 > static_cast<std::int64_t>(std::numeric_limits<std::ptrdiff_t>::max()))
+        throw std::invalid_argument(
+            "solve_contact_nested: the padded (2Ns)^2 grid exceeds ptrdiff_t");
+    if (static_cast<std::int64_t>(g0.size()) != N64)
         throw std::invalid_argument("solve_contact_nested: g0 size != Ns*Ns");
-
-#ifdef __GLIBC__
-    // The matvec and preconditioner allocate large temporaries every iteration
-    // (M/L buffers, the y vector, the FFT arrays). Force allocations above
-    // 128 KB to use mmap so free() returns them to the OS immediately (munmap),
-    // instead of accumulating in glibc's arena — otherwise peak RSS climbs
-    // steadily over the iterations and OOMs at large Ns.
-    mallopt(M_MMAP_THRESHOLD, 128 * 1024);
-    mallopt(M_TRIM_THRESHOLD, 128 * 1024);
-#endif
+    if (!g0.allFinite())
+        throw std::invalid_argument(
+            "solve_contact_nested: gap contains non-finite values");
+    if (!(p_bar > 0.0) || !std::isfinite(p_bar))
+        throw std::invalid_argument(
+            "solve_contact_nested: p_nominal must be positive");
+    if (!(tol > 0.0) || !std::isfinite(tol))
+        throw std::invalid_argument("solve_contact_nested: tol must be positive");
+    if (max_iter < 0)
+        throw std::invalid_argument("solve_contact_nested: max_iter must be >= 0");
+    // coarsest = 0 made the level loop non-progressing (n *= 2 never leaves 0)
+    if (np.coarsest <= 0)
+        throw std::invalid_argument(
+            "solve_contact_nested: coarsest must be positive");
+    if (np.coarsest > Ns)
+        throw std::invalid_argument("solve_contact_nested: coarsest > Ns");
+    if (np.q < 2)
+        throw std::invalid_argument("solve_contact_nested: q must be >= 2");
+    if (np.leaf_side <= 0 || !pow2(np.leaf_side))
+        throw std::invalid_argument(
+            "solve_contact_nested: leaf_side must be a positive power of two");
+    if (!(np.coarse_tol > 0.0))
+        throw std::invalid_argument(
+            "solve_contact_nested: coarse_tol must be positive");
+    if (np.active_set) {
+        if (np.active_halo < 0)
+            throw std::invalid_argument(
+                "solve_contact_nested: active_halo must be >= 0");
+        if (np.active_max_rounds < 1)
+            throw std::invalid_argument(
+                "solve_contact_nested: active_max_rounds must be >= 1");
+        if (!(np.active_delta >= 0.0))
+            throw std::invalid_argument(
+                "solve_contact_nested: active_delta must be >= 0");
+    }
 
     std::vector<int> levels;
     for (int n = np.coarsest; n <= Ns; n *= 2) levels.push_back(n);

@@ -68,7 +68,12 @@ public:
     H2Operator(int Ns, double h, FarKernelFn far, NearKernelFn near,
                H2Params params);
 
+    // Idempotent for an immutable parameter set: after a successful build,
+    // repeat calls are no-ops. The old behaviour APPENDED to the interaction,
+    // coupling and leaf arrays and left the float caches stale, so a second
+    // build silently produced a different (wrong) operator (spec A19).
     void build();
+    bool is_built() const { return built_; }
 
     // u = S x, with x and u in natural flat order (global = iy*Ns + ix).
     // Reuses internal multipole/local scratch across calls: concurrent matvec
@@ -190,6 +195,7 @@ private:
     mutable Eigen::MatrixXf Mbuf_f_, Lbuf_f_;
 
     H2Info info_;
+    bool built_ = false;
 
     double far_kernel(double dx, double dy) const; // g(dx,dy)
 

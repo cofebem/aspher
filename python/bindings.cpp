@@ -15,6 +15,7 @@
 #include "h2_operator.hpp"
 #include "hmatrix.hpp"
 #include "nested_solve.hpp"
+#include "runtime_policy.hpp"
 #include "tangential_operator.hpp"
 
 #include <cstring>
@@ -691,6 +692,18 @@ PYBIND11_MODULE(aspher, m) {
           "active_delta*scale) through the masked H2 matvec, with per-round "
           "full-grid verification and a full-solve fallback after "
           "active_max_rounds (see .active_rounds/.active_fallback).");
+
+    m.def("configure_allocator", &hmc::configure_allocator,
+          py::arg("mmap_threshold_bytes") = 128 * 1024,
+          py::arg("trim_threshold_bytes") = 128 * 1024,
+          "Opt-in PROCESS-WIDE glibc allocator policy (returns False where "
+          "unsupported). Large solves free multi-megabyte buffers every "
+          "iteration; forcing them through mmap returns them to the OS "
+          "immediately instead of growing the arena. ASPHER never calls this "
+          "itself — the solver used to change the host process's policy from "
+          "inside a library call. Call it once at start-up if you measure "
+          "that it helps (large H-matrix builds and very large nested "
+          "solves).");
 
     py::class_<PyBipotResult>(m, "BipotentialResult")
         .def_property_readonly(
