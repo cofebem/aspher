@@ -192,6 +192,13 @@ static ContactResult active_finest(const H2Operator& h2,
         // certificate gains at most P*(tol/2)*g_ref, i.e. tol/2 in normalised
         // units, on top of the restricted certificate's tol/2 (spec A03).
         aopt.tol = 0.5 * lvl_tol;
+        // The split is an INTERNAL budget, not the caller's request: the
+        // restricted stage is solved tighter than asked so that it plus the
+        // outside-C allowance meet the level tolerance. Reporting tol/2 as
+        // `requested_tol` would say the caller asked for something they did
+        // not, and would make two otherwise identical runs look like they had
+        // different accuracy contracts.
+        aopt.requested_tol = lvl_tol;
         aopt.max_iter = max_iter;
         aopt.use_pr = use_pr;
         aopt.record_history = record_history;
@@ -273,6 +280,7 @@ static ContactResult active_finest(const H2Operator& h2,
         res.fw_error = fw_glob;
         res.penetration_error = pen_glob;
         res.effective_tol = lvl_tol;
+        res.requested_tol = lvl_tol;
 
         // Accept only when the restricted solve met its own KKT conditions
         // AND the global check passes: an empty outside-violation list is not
