@@ -429,6 +429,13 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
         if (r.converged) {
             r.status = SolveStatus::converged;
             r.status_reason.clear();
+            // Visibility, not a failure: a state that passes but sits within a
+            // decade of its own acceptance threshold is riding the solver's
+            // floor, and the caller should read proj_residual rather than
+            // trust `converged` alone. Scaling the notice to kkt_tol keeps it
+            // meaningful when the caller tightens the contract.
+            if (r.proj_residual > 0.1 * kt)
+                r.status_reason = "local_kkt_near_tolerance";
         }
     };
 

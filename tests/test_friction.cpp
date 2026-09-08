@@ -646,6 +646,30 @@ static int test_final_kkt() {
                 bad2.cone_violation);
     CHECK(bad2.cone_violation > 1e-3);
 
+    // A clean partial-slip solve carries no notice; a state riding the floor
+    // does. The notice never changes `converged` — it is visibility, so a
+    // caller that only reads `converged` is not silently handed a state whose
+    // local equilibrium sits at the solver's limit.
+    CHECK(r.status_reason.empty());
+    {
+        // uniform threshold + a large shift = gross slip, the regime where
+        // rotating slip directions hold the residual near 1e-2
+        Eigen::VectorXd su(N);
+        for (int i = 0; i < N; ++i)
+            su(i) = (nr.pressure(i) > 0.0) ? 6e-4 : 0.0;
+        hmc::TangentialResult g = hmc::solve_tangential(
+            Cop, su, false, Eigen::Vector2d(6e-4, 0.0), 1e-4, 200000, true, {},
+            nullptr, nullptr, 0.0, nullptr, nullptr, /*kkt_tol=*/2e-2);
+        std::printf("T24 gross slip: %s reason='%s' proj=%.2e (kkt_tol %.1e) "
+                    "slip=%d stick=%d\n",
+                    hmc::to_string(g.status), g.status_reason.c_str(),
+                    g.proj_residual, g.kkt_tol, g.n_slip, g.n_stick);
+        CHECK(g.converged);                       // still accepted
+        CHECK(g.n_slip > 0 && g.n_stick == 0);    // really is gross slip
+        CHECK(g.proj_residual > 0.1 * g.kkt_tol);
+        CHECK(g.status_reason == "local_kkt_near_tolerance");
+    }
+
     // rho is a fixed operator property: halving the threshold field scales
     // s_ref and w_ref together, so rho is unchanged (it cannot be shrunk to
     // make a residual look small)

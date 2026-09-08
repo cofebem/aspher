@@ -27,6 +27,9 @@ struct TangentialResult {
     // A tiny total-force residual cannot establish local equilibrium, and the
     // old res.error described the pre-correction iterate.
     SolveStatus status = SolveStatus::max_iterations;
+    // Why a solve failed — or, on success, "local_kkt_near_tolerance" when
+    // proj_residual is within a decade of kkt_tol (the state is accepted but
+    // is riding the solver's floor; read proj_residual).
     std::string status_reason;
     double cone_violation = 0.0;  // max(0, |q_i| - s_i) / s_ref
     double stick_residual = 0.0;  // max |w_i| over stick / w_ref

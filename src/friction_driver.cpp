@@ -333,6 +333,9 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
             q_bar_last_ = tan_target;
             has_q_bar_last_ = true;
         }
+        // carry a passing-but-near-the-floor notice up to the caller
+        if (do_tan && res.status_reason.empty())
+            res.status_reason = res.tangential.status_reason;
     } else if (res.status_reason.empty()) {
         res.status_reason = "tangential solve did not converge";
     }

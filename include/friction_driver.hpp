@@ -65,7 +65,11 @@ struct FrictionStepResult {
     // driving it. `hold_relaxation` names which quantity was held.
     bool tangential_hold_applied = false;
     TangentialHold hold_applied = TangentialHold::displacement;
-    std::string status_reason; // empty on success
+    // Empty on a clean success. On failure, why the step was refused (the
+    // driver state is then unchanged). On success it may still carry
+    // "local_kkt_near_tolerance", meaning the step committed but its local
+    // equilibrium is only as good as tangential.proj_residual says.
+    std::string status_reason;
 };
 
 // Incremental quasi-static frictional-contact driver (spec §6): per step,
