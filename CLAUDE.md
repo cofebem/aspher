@@ -88,6 +88,26 @@ where `R±± = sqrt((x±a)²+(y±a)²)`.
 
 Self-term: `S_ii = 4h·ln(1+√2) / (π E*)`.
 
+**Stable evaluation (2026-09, A05).** The printed corner-logarithm form
+cancels catastrophically at signed/large offsets (relative error 1.9e-7 at
+(16384,16384)h, ~1 at (−1e6,0)h) and returns **NaN at a cell corner**.
+`love_uz` now (i) folds parity first — `love_uz(±x,±y)` is bitwise equal —
+(ii) uses `ln(t+√(t²+c²)) = ln|c| + asinh(t/|c|)` so the divergent `ln|c|`
+cancels analytically and the `t→0` limits are removable, (iii) evaluates the
+asinh *difference* without cancellation (`asinh_diff(u,v,du)`, conjugate form
+when `u,v` share a sign, with the exactly known `du = 2a` or `2b`), and
+(iv) switches past `r = 1500·max(a,b)` to the multipole expansion
+`A/r + (A/6r⁵)[a²(3x²−r²) + b²(3y²−r²)]` (= `(h²/r)[1+h²/(24r²)]` for a
+square — which is *why* a bare point kernel is not an exact far substitute).
+Worst relative error over the 472-point 80-digit fixture: **3.5e-14** (r/h up
+to 1e6). The same treatment applies to Cerruti: `cerruti_uxx` is written as
+`(1−ν)·Love + ν·ylog` (no cancellation on the axis), `ylog` has its own
+expansion, and `cerruti_uxy` is rationalised into a product of positive
+factors with no subtraction at all. Oracle: `tests/generate_kernel_reference.py`
+(explicit developer command, mpmath ≥80 digits, cross-checked against
+independent singularity-aware quadrature to 1e-69/1e-53) → immutable fixtures
+in `tests/data/`; gate `test_kernel_stability` (T10–T12).
+
 Translation invariance: `S_ij` depends only on `|ix-jx|, |iy-jy|` → Ns×Ns lookup table, O(1) per entry.
 
 ### H-Matrix
@@ -102,6 +122,7 @@ Translation invariance: `S_ij` depends only on `|ix-jx|, |iy-jy|` → Ns×Ns loo
 
 ### H2/FMM operator (`backend="h2"`) — preferred for large Ns
 Matrix-free black-box FMM (Chebyshev interpolation, Fong & Darve 2009). **No blocks stored**: shares bases per cluster and couplings per interaction, all cached by `(level, relative offset)` via translation invariance. O(N) memory, O(N) matvec.
+- **Compact construction (2026-09, A06)**: `make_boussinesq_h2(Ns, L, E*, params)` builds the operator **without** the Ns² Love table. Only offsets with `|dx|,|dy| ≤ (near_radius+1)·leaf_side − 1` are ever requested, so a `b = min(Ns,(r+1)ℓ)` table suffices (2 KiB at ℓ=8, r=1) and the operator *owns* it (no external lifetime contract). Bit-for-bit identical to the full-table operator over 48 configurations (`test_contracts` T13). Used by `solve_contact_nested` (h2 levels) and `ContactSolver(backend="h2")`; the FFT backend still builds the full table because it transforms it. Measured build: Ns=1024 q=4 48.7→14.3 ms (3.4×), Ns=2048 q=4 200.8→52.4 ms (3.8×); storage −8N bytes (2 GiB at Ns=16384, 8 GiB at 32768). `H2Info` gains `bytes_kernel` and `near_table_extent`.
 - **Tree**: `UniformQuadTree` — balanced quad-tree to square leaves of side `h2_leaf_side` (default 8); stores index *ranges*, no index lists. `Ns`, `leaf_side` must be powers of two.
 - **Far field**: tensor-product Chebyshev interpolation, order `q` (default 4; r=q² nodes). Passes `P2M → M2M → M2L → L2L → L2P`. Coupling `K[a,b]=g(ξ_a−ξ_b)` cached by `(level,dx,dy)`; M2M/L2L are 4 cached q²×q² matrices (scale-invariant).
 - **Near field**: exact Love stencils for leaves within `near_radius` (default 1, the 3×3 neighborhood), cached by relative leaf offset. Uses the same `love_uz` kernel as the far field (consistent; far error is interpolation-only).
@@ -333,6 +354,14 @@ Fix: use plain `\begin{enumerate}` and `\begin{itemize}` without optional argume
 | Held force on the same unload | correctly infeasible, fails transactionally with the full state snapshot unchanged |
 | Tangential local KKT (force control Ns=32, 40% of gross slip) | cone 8.9e-17, proj 7.7e-7, force 1.8e-20; a load-preserving ±d perturbation keeps force 1.8e-20 but proj jumps to 1.9e-2 and is rejected |
 | Tangential preconditioner drop on stall (A15 relaxation) | proj 1.8e-2 → 8.5e-5 |
+| **A05/A06 (2026-09) — kernels and memory** | |
+| Love kernel vs 80-digit fixture (472 pts, r/h up to 1e6) | worst rel 3.5e-14 (old form: 1.9e-7 at 16384h diagonal, ~1 at 1e6h) |
+| Love self term vs 4h ln(1+√2) | rel 1.3e-16; cell corner now finite (was NaN) |
+| Love far-branch switch (r=1500·max(a,b)) branch disagreement | 3e-14 … 4e-13 |
+| Cerruti brackets vs 80-digit fixture (58 pts) | ylog 2.9e-13, xy 1.7e-16 of the local normal-kernel scale |
+| Fixture oracle cross-check (closed form vs adaptive quadrature) | 1.2e-69 (Love), 1.3e-53 (Cerruti) |
+| Compact vs full-table H2 matvec (48 configs, f64+f32) | bit-for-bit identical |
+| H2 build, full table → compact (Ns=1024/2048, q=4) | 48.7→14.3 ms (3.4×), 200.8→52.4 ms (3.8×); table 8/32 MiB → 2 KiB |
 
 ---
 
@@ -467,7 +496,8 @@ de Saxcé–Feng reference cross-check (slow; not for production).
 - **H2 follow-ups**: rectangular grids (nx≠ny); leaf/q auto-tuning; PCG convergence + timing sweep of H2 at Ns≥1024.
 - **Accuracy/efficiency roadmap (spec `doc/specs/2026-09-08-accuracy-efficiency-improvements.md`, plan `doc/plans/2026-09-08-accuracy-efficiency-validation.md`, review `doc/review_20260908.md`)**:
   - ✅ **D1 correctness release done (2026-09-08, branch `feat/accuracy-efficiency`)** — A01 (certificates + honest statuses), A02 (scale-invariant activation + feasible identification step), A03 (global candidate verification), A04 (gap datum), A15 (friction load/hold semantics + final local KKT), A19-protective (validation, build idempotence, opt-in allocator policy). New gates: `test_certification`, `test_precision`, `test_contracts`, `tests/contact_oracle.hpp` (independent dense-QP oracle), `tests/test_certification_py.py`, plus T06/T24/T25/T26 in the existing groups.
-  - **D2 (kernel/memory)**: A06 compact near-offset cache (before A05), A05 stable Love/Cerruti evaluation, A07 accurate memory/cost instrumentation, A14 ACA storage protections.
+  - ✅ **A06 + A05 done (2026-09-08)**: compact near-offset H2 construction (bit-for-bit, 3–4× faster build, −8N bytes) and stable Love/Cerruti evaluation (worst 3.5e-14 against an 80-digit fixture, corners finite), with the offline oracle `tests/generate_kernel_reference.py` and the gate `test_kernel_stability`.
+  - **D2 remaining**: A07 accurate memory/cost instrumentation, A14 ACA storage protections.
   - **D3 (measured optimisation)**: A08 displacement recurrence, A09 staged precision/q, A10 M2L compression/batching, A11 occupied traversal + screening, A17 vector H².
   - **D4/D5 (research)**: A12 two-phase simplex/reduced-CG, A13 sparse preconditioner, A16 semismooth Newton for friction (the path to lowering the 1e-2 tangential KKT default), A18 observables + Galerkin/periodic/multigrid.
 - ~~FFT preconditioner speed~~ ✅ done (2026-07): half-spectrum transforms on pocketfft (default, BSD) or FFTW3 plans (opt-in, GPL; ~16%/~5% faster double/float end-to-end at Ns=4096), object-owned scratch/plans. The FFT is now a small share of the iteration.
