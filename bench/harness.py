@@ -146,7 +146,11 @@ def fft_engine():
 
 
 def provenance():
-    dirty = _run(["git", "-C", ROOT, "status", "--porcelain"])
+    # Only TRACKED modifications make a run untrustworthy: untracked files
+    # (build trees, figures, scratch) cannot change the binary under test, and
+    # counting them would make every run on a working checkout look dirty.
+    dirty = _run(["git", "-C", ROOT, "status", "--porcelain",
+                  "--untracked-files=no"])
     cpu = ""
     try:
         with open("/proc/cpuinfo") as f:
