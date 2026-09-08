@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 
@@ -168,7 +169,78 @@ static int t34_lifecycle() {
     return 0;
 }
 
+// ── T13: compact near-offset cache equals the full-table operator ─────────
+static int t13_compact_cache() {
+    for (int Ns : {8, 16, 32, 64}) {
+        for (int ls : {4, 8, 16}) {
+            if (ls > Ns) continue;
+            for (int rad : {1, 2, 3}) {
+                for (int q : {4, 6}) {
+                    hmc::H2Params par{ls, q, rad};
+                    hmc::BoussinesqKernel K(Ns, 1.0, 1.0);
+                    hmc::H2Operator full(K, par);
+                    full.build();
+                    auto compact = hmc::make_boussinesq_h2(Ns, 1.0, 1.0, par);
+                    compact->build();
+
+                    // every required near entry must match the full table
+                    const int b = hmc::near_table_extent(Ns, ls, rad);
+                    CHECK(compact->info().near_table_extent == b);
+                    CHECK(b <= Ns);
+                    CHECK(b >= std::min(Ns, (rad + 1) * ls));
+
+                    const int N = Ns * Ns;
+                    Eigen::VectorXd x = Eigen::VectorXd::Random(N), y1(N), y2(N);
+                    full.matvec_into(x, y1);
+                    compact->matvec_into(x, y2);
+                    if ((y1 - y2).cwiseAbs().maxCoeff() != 0.0) {
+                        std::printf("FAILED compact Ns=%d ls=%d rad=%d q=%d "
+                                    "diff=%.3e\n",
+                                    Ns, ls, rad, q,
+                                    (y1 - y2).cwiseAbs().maxCoeff());
+                        return 1;
+                    }
+                    // and in float
+                    full.build_single_caches();
+                    compact->build_single_caches();
+                    Eigen::VectorXf xf = x.cast<float>(), f1(N), f2(N);
+                    full.matvec_single_into(xf, f1);
+                    compact->matvec_single_into(xf, f2);
+                    CHECK((f1 - f2).cwiseAbs().maxCoeff() == 0.0f);
+
+                    // the compact operator OWNS its coefficients and reports
+                    // them; the full-table one borrows the caller's kernel
+                    CHECK(compact->info().bytes_kernel ==
+                          static_cast<std::int64_t>(b) * b * 8);
+                    CHECK(full.info().bytes_kernel == 0);
+                }
+            }
+        }
+    }
+    // the Ns = leaf_side case (b clipped to Ns)
+    {
+        hmc::H2Params par{8, 4, 1};
+        auto op = hmc::make_boussinesq_h2(8, 1.0, 1.0, par);
+        op->build();
+        CHECK(op->info().near_table_extent == 8);
+    }
+    // storage: at Ns=1024, leaf 8, radius 1 the compact table is 2 KiB where
+    // the full one is 8 MiB
+    {
+        auto op = hmc::make_boussinesq_h2(1024, 1.0, 1.0, {8, 4, 1});
+        op->build();
+        const std::int64_t full_bytes = 8LL * 1024 * 1024;
+        std::printf("T13 Ns=1024: compact table %lld B vs full %lld B (%.0fx)\n",
+                    (long long)op->info().bytes_kernel, (long long)full_bytes,
+                    double(full_bytes) / double(op->info().bytes_kernel));
+        CHECK(op->info().bytes_kernel == 16 * 16 * 8);
+    }
+    std::printf("T13 compact near cache: bit-for-bit over 48 configurations\n");
+    return 0;
+}
+
 int main() {
+    if (t13_compact_cache()) return 1;
     if (t33_bad_inputs()) return 1;
     if (t34_lifecycle()) return 1;
     std::printf("test_contracts: all checks passed\n");

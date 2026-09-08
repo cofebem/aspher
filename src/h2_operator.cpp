@@ -78,6 +78,49 @@ static inline std::int64_t near_key(int dx, int dy) {
     return (static_cast<std::int64_t>(dx + 64) << 16) ^ static_cast<std::int64_t>(dy + 64);
 }
 
+std::unique_ptr<H2Operator> make_boussinesq_h2(int Ns, double L, double E_star,
+                                               H2Params params) {
+    if (Ns <= 0) throw std::invalid_argument("make_boussinesq_h2: Ns <= 0");
+    if (!(L > 0.0) || !std::isfinite(L))
+        throw std::invalid_argument("make_boussinesq_h2: L must be positive");
+    if (!(E_star > 0.0) || !std::isfinite(E_star))
+        throw std::invalid_argument("make_boussinesq_h2: E_star must be positive");
+    const double h = L / Ns;
+    const double a = 0.5 * h;
+    const double scale = 1.0 / (M_PI * E_star);
+    const int b = near_table_extent(Ns, params.leaf_side, params.near_radius);
+    // Same expression, same order as BoussinesqKernel's table: the compact and
+    // full-table operators must be bit-for-bit identical (gate T13).
+    auto near = std::make_shared<std::vector<double>>(
+        static_cast<std::size_t>(b) * b);
+    for (int dy = 0; dy < b; ++dy)
+        for (int dx = 0; dx < b; ++dx)
+            (*near)[static_cast<std::size_t>(dy) * b + dx] =
+                scale * love_uz(dx * h, dy * h, a, a);
+    auto op = std::make_unique<H2Operator>(
+        Ns, h,
+        [scale, a](double dx, double dy) {
+            return scale * love_uz(dx, dy, a, a);
+        },
+        // The table is captured BY VALUE (shared_ptr): the operator owns its
+        // coefficients, so there is no external lifetime contract as there is
+        // with the kernel-reference constructor.
+        [near, b, Ns](int dix, int diy) {
+            const int dx = std::abs(dix), dy = std::abs(diy);
+            if (dx >= Ns || dy >= Ns) return 0.0; // outside the grid span
+            if (dx >= b || dy >= b)
+                throw std::logic_error(
+                    "make_boussinesq_h2: near-offset request outside the "
+                    "compact table extent — the near field should never ask "
+                    "for it");
+            return (*near)[static_cast<std::size_t>(dy) * b + dx];
+        },
+        params);
+    op->set_owned_kernel_bytes(
+        static_cast<std::int64_t>(near->size()) * sizeof(double), b);
+    return op;
+}
+
 void H2Operator::build() {
     if (built_) return; // idempotent for an immutable parameter set
     const auto& boxes = tree_.boxes();
@@ -197,7 +240,10 @@ void H2Operator::build() {
     info_.bytes_coupling = 8LL * info_.n_unique_couplings * q2_ * q2_;
     info_.bytes_near = 8LL * info_.n_near_stencils * ls2_ * ls2_;
     info_.bytes_buffers = 8LL * 2 * nbox * q2_;
-    info_.bytes_total = info_.bytes_coupling + info_.bytes_near + info_.bytes_buffers;
+    info_.bytes_kernel = owned_kernel_bytes_;
+    info_.near_table_extent = owned_extent_;
+    info_.bytes_total = info_.bytes_coupling + info_.bytes_near +
+                        info_.bytes_buffers + info_.bytes_kernel;
     built_ = true;
 }
 

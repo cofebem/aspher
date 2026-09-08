@@ -519,19 +519,24 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
 
     for (std::size_t li = 0; li < levels.size(); ++li) {
         const int n = levels[li];
-        BoussinesqKernel kernel(n, L, E_star);
+        // A06: the FFT backend needs the full Love table (it transforms it);
+        // the H2 backend never touches it after build(), so it is built
+        // through the compact near-offset path instead — 8*n^2 bytes saved at
+        // every level (2 GiB at Ns=16384).
+        std::unique_ptr<BoussinesqKernel> kernel;
         std::unique_ptr<H2Operator> h2;
         std::unique_ptr<FFTOperator> fop;
         MatVecIntoT<double> mv;
         if (np.backend == "fft") {
-            fop = std::make_unique<FFTOperator>(kernel);
+            kernel = std::make_unique<BoussinesqKernel>(n, L, E_star);
+            fop = std::make_unique<FFTOperator>(*kernel);
             fop->build();
             mv = [&fop](const Eigen::VectorXd& v, Eigen::VectorXd& out) {
                 fop->matvec_into(v, out);
             };
         } else {
-            h2 = std::make_unique<H2Operator>(kernel,
-                                              H2Params{np.leaf_side, np.q, 1});
+            h2 = make_boussinesq_h2(n, L, E_star,
+                                    H2Params{np.leaf_side, np.q, 1});
             h2->build();
             mv = [&h2](const Eigen::VectorXd& v, Eigen::VectorXd& out) {
                 h2->matvec_into(v, out);

@@ -116,23 +116,39 @@ public:
                     double aca_tol, int leaf_size, bool use_hmatrix,
                     bool use_acagp, double central_fraction, double inline_svd_tol,
                     std::string backend, int q, int near_radius, int h2_leaf_side)
-        : kernel_(grid_size, domain_size, E_star) {
+        : Ns_(grid_size) {
+        if (grid_size <= 0)
+            throw std::invalid_argument("grid_size must be positive");
+        if (!(domain_size > 0.0))
+            throw std::invalid_argument("domain_size must be positive");
+        if (!(E_star > 0.0))
+            throw std::invalid_argument("E_star must be positive");
         if (backend.empty()) backend = use_hmatrix ? "hmatrix" : "dense";
         backend_ = backend;
+        // A06: only the backends that actually consume the Ns x Ns Love table
+        // build it. The H2 operator never touches it after build(), so it goes
+        // through the compact near-offset path (8*N bytes saved).
         if (backend_ == "h2") {
-            h2_ = std::make_unique<hmc::H2Operator>(
-                kernel_, hmc::H2Params{h2_leaf_side, q, near_radius});
+            h2_ = hmc::make_boussinesq_h2(
+                grid_size, domain_size, E_star,
+                hmc::H2Params{h2_leaf_side, q, near_radius});
             h2_->build();
         } else if (backend_ == "fft") {
-            fft_ = std::make_unique<hmc::FFTOperator>(kernel_);
+            kernel_ = std::make_unique<hmc::BoussinesqKernel>(grid_size,
+                                                              domain_size, E_star);
+            fft_ = std::make_unique<hmc::FFTOperator>(*kernel_);
             fft_->build();
         } else if (backend_ == "hmatrix") {
+            kernel_ = std::make_unique<hmc::BoussinesqKernel>(grid_size,
+                                                              domain_size, E_star);
             tree_ = std::make_unique<hmc::ClusterTree>(grid_size, leaf_size);
             hmat_ = std::make_unique<hmc::HMatrix>(
-                kernel_, *tree_, eta, aca_tol, use_acagp, central_fraction,
+                *kernel_, *tree_, eta, aca_tol, use_acagp, central_fraction,
                 inline_svd_tol);
         } else if (backend_ == "dense") {
-            dense_ = kernel_.assemble_dense();
+            kernel_ = std::make_unique<hmc::BoussinesqKernel>(grid_size,
+                                                              domain_size, E_star);
+            dense_ = kernel_->assemble_dense();
         } else {
             throw std::invalid_argument("unknown backend: " + backend_ +
                                         " (expected dense, hmatrix, h2, or fft)");
@@ -149,13 +165,13 @@ public:
     py::array_t<double>
     matvec(const py::array_t<double, py::array::c_style | py::array::forcecast>& p)
         const {
-        Eigen::VectorXd v = to_vector(p, kernel_.size());
+        Eigen::VectorXd v = to_vector(p, (Ns_ * Ns_));
         Eigen::VectorXd u;
         {
             py::gil_scoped_release release;
             u = apply(v);
         }
-        py::array_t<double> out(kernel_.size());
+        py::array_t<double> out((Ns_ * Ns_));
         std::memcpy(out.mutable_data(), u.data(), sizeof(double) * u.size());
         return out;
     }
@@ -165,12 +181,12 @@ public:
                    double p_nominal, double tol, int max_iter,
                    bool use_pr, const std::string& precond,
                    const py::object& p_init) const {
-        Eigen::VectorXd g0 = to_vector(gap, kernel_.size());
+        Eigen::VectorXd g0 = to_vector(gap, (Ns_ * Ns_));
 
         hmc::Precond pc;
         if (precond == "fourier") {
             auto fp = std::make_shared<hmc::FourierPreconditioner>(
-                kernel_.grid_size());
+                Ns_);
             pc = [fp](const Eigen::VectorXd& g,
                       const std::vector<std::uint8_t>& contact) {
                 return fp->apply(g, contact);
@@ -184,12 +200,12 @@ public:
         if (!p_init.is_none()) {
             p0 = to_vector(p_init.cast<py::array_t<double, py::array::c_style |
                                                           py::array::forcecast>>(),
-                           kernel_.size());
+                           (Ns_ * Ns_));
             p0ptr = &p0;
         }
 
         PyResult out;
-        out.Ns = kernel_.grid_size();
+        out.Ns = Ns_;
         {
             py::gil_scoped_release release;
             auto op = [this](const Eigen::VectorXd& v) { return apply(v); };
@@ -265,9 +281,9 @@ public:
         }
         if (backend_ != "hmatrix") {
             d["dense"] = true;
-            d["bytes"] = 8LL * kernel_.size() * kernel_.size();
-            py::print("dense influence matrix,", kernel_.size(), "x",
-                      kernel_.size());
+            d["bytes"] = 8LL * Ns_ * Ns_ * Ns_ * Ns_;
+            py::print("dense influence matrix,", (Ns_ * Ns_), "x",
+                      (Ns_ * Ns_));
             return d;
         }
         const auto s = hmat_->info();
@@ -283,7 +299,8 @@ public:
     }
 
 private:
-    hmc::BoussinesqKernel kernel_;
+    int Ns_ = 0;
+    std::unique_ptr<hmc::BoussinesqKernel> kernel_; // only for fft/hmatrix/dense
     std::string backend_;
     std::unique_ptr<hmc::ClusterTree> tree_;
     std::unique_ptr<hmc::HMatrix> hmat_;

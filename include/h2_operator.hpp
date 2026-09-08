@@ -5,8 +5,10 @@
 #include "uniform_quadtree.hpp"
 
 #include <Eigen/Dense>
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <functional>
 #include <vector>
 
@@ -24,6 +26,11 @@ struct H2Info {
     std::int64_t n_near_interactions = 0, n_far_interactions = 0;
     int n_unique_couplings = 0, n_near_stencils = 0;
     std::int64_t bytes_coupling = 0, bytes_near = 0, bytes_buffers = 0, bytes_total = 0;
+    // Immutable kernel coefficient data the operator OWNS (A06/A07): the
+    // compact near-offset table when built through make_boussinesq_h2, 0 when
+    // the coefficients belong to a caller-owned kernel. Counted once.
+    std::int64_t bytes_kernel = 0;
+    int near_table_extent = 0; // b, the compact table side (0 = not owned)
 };
 
 // Per-box occupancy bitmap over the complete quad-tree: box_occ[b] != 0 iff
@@ -54,6 +61,16 @@ struct H2Mask {
 using FarKernelFn = std::function<double(double, double)>;
 using NearKernelFn = std::function<double(int, int)>;
 
+// Required near-offset extent for an H2 operator (spec A06): the near field
+// of a leaf covers the (near_radius+1) leaf shells around it, so only element
+// offsets with |dx|,|dy| <= (near_radius+1)*leaf_side - 1 are ever requested.
+// A table of b = min(Ns, (near_radius+1)*leaf_side) entries per axis suffices.
+inline int near_table_extent(int Ns, int leaf_side, int near_radius) {
+    const long long span =
+        static_cast<long long>(near_radius + 1) * leaf_side;
+    return static_cast<int>(std::min<long long>(Ns, span));
+}
+
 // Matrix-free black-box FMM (Fong & Darve 2009) operator for the translation-
 // invariant Boussinesq half-space kernel on a uniform Ns x Ns grid. Far field
 // via tensor-product Chebyshev interpolation with cached, translation-invariant
@@ -74,6 +91,14 @@ public:
     // build silently produced a different (wrong) operator (spec A19).
     void build();
     bool is_built() const { return built_; }
+
+    // Record coefficient data the operator owns (set by make_boussinesq_h2).
+    void set_owned_kernel_bytes(std::int64_t bytes, int extent) {
+        info_.bytes_kernel = bytes;
+        info_.near_table_extent = extent;
+        owned_kernel_bytes_ = bytes;
+        owned_extent_ = extent;
+    }
 
     // u = S x, with x and u in natural flat order (global = iy*Ns + ix).
     // Reuses internal multipole/local scratch across calls: concurrent matvec
@@ -196,6 +221,8 @@ private:
 
     H2Info info_;
     bool built_ = false;
+    std::int64_t owned_kernel_bytes_ = 0;
+    int owned_extent_ = 0;
 
     double far_kernel(double dx, double dy) const; // g(dx,dy)
 
@@ -670,5 +697,17 @@ void H2Operator::matvec_masked_stream_impl(
         }
     }
 }
+
+// Build a Boussinesq H2 operator WITHOUT materialising the full Ns x Ns Love
+// table (spec A06). Both the nested driver and the explicit solver used to
+// construct a BoussinesqKernel — 8N bytes, 2 GiB at Ns=16384 and 8 GiB at
+// Ns=32768 — and then never touch it again after build(), because the matvec
+// runs entirely off the operator's own caches. Only the compact near table
+// (min(Ns,(near_radius+1)*leaf_side)^2 doubles: 2 KiB at leaf_side=8,
+// near_radius=1) is needed, and the returned operator OWNS it, so no external
+// lifetime contract is imposed. The arithmetic is identical to
+// BoussinesqKernel's, so the result is bit-for-bit the same operator.
+std::unique_ptr<H2Operator> make_boussinesq_h2(int Ns, double L, double E_star,
+                                               H2Params params);
 
 } // namespace hmc
