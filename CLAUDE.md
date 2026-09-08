@@ -122,6 +122,25 @@ Translation invariance: `S_ij` depends only on `|ix-jx|, |iy-jy|` → Ns×Ns loo
 
 ### H2/FMM operator (`backend="h2"`) — preferred for large Ns
 Matrix-free black-box FMM (Chebyshev interpolation, Fong & Darve 2009). **No blocks stored**: shares bases per cluster and couplings per interaction, all cached by `(level, relative offset)` via translation invariance. O(N) memory, O(N) matvec.
+- **Memory accounting (2026-09, A07)**: `H2Operator::memory()` itemises every
+  allocation, counted once — kernel (owned vs **borrowed**), tree, leaves, far
+  CSR, near CSR, transfers, couplings, near stencils, float caches, and the
+  workspace *actually* held. Nothing lazily sized counts as resident;
+  `estimated_next_apply_bytes` predicts it, and `release_scratch()` /
+  `release_single_caches()` free the workspace and the float generation. The old
+  report (couplings + near + predicted buffers) understated the footprint by
+  **≥46%**. What it hid, at Ns=1024/ℓ=8/q=6: **far CSR 8.17 MiB (58% of
+  resident)**, tree 1.00 MiB — against couplings 2.37 MiB, the item the old
+  report treated as the main cost. Resident 14.05 MiB + 8.00 MiB borrowed Love
+  table (`system_resident()` = 22.05 MiB) + 12.00 MiB predicted first-apply
+  scratch. *The far interaction list, not the couplings, dominates H² storage* —
+  a concrete A11 target the old accounting could not reveal. `FFTInfo` gains the
+  matching `bytes_kernel_borrowed`/`estimated_next_apply_bytes`; `ContactResult`
+  gains `memory` (cg_state, best_iterate, contact_mask, output_arrays, peak —
+  the solver's own buffers, explicitly *not* process RSS) and per-phase
+  `timings` (total/matvec/precond/build/coarse/verification/output; the nested
+  driver attributes operator construction and the coarse solves, measured at 17%
+  of wall time at Ns=256). All exposed to Python.
 - **Compact construction (2026-09, A06)**: `make_boussinesq_h2(Ns, L, E*, params)` builds the operator **without** the Ns² Love table. Only offsets with `|dx|,|dy| ≤ (near_radius+1)·leaf_side − 1` are ever requested, so a `b = min(Ns,(r+1)ℓ)` table suffices (2 KiB at ℓ=8, r=1) and the operator *owns* it (no external lifetime contract). Bit-for-bit identical to the full-table operator over 48 configurations (`test_contracts` T13). Used by `solve_contact_nested` (h2 levels) and `ContactSolver(backend="h2")`; the FFT backend still builds the full table because it transforms it. Measured build: Ns=1024 q=4 48.7→14.3 ms (3.4×), Ns=2048 q=4 200.8→52.4 ms (3.8×); storage −8N bytes (2 GiB at Ns=16384, 8 GiB at 32768). `H2Info` gains `bytes_kernel` and `near_table_extent`.
 - **Tree**: `UniformQuadTree` — balanced quad-tree to square leaves of side `h2_leaf_side` (default 8); stores index *ranges*, no index lists. `Ns`, `leaf_side` must be powers of two.
 - **Far field**: tensor-product Chebyshev interpolation, order `q` (default 4; r=q² nodes). Passes `P2M → M2M → M2L → L2L → L2P`. Coupling `K[a,b]=g(ξ_a−ξ_b)` cached by `(level,dx,dy)`; M2M/L2L are 4 cached q²×q² matrices (scale-invariant).
@@ -231,6 +250,27 @@ Default β formula: **Polak-Ribière+** (`use_pr=true`); Fletcher-Reeves availab
 - **Spectral preconditioner** (`precond="fourier"`, `fourier_precond.hpp`): `M⁻¹` with symbol `∝|q|` (inverse of `Ŝ∝1/|q|`) applied by FFT to the contact-masked residual, mean-zeroed, DC zeroed. Only the CG direction/β change (M-inner product); exact line search untouched; `precond="none"` follows the original algorithm exactly (identical solution; since the 2026-07 OpenMP reductions the floating-point summation order differs, so no longer bit-for-bit). ~1.7–2.9× fewer iterations (more at larger Ns).
 - **Warm start** (`p_init=`): start PCG from a given pressure (renormalised to the load).
 - **Nested-grid (cascadic/FMG) continuation** — single C++ entry point `hc.solve_nested(grid_size, gap, p_nominal, coarsest=64, q=6, ...)` (`nested_solve.hpp`): builds the coarse→fine hierarchy and per-level H2 operators internally, restricts the gap (2×2 average), and warm-starts each level by injecting the prolonged coarse pressure (sharp contact boundary; injection beats bilinear). `grid_size` must be `coarsest·2^k`. Combined with the preconditioner → up to 4× fewer iterations at Ns=1024 (180→45), full solve cheaper than one cold solve. Prototypes in `experiments/`; design in `doc/specs/2026-06-30-spectral-preconditioner-design.md`.
+- **Precision policy (2026-09, A09)** — `hc.solve_nested(..., precision=...)`:
+  `"double"` (default), `"float"` (== `single_precision=True`), or
+  `"float_then_double"`. **Behaviour change:** float cannot drive the
+  certificate below ~2e-7, so a *float-only* solve asked for a tighter
+  tolerance now returns `status="stagnated"`, `status_reason="precision_limit"`
+  instead of a relaxed success; pass `allow_tolerance_relaxation=True` to accept
+  the documented floor (`float_floor=2e-6` by default), and `requested_tol` /
+  `effective_tol` record both numbers either way. `"float_then_double"`
+  identifies the contact in float at the floor, releases the float cache
+  generation, then **polishes in double** with the same fixed operator,
+  warm-started, to the requested tolerance — a fresh solve, so no conjugacy or
+  recurrence state crosses the switch. Measured at Ns=256 (fft, p̄=0.02,
+  requested 1e-8, vs a double tol=1e-12 reference): double 31 it / rel 8.0e-9 /
+  0.074 s; float 23 it / rel 5.0e-6 (stagnated); **float_then_double 31 it
+  (23 float + 8 double) / rel 2.1e-8 / 0.056 s** — 240× more accurate than
+  float *and* faster than pure double. It is **not** a memory substitute: the
+  polish carries the double working set, so the large-grid recipe stays on
+  `float_only`. Combining it with `active_set=True` is rejected (the O(N_c)
+  polish route is a follow-up). `result.stage_stats` lists every stage
+  (name, precision, q, requested/effective tol, iterations, matvecs, seconds,
+  status, final certificate).
 - **Single precision** (`hc.solve_nested(..., single_precision=True)`): runs each level's H2 matvec + PCG (and the |q| preconditioner's FFT) in `float`. `solve_contact` is templated (`solve_contact_impl<Real>`, float/double); `H2Operator::matvec_single`/`build_single_caches` hold float cache copies; `FourierPreconditioner::apply_single` uses a float FFT (symbol stored as float). Float's arithmetic floor is ~1e-6, so the finest tol is clamped to 2e-6 (solution matches double to rel-L2 ~2e-5, ΔArea ~4e-6). **Keep the preconditioner ON with single precision** — the float solve stalls (and returns a *wrong* answer) without it. Default `False`. Since the 2026-07 perf pass all CG scalar reductions (dots, sums, means, line-search num/den) accumulate in **double** even when Real=float, and the line-search denominator keeps the centred `(r−rmean)·t` form (the expanded `Σrt − rmean·Σt` form cancels catastrophically in float): the float solve now converges in ~the same iteration count as double (e.g. Ns=2048 fixed-band rough: 21 it, 3.4 s vs 214 stalled it, 52 s before) instead of grinding at the noise floor.
 - **Light result** (`hc.solve_nested(..., light_result=True)`): skip the `displacement`/`gap` result arrays (2 of the 3 double N-sized outputs); `pressure` + all scalars still filled. Same flag on `solve_contact(..., light=)`. Through the Python bindings, `result.displacement`/`result.gap` are `None` when light.
 - **Stagnation guard** (`solve_contact_impl`): if the merit (max of `fw_error`, `penetration_error`) plateaus for 200 iterations, the solver first spends up to three guaranteed-descent identification steps; if those do not help it stops with `status = stagnated` (**not** converged — 2026-09, A01) and returns the best checked iterate. With the double accumulators (2026-07) the float path normally reaches its clamped tol directly, so this is a safety net rather than the usual float exit path.
@@ -362,6 +402,13 @@ Fix: use plain `\begin{enumerate}` and `\begin{itemize}` without optional argume
 | Fixture oracle cross-check (closed form vs adaptive quadrature) | 1.2e-69 (Love), 1.3e-53 (Cerruti) |
 | Compact vs full-table H2 matvec (48 configs, f64+f32) | bit-for-bit identical |
 | H2 build, full table → compact (Ns=1024/2048, q=4) | 48.7→14.3 ms (3.4×), 200.8→52.4 ms (3.8×); table 8/32 MiB → 2 KiB |
+| **A07/A09 (2026-09) — measurement and staged precision** | |
+| H2 resident memory, itemised (Ns=1024, ℓ=8, q=6) | far CSR 8.17 + couplings 2.37 + near CSR 2.13 + tree 1.00 + near stencils 0.28 + transfers 0.04 = 14.05 MiB (old report: 14.65 MiB "total", omitting ≥6.74 MiB) |
+| Borrowed vs owned coefficients at Ns=1024 | compact owns 2 KiB; kernel-constructed borrows 8 MiB (`system_resident` 22.05 MiB) |
+| Nested build share of wall time (Ns=256, h2 q=6) | 17% (build 0.036 s of 0.215 s total) |
+| Float achievable certificate (Ns=256 rough, fft) | 2e-7 converges (102 it); tighter stalls at 1.88e-7; pressure error vs double saturates at ~5e-6 either way |
+| Precision policy at Ns=256, requested 1e-8 (vs double tol=1e-12) | double 31 it / rel 8.0e-9 / 0.074 s; float 23 it / rel 5.0e-6 / **stagnated**; float_then_double 23+8 it / rel **2.1e-8** / 0.056 s |
+| float_then_double polish gain (T17 fixture, Ns=64) | pressure rel vs double 2.03e-5 → **1.76e-9** for 4 extra double iterations |
 
 ---
 
@@ -497,8 +544,10 @@ de Saxcé–Feng reference cross-check (slow; not for production).
 - **Accuracy/efficiency roadmap (spec `doc/specs/2026-09-08-accuracy-efficiency-improvements.md`, plan `doc/plans/2026-09-08-accuracy-efficiency-validation.md`, review `doc/review_20260908.md`)**:
   - ✅ **D1 correctness release done (2026-09-08, branch `feat/accuracy-efficiency`)** — A01 (certificates + honest statuses), A02 (scale-invariant activation + feasible identification step), A03 (global candidate verification), A04 (gap datum), A15 (friction load/hold semantics + final local KKT), A19-protective (validation, build idempotence, opt-in allocator policy). New gates: `test_certification`, `test_precision`, `test_contracts`, `tests/contact_oracle.hpp` (independent dense-QP oracle), `tests/test_certification_py.py`, plus T06/T24/T25/T26 in the existing groups.
   - ✅ **A06 + A05 done (2026-09-08)**: compact near-offset H2 construction (bit-for-bit, 3–4× faster build, −8N bytes) and stable Love/Cerruti evaluation (worst 3.5e-14 against an 80-digit fixture, corners finite), with the offline oracle `tests/generate_kernel_reference.py` and the gate `test_kernel_stability`.
-  - **D2 remaining**: A07 accurate memory/cost instrumentation, A14 ACA storage protections.
-  - **D3 (measured optimisation)**: A08 displacement recurrence, A09 staged precision/q, A10 M2L compression/batching, A11 occupied traversal + screening, A17 vector H².
+  - ✅ **A07 + A09 done (2026-09-08/09)**: itemised memory accounting and phase timing (the old H2 report understated by ≥46%; the far interaction list turns out to dominate), and the staged precision policy delivering `float_then_double` plus the honest float tolerance contract. Gates T17/T23 in `test_contracts`.
+  - **D2 remaining**: A14 ACA storage protections (parked — the H-matrix backend is superseded by H2/FFT).
+  - **Evidence already on record before building anything**: `experiments/review_20260908_baseline.md` maps every review probe to what fixed it. Three D3 items have *negative* pre-existing evidence — the tensor M2M/L2L transfer is **slower** at production q (0.65×/0.61× at q=4/6, only 1.20× at q=8), M2L SVD compression has a flop ratio **worse than dense** at q=4 (1.175), and the displacement recurrence saved 18% of matvecs but only 4% of wall time with its precondition holding just 8 of 22 iterations. Measure before implementing.
+  - **D3 (measured optimisation)**: A08 displacement recurrence, A10 M2L compression/batching, A11 occupied traversal + screening (its safe-screening bound needs `fw_gap`, which A01 now provides), A17 vector H². A09's remaining half — staged **q** and operator-error propagation `G_S ≤ G̃ + 2Pε_u` — is still open.
   - **D4/D5 (research)**: A12 two-phase simplex/reduced-CG, A13 sparse preconditioner, A16 semismooth Newton for friction (the path to lowering the 1e-2 tangential KKT default), A18 observables + Galerkin/periodic/multigrid.
 - ~~FFT preconditioner speed~~ ✅ done (2026-07): half-spectrum transforms on pocketfft (default, BSD) or FFTW3 plans (opt-in, GPL; ~16%/~5% faster double/float end-to-end at Ns=4096), object-owned scratch/plans. The FFT is now a small share of the iteration.
 - ~~FFT-convolution matvec backend (`backend="fft"`)~~ ✅ done (2026-07): exact zero-padded Love-kernel convolution per `doc/specs/2026-07-09-fft-convolution-backend-design.md`, plumbed into `ContactSolver` and `solve_nested`. **Measured outcome**: exactness is the headline (matches dense to ~1e-15 double / ~1.4e-7 float — no interpolation, no Gibbs); performance is modestly better than H2 at Ns ≤ 2048 (~1.5–1.6× matvec), ≈parity at Ns=4096 (measured under desktop load) — the padded transforms are bandwidth-bound, so the spec's flop-count 2–3× estimate did not materialise; H2 remains preferred for very large Ns.
