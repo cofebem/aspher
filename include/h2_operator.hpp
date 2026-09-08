@@ -222,6 +222,12 @@ public:
     // before materialising full-grid output.
     void release_scratch() const;
 
+    // Drop the float cache generation (A09 memory policy: a staged solve must
+    // not keep a precision generation it has finished with). The double caches
+    // are the source of truth and are untouched; build_single_caches() can
+    // rebuild them.
+    void release_single_caches() const;
+
     int n_far_interactions() const { return static_cast<int>(info_.n_far_interactions); }
     int n_unique_couplings() const { return info_.n_unique_couplings; }
 

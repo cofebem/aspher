@@ -73,7 +73,8 @@ def worker(backend, precision, Ns, active_set=False):
     kwargs = dict(
         grid_size=Ns, gap=gap0, p_nominal=P_BAR, coarsest=COARSEST,
         precond=True, tol=1e-8, coarse_tol=1e-4, max_iter=20000,
-        single_precision=single, light_result=True, backend=backend,
+        single_precision=single, allow_tolerance_relaxation=single,
+        light_result=True, backend=backend,
         record_error_history=True,
     )
     if backend == "h2":

@@ -368,8 +368,99 @@ static int t23_memory_accounting() {
     return 0;
 }
 
+// ── T17 (partial): accuracy stages and precision policy (spec A09) ────────
+static int t17_stages() {
+    const int Ns = 64, N = Ns * Ns;
+    Eigen::VectorXd g0(N);
+    for (int iy = 0; iy < Ns; ++iy)
+        for (int ix = 0; ix < Ns; ++ix) {
+            const double x = (ix + 0.5) / Ns - 0.5, y = (iy + 0.5) / Ns - 0.5;
+            g0(iy * Ns + ix) = 0.5 * (x * x + y * y) +
+                               0.002 * std::cos(12.0 * M_PI * x) *
+                                   std::cos(10.0 * M_PI * y);
+        }
+    const double p_bar = 0.02, tol = 1e-9;
+    hmc::NestedParams base;
+    base.coarsest = 32;
+    base.q = 6;
+    base.backend = "fft";
+
+    hmc::NestedParams dbl = base;
+    const auto rd = hmc::solve_contact_nested(Ns, 1.0, 1.0, g0, p_bar, tol,
+                                              20000, true, dbl);
+    CHECK(rd.converged);
+
+    // float-only: the request is below the float floor, so it must FAIL
+    hmc::NestedParams flt = base;
+    flt.precision = hmc::NestedParams::Precision::float_only;
+    const auto rf = hmc::solve_contact_nested(Ns, 1.0, 1.0, g0, p_bar, tol,
+                                              20000, true, flt);
+    std::printf("T17 float-only: %s/%s requested %.0e effective %.0e fw %.2e\n",
+                hmc::to_string(rf.status), rf.status_reason.c_str(),
+                rf.requested_tol, rf.effective_tol, rf.fw_error);
+    CHECK(!rf.converged);
+    CHECK(rf.status == hmc::SolveStatus::stagnated);
+    CHECK(rf.status_reason == "precision_limit");
+    CHECK(rf.requested_tol < rf.effective_tol);
+
+    // ... unless the caller explicitly accepts the relaxation
+    hmc::NestedParams fltr = flt;
+    fltr.allow_tolerance_relaxation = true;
+    const auto rfr = hmc::solve_contact_nested(Ns, 1.0, 1.0, g0, p_bar, tol,
+                                               20000, true, fltr);
+    CHECK(rfr.converged);
+    CHECK(rfr.effective_tol > rfr.requested_tol); // and it is recorded
+
+    // float_then_double: meets the request, and beats float-only accuracy
+    hmc::NestedParams ftd = base;
+    ftd.precision = hmc::NestedParams::Precision::float_then_double;
+    const auto rp = hmc::solve_contact_nested(Ns, 1.0, 1.0, g0, p_bar, tol,
+                                              20000, true, ftd);
+    const double rel_f = (rfr.pressure - rd.pressure).norm() / rd.pressure.norm();
+    const double rel_p = (rp.pressure - rd.pressure).norm() / rd.pressure.norm();
+    std::printf("T17 float_then_double: %s fw %.2e | pressure vs double: "
+                "float-only %.2e -> polished %.2e\n",
+                hmc::to_string(rp.status), rp.fw_error, rel_f, rel_p);
+    CHECK(rp.converged);
+    CHECK(rp.fw_error <= tol && rp.penetration_error <= tol);
+    CHECK(rp.effective_tol == rp.requested_tol);
+    CHECK(rel_p < rel_f); // the polish is strictly more accurate
+
+    // stage metadata: every level plus the polish, with honest per-stage
+    // precision, target and status
+    CHECK(rp.stage_stats.size() == rd.stage_stats.size() + 1);
+    const auto& last = rp.stage_stats.back();
+    const auto& prev = rp.stage_stats[rp.stage_stats.size() - 2];
+    CHECK(prev.precision == "float" && prev.name.rfind("finest:", 0) == 0);
+    CHECK(last.precision == "double" && last.name.rfind("polish:", 0) == 0);
+    CHECK(prev.effective_tol == ftd.float_floor);
+    CHECK(last.effective_tol == tol);
+    CHECK(last.status == hmc::SolveStatus::converged);
+    // the reported finest work is the SUM of both stages
+    CHECK(rp.iterations == prev.iterations + last.iterations);
+    CHECK(rp.matvec_count >= prev.matvec_count + last.matvec_count);
+    for (const auto& st : rp.stage_stats) CHECK(st.seconds >= 0.0);
+
+    // the polish does the smaller share of the work: the float stage
+    // identified the contact
+    std::printf("T17 stages: float %d it, polish %d it\n", prev.iterations,
+                last.iterations);
+    CHECK(last.iterations < prev.iterations);
+
+    // float_then_double with the active-set path is rejected, not silently
+    // downgraded
+    hmc::NestedParams bad = ftd;
+    bad.backend = "h2";
+    bad.active_set = true;
+    CHECK(rejects([&] {
+        hmc::solve_contact_nested(Ns, 1.0, 1.0, g0, p_bar, tol, 20000, true, bad);
+    }));
+    return 0;
+}
+
 int main() {
     if (t13_compact_cache()) return 1;
+    if (t17_stages()) return 1;
     if (t23_memory_accounting()) return 1;
     if (t33_bad_inputs()) return 1;
     if (t34_lifecycle()) return 1;

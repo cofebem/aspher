@@ -63,6 +63,9 @@ public:
     void build_single_caches() const;
 
     FFTInfo info() const;
+
+    // Drop the float spectrum and scratch (A09 memory policy).
+    void release_single_caches() const;
     void print_statistics() const;
 
 private:

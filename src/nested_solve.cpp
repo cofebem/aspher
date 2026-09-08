@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <limits>
+#include <string>
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
@@ -484,6 +485,20 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                 "solve_contact_nested: active_delta must be >= 0");
     }
 
+    // ── A09: resolve the precision policy (legacy flag folds into it) ─────
+    NestedParams::Precision policy = np.precision;
+    if (policy == NestedParams::Precision::double_only && np.single_precision)
+        policy = NestedParams::Precision::float_only;
+    const bool any_float = policy != NestedParams::Precision::double_only;
+    if (!(np.float_floor > 0.0))
+        throw std::invalid_argument(
+            "solve_contact_nested: float_floor must be positive");
+    if (policy == NestedParams::Precision::float_then_double && np.active_set)
+        throw std::invalid_argument(
+            "solve_contact_nested: float_then_double does not yet route its "
+            "polish through the active-set path; use float_only or "
+            "double_only with active_set=true");
+
     std::vector<int> levels;
     for (int n = np.coarsest; n <= Ns; n *= 2) levels.push_back(n);
     if (levels.empty() || levels.back() != Ns)
@@ -531,6 +546,24 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
     // and must appear in any full-solve total (plan §8).
     double t_build = 0.0, t_coarse = 0.0;
     const auto t_nested = std::chrono::steady_clock::now();
+    std::vector<ContactResult::Stage> stages;
+    auto record_stage = [&stages](const std::string& name, const char* prec,
+                                  int q, double req, double eff,
+                                  const ContactResult& r) {
+        ContactResult::Stage st;
+        st.name = name;
+        st.precision = prec;
+        st.q = q;
+        st.requested_tol = req;
+        st.effective_tol = eff;
+        st.iterations = r.iterations;
+        st.matvec_count = r.matvec_count;
+        st.seconds = r.time_total;
+        st.status = r.status;
+        st.fw_error = r.fw_error;
+        st.penetration_error = r.penetration_error;
+        stages.push_back(std::move(st));
+    };
 
     for (std::size_t li = 0; li < levels.size(); ++li) {
         const int n = levels[li];
@@ -574,10 +607,16 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         Eigen::Ref<const Eigen::VectorXd> glvl =
             finest ? Eigen::Ref<const Eigen::VectorXd>(g0)
                    : Eigen::Ref<const Eigen::VectorXd>(gap[li]);
+        // A09: this level's working precision and target. Under
+        // float_then_double the finest level runs float only as an
+        // IDENTIFICATION stage at the float floor; the double polish that
+        // follows carries the requested tolerance.
+        const bool polish_after =
+            finest && policy == NestedParams::Precision::float_then_double;
+        const bool level_float = any_float;
         double lvl_tol = finest ? tol : np.coarse_tol;
-        // float arithmetic cannot drive the complementarity error below ~1e-6,
-        // so clamp the requested tolerance to a reachable floor in that mode.
-        if (np.single_precision) lvl_tol = std::max(lvl_tol, 2e-6);
+        if (polish_after) lvl_tol = np.float_floor;
+        else if (level_float) lvl_tol = std::max(lvl_tol, np.float_floor);
         // coarse levels only need the pressure (for prolongation), so drop
         // their displacement/gap; the finest honours light_result. Exception:
         // the active-set candidate set needs the next-to-finest gap field
@@ -599,13 +638,18 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         // the float floor and the coarse-level tolerances are deliberate
         // stage policies, not silent relaxations of the user's target: the
         // finest double stage carries the requested tolerance strictly.
-        lopt.allow_tolerance_relaxation = !finest || np.single_precision;
+        // Coarse levels are deliberately loose (cascadic continuation), so
+        // their relaxation is a stage policy. The FINEST stage carries the
+        // user's contract: a float-only finest that cannot reach the request
+        // must say so unless the caller explicitly allowed relaxation.
+        lopt.allow_tolerance_relaxation =
+            !finest || polish_after || np.allow_tolerance_relaxation;
         lopt.scales.g_ref = g_ref;
         lopt.scales.datum = datum;
         // double levels read their gap in place and subtract the datum on the
         // fly (no extra N-sized buffer); float levels get it removed inside
         // the cast, before any information can be rounded away.
-        lopt.scales.datum_mode = np.single_precision
+        lopt.scales.datum_mode = level_float
                                      ? SolveScales::DatumMode::caller
                                      : SolveScales::DatumMode::solver;
 
@@ -613,7 +657,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             // restricted (active-set) solve on the candidate set built from
             // the coarse contact + gap; p_init/coarse_gap are consumed
             const FourierPreconditioner* fpp = np.precond ? &fp : nullptr;
-            if (np.single_precision) {
+            if (level_float) {
                 h2->build_single_caches();
                 // centre inside the cast: rounding a large offset first is
                 // exactly what destroyed the float solution (review §4)
@@ -630,7 +674,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                                             datum);
             }
             coarse_gap.resize(0);
-        } else if (np.single_precision) {
+        } else if (level_float) {
             MatVecIntoT<float> mvf;
             if (fop) {
                 fop->build_single_caches();
@@ -672,6 +716,54 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             if (!finest) gap[li].resize(0);
         }
 
+        record_stage(std::string(finest ? "finest:" : "coarse:") +
+                         std::to_string(n),
+                     level_float ? "float" : "double", np.q,
+                     lopt.requested_tol, lopt.tol, res);
+
+        if (polish_after) {
+            // ── A09 stage 2: polish in double ─────────────────────────────
+            // The float stage identified the contact set at the float floor;
+            // this re-solves with the SAME fixed accurate operator, in
+            // double, warm-started from that pressure, to the tolerance the
+            // caller actually asked for. It is a fresh solve, so no conjugacy
+            // or recurrence state crosses the precision switch. The float
+            // cache generation is dropped first: a staged solve must not keep
+            // a precision it has finished with.
+            if (h2) h2->release_single_caches();
+            if (fop) fop->release_single_caches();
+            Eigen::VectorXd p_warm = std::move(res.pressure);
+            SolveOptions popt;
+            popt.tol = tol;
+            popt.requested_tol = tol;
+            popt.max_iter = max_iter;
+            popt.use_pr = use_pr;
+            popt.light = np.light_result;
+            popt.record_history = record_history;
+            popt.keep_best = !np.light_result;
+            popt.allow_tolerance_relaxation = np.allow_tolerance_relaxation;
+            popt.scales.g_ref = g_ref;
+            popt.scales.datum = datum;
+            popt.scales.datum_mode = SolveScales::DatumMode::solver;
+            const ContactResult before = res;
+            res = solve_contact_impl<double>(mv, glvl, p_bar, popt, pc, &p_warm);
+            record_stage("polish:" + std::to_string(n), "double", np.q, tol,
+                         tol, res);
+            // the finest level's reported work is the sum of its stages
+            res.iterations += before.iterations;
+            res.matvec_count += before.matvec_count;
+            res.precond_count += before.precond_count;
+            res.time_matvec += before.time_matvec;
+            res.time_precond += before.time_precond;
+            res.memory.peak = std::max(res.memory.peak, before.memory.peak);
+            if (record_history) {
+                std::vector<double> h = before.error_history;
+                h.insert(h.end(), res.error_history.begin(),
+                         res.error_history.end());
+                res.error_history = std::move(h);
+            }
+        }
+
         if (!finest) {
             t_coarse += res.time_total;
             p_init = prolong_field(res.pressure, n);
@@ -679,6 +771,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             if (keep_gap) coarse_gap = std::move(res.gap);
         }
     }
+    res.stage_stats = std::move(stages);
     res.time_build = t_build;
     res.time_coarse = t_coarse;
     res.time_total = std::chrono::duration<double>(

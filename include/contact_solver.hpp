@@ -87,6 +87,23 @@ struct ContactResult {
     double time_verification = 0.0; // streamed global checks (active set)
     double time_output = 0.0;       // materialising the full-grid fields
 
+    // One entry per solve stage (coarse level, finest, polish). Spec §3.2
+    // lists this as opt-in; it is O(number of stages) — well under a
+    // kilobyte — so it is always populated, which keeps benchmark provenance
+    // complete by construction rather than by remembering a flag.
+    struct Stage {
+        std::string name;      // "coarse:128", "finest:float", "polish:double"
+        std::string precision; // "float" | "double"
+        int q = 0;
+        double requested_tol = 0.0, effective_tol = 0.0;
+        int iterations = 0;
+        long long matvec_count = 0;
+        double seconds = 0.0;
+        SolveStatus status = SolveStatus::max_iterations;
+        double fw_error = 0.0, penetration_error = 0.0;
+    };
+    std::vector<Stage> stage_stats;
+
     long long matvec_count = 0;              // operator applies inside the solve
     long long verification_matvec_count = 0; // applies spent on verification
     long long precond_count = 0;             // preconditioner applications

@@ -336,7 +336,8 @@ PyResult py_solve_nested(
     const py::array_t<double, py::array::c_style | py::array::forcecast>& gap,
     double p_nominal, double domain_size, double E_star, int coarsest, int q,
     int leaf_side, bool precond, double tol, double coarse_tol, int max_iter,
-    bool use_pr, bool single_precision, bool light_result,
+    bool use_pr, bool single_precision, const std::string& precision,
+    double float_floor, bool allow_tolerance_relaxation, bool light_result,
     const std::string& backend, bool record_error_history, bool active_set,
     double active_delta, int active_halo, int active_max_rounds) {
     const py::ssize_t expected =
@@ -350,9 +351,26 @@ PyResult py_solve_nested(
     // alive across the GIL-released call; forcecast only materialises a
     // temporary when the input is not already a C-contiguous float64 array.
     Eigen::Map<const Eigen::VectorXd> g0(gap.data(), expected);
-    hmc::NestedParams np{coarsest, q, leaf_side, precond, coarse_tol,
-                         single_precision, light_result, backend,
-                         record_error_history};
+    hmc::NestedParams np;
+    np.coarsest = coarsest;
+    np.q = q;
+    np.leaf_side = leaf_side;
+    np.precond = precond;
+    np.coarse_tol = coarse_tol;
+    np.single_precision = single_precision;
+    if (precision == "double") np.precision = hmc::NestedParams::Precision::double_only;
+    else if (precision == "float") np.precision = hmc::NestedParams::Precision::float_only;
+    else if (precision == "float_then_double")
+        np.precision = hmc::NestedParams::Precision::float_then_double;
+    else if (!precision.empty())
+        throw std::invalid_argument(
+            "precision must be 'double', 'float', 'float_then_double' or '' "
+            "(defer to single_precision)");
+    np.float_floor = float_floor;
+    np.allow_tolerance_relaxation = allow_tolerance_relaxation;
+    np.light_result = light_result;
+    np.backend = backend;
+    np.record_error_history = record_error_history;
     np.active_set = active_set;
     np.active_delta = active_delta;
     np.active_halo = active_halo;
@@ -670,6 +688,29 @@ PYBIND11_MODULE(aspher, m) {
             [](const PyResult& s) { return s.r.identification_steps; })
         .def_property_readonly("returned_best",
                                [](const PyResult& s) { return s.r.returned_best; })
+        .def_property_readonly(
+            "stage_stats",
+            [](const PyResult& s) {
+                py::list out;
+                for (const auto& st : s.r.stage_stats) {
+                    py::dict d;
+                    d["name"] = st.name;
+                    d["precision"] = st.precision;
+                    d["q"] = st.q;
+                    d["requested_tol"] = st.requested_tol;
+                    d["effective_tol"] = st.effective_tol;
+                    d["iterations"] = st.iterations;
+                    d["matvec_count"] = st.matvec_count;
+                    d["seconds"] = st.seconds;
+                    d["status"] = std::string(hmc::to_string(st.status));
+                    d["fw_error"] = st.fw_error;
+                    d["penetration_error"] = st.penetration_error;
+                    out.append(d);
+                }
+                return out;
+            },
+            "One entry per solve stage (each coarse level, the finest solve, "
+            "and the double polish when precision='float_then_double').")
         // ── A07: library-side allocation accounting and phase timing ───────
         .def_property_readonly(
             "memory",
@@ -743,7 +784,10 @@ PYBIND11_MODULE(aspher, m) {
           py::arg("leaf_side") = 8, py::arg("precond") = true,
           py::arg("tol") = 1e-8, py::arg("coarse_tol") = 1e-4,
           py::arg("max_iter") = 20000, py::arg("use_pr") = true,
-          py::arg("single_precision") = false, py::arg("light_result") = false,
+          py::arg("single_precision") = false, py::arg("precision") = "",
+          py::arg("float_floor") = 2e-6,
+          py::arg("allow_tolerance_relaxation") = false,
+          py::arg("light_result") = false,
           py::arg("backend") = "h2", py::arg("record_error_history") = false,
           py::arg("active_set") = false, py::arg("active_delta") = 0.05,
           py::arg("active_halo") = 2, py::arg("active_max_rounds") = 5,
@@ -752,6 +796,13 @@ PYBIND11_MODULE(aspher, m) {
           "each level with the prolonged coarse pressure. grid_size must equal "
           "coarsest * 2^k. Returns a ContactResult. backend='h2' (O(N) memory) "
           "or 'fft' (exact convolution, fastest at Ns<=8192). "
+          "precision='double' (default) | 'float' (== single_precision=True; "
+          "cannot reach a tolerance below float_floor, and now reports "
+          "'stagnated'/'precision_limit' rather than a relaxed success unless "
+          "allow_tolerance_relaxation=True) | 'float_then_double' (identify "
+          "the contact in float at float_floor, then polish in double to the "
+          "requested tol — accuracy, not memory: the polish carries the "
+          "double working set). result.stage_stats reports every stage. "
           "record_error_history=True fills .error_history with the finest "
           "level's per-iteration complementarity error (off by default). "
           "active_set=True (h2 only) solves the finest level restricted to a "

@@ -171,6 +171,18 @@ H2Memory H2Operator::memory() const {
     return m;
 }
 
+void H2Operator::release_single_caches() const {
+    Wleaf_f_.resize(0, 0);
+    for (auto& R : R_f_) R.resize(0, 0);
+    couplings_f_.clear();
+    couplings_f_.shrink_to_fit();
+    near_stencils_f_.clear();
+    near_stencils_f_.shrink_to_fit();
+    Mbuf_f_.resize(0, 0);
+    Lbuf_f_.resize(0, 0);
+    have_single_ = false;
+}
+
 void H2Operator::release_scratch() const {
     Mbuf_.resize(0, 0);
     Lbuf_.resize(0, 0);

@@ -162,6 +162,14 @@ void FFTOperator::matvec_single_into(const Eigen::VectorXf& x,
     matvec_impl<float>(x, y, Kh_f_, Gf_, Cf_, fft_f_);
 }
 
+void FFTOperator::release_single_caches() const {
+    Kh_f_.resize(0, 0);
+    Gf_.resize(0, 0);
+    Cf_.resize(0, 0);
+    fft_f_.reset();
+    have_single_ = false;
+}
+
 FFTInfo FFTOperator::info() const {
     FFTInfo s;
     s.Ns = Ns_;

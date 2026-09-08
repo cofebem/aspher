@@ -14,7 +14,34 @@ struct NestedParams {
     int leaf_side = 8;        // H2 leaf side on every level
     bool precond = true;      // |q| spectral preconditioner per level
     double coarse_tol = 1e-4; // cascadic: looser tolerance on coarse levels
-    bool single_precision = false; // run each level's solve in float (~half RAM)
+    // ── A09: precision policy ─────────────────────────────────────────────
+    // `double_only`       every stage in double (default).
+    // `float_only`        every stage in float — the historical
+    //                     single_precision=true. Float cannot drive the
+    //                     certificate below ~2e-7, so a request tighter than
+    //                     `float_floor` is NOT met; such a solve now reports
+    //                     `stagnated` with reason "precision_limit" unless
+    //                     allow_tolerance_relaxation is set.
+    // `float_then_double` identify the contact in float at `float_floor`,
+    //                     then POLISH in double, warm-started, to the
+    //                     requested tolerance. This buys accuracy, not
+    //                     memory: the polish carries the double path's
+    //                     working set, so the large-grid recipe that uses
+    //                     float for RAM should stay on float_only.
+    enum class Precision { double_only, float_only, float_then_double };
+    Precision precision = Precision::double_only;
+    // Legacy spelling of Precision::float_only; when true and `precision` is
+    // still the default, it selects float_only.
+    bool single_precision = false;
+    // Certificate level float can actually reach. Measured on a Ns=256 rough
+    // surface: 2e-7 converges in 102 iterations, anything tighter stalls at
+    // 1.88e-7, and the PRESSURE error against double saturates at ~5e-6
+    // regardless — so tightening this buys iterations, not accuracy.
+    double float_floor = 2e-6;
+    // Permit success at an effective tolerance looser than the requested one
+    // (recorded in the result either way). Off by default: an unmet request
+    // is a failure, not a silently relaxed success.
+    bool allow_tolerance_relaxation = false;
     bool light_result = false;     // skip displacement/gap in the result (~2 N arrays)
     std::string backend = "h2";    // per-level operator: "h2" or "fft"
     bool record_error_history = false; // finest-level per-iteration error trace

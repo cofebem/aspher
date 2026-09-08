@@ -104,8 +104,12 @@ def test_gap_datum_invariance_nested():
 
     for shift in (0.0, 1e3, 1e6):
         for single in (False, True):
+            # the float arm deliberately stays float-only (that is the path
+            # whose datum handling is under test) and accepts its documented
+            # floor explicitly, rather than hiding it behind a double polish
             r = hc.solve_nested(ns, g0 + shift, p_bar, coarsest=32,
                                 backend="fft", single_precision=single,
+                                allow_tolerance_relaxation=single,
                                 tol=1e-8)
             rel = (np.linalg.norm(np.asarray(r.pressure).ravel() - pref)
                    / np.linalg.norm(pref))
