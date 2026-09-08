@@ -247,10 +247,19 @@ int t03_termination() {
                     "returned_best=%d\n",
                     hmc::to_string(r.status), r.status_reason.c_str(),
                     r.iterations, r.fw_error, int(r.returned_best));
-        CHECK(!r.converged);
-        CHECK(r.status == hmc::SolveStatus::stagnated ||
-              r.status == hmc::SolveStatus::max_iterations);
         const auto d = oracle::diagnose(S, g0, r.pressure, P, gref);
+        // The plan warns against a flaky "must fail at 1e-25" expectation: on
+        // a small grid the certificate can legitimately underflow to exactly
+        // zero, which satisfies any tolerance. Accept success only when the
+        // INDEPENDENT check confirms an exactly zero certificate; otherwise
+        // require an honest failure status.
+        if (r.converged) {
+            CHECK(d.fw_gap == 0.0);
+            CHECK(d.min_gap >= 0.0);
+        } else {
+            CHECK(r.status == hmc::SolveStatus::stagnated ||
+                  r.status == hmc::SolveStatus::max_iterations);
+        }
         CHECK(diagnostics_agree(r, d, 1e-8));
     }
 

@@ -375,6 +375,81 @@ int main() {
         // pre-fix state returned 1.5e-2
         CHECK(rel3 <= 1e-4);
         CHECK(std::abs(r3.contact_fraction - r0.contact_fraction) <= 1e-4);
+
+        // T06 (spec A03): with the same deliberately truncated candidate set
+        // but a real round budget the driver must EXPAND and certify
+        // globally, and the points pulled into C by that expansion must be
+        // reconsidered. The old outside-only scan could not see them again.
+        hmc::NestedParams np_exp = np_bad;
+        np_exp.active_max_rounds = 8;
+        auto r4 = hmc::solve_contact_nested(Nr, 1.0, 1.0, gap, pbar, tol,
+                                            20000, true, np_exp);
+        const double rel4 =
+            (r4.pressure - r0.pressure).norm() / r0.pressure.norm();
+        std::printf("active expansion: status=%s rounds=%d fallback=%d "
+                    "relL2 %.2e\n",
+                    hmc::to_string(r4.status), r4.active_rounds,
+                    int(r4.active_fallback), rel4);
+        CHECK(r4.converged);
+        CHECK(rel4 <= 1e-4);
+        CHECK(std::abs(r4.contact_fraction - r0.contact_fraction) <= 1e-4);
+    }
+
+    // ── T06: a restricted certificate is NOT a global one ───────────────────
+    // A candidate set that excludes real contact lets the restricted solve
+    // converge on its own subproblem while the true solution penetrates
+    // outside it. The restricted status must stay local, and an independent
+    // global check must reject the iterate — which is exactly what the
+    // driver's streamed verification now does.
+    {
+        const int Ns2 = 32, N2 = Ns2 * Ns2;
+        hmc::BoussinesqKernel K2(Ns2, 1.0, 1.0);
+        const Eigen::MatrixXd Sd = K2.assemble_dense();
+        Eigen::VectorXd g2(N2);
+        for (int iy = 0; iy < Ns2; ++iy)
+            for (int ix = 0; ix < Ns2; ++ix) {
+                const double x = (ix + 0.5) / Ns2 - 0.5;
+                const double y = (iy + 0.5) / Ns2 - 0.5;
+                g2(iy * Ns2 + ix) = x * x + y * y;
+            }
+        const double pbar2 = 0.02, P2 = pbar2 * N2;
+        const double gref2 = g2.maxCoeff() - g2.minCoeff();
+
+        // candidates: only the left half of the domain
+        std::vector<int> idx;
+        for (int iy = 0; iy < Ns2; ++iy)
+            for (int ix = 0; ix < Ns2 / 2; ++ix) idx.push_back(iy * Ns2 + ix);
+
+        hmc::MatVecIntoT<double> op = [&Sd](const Eigen::VectorXd& x,
+                                            Eigen::VectorXd& y) { y = Sd * x; };
+        hmc::SolveOptions o;
+        o.tol = 1e-10;
+        o.max_iter = 20000;
+        o.n_grid = N2;
+        o.scales.g_ref = gref2;
+        o.scales.datum_mode = hmc::SolveScales::DatumMode::caller;
+        hmc::RestrictedCertificate cert;
+        auto rr = hmc::solve_contact_active_impl<double>(op, g2, pbar2, o, {},
+                                                        idx, nullptr, &cert);
+        // independent global check on the returned pressure
+        const Eigen::VectorXd v = Sd * rr.pressure + g2;
+        const double alpha = rr.approach;
+        const double pen_glob =
+            std::max(0.0, -(v.minCoeff() - alpha)) / gref2;
+        const double G_glob = rr.fw_gap + P2 * (cert.vmin_local - v.minCoeff());
+        std::printf("T06 restricted: status=%s local fw=%.2e | global fw=%.2e "
+                    "pen=%.2e\n",
+                    hmc::to_string(rr.status), rr.fw_error,
+                    G_glob / (P2 * gref2), pen_glob);
+        CHECK(rr.status == hmc::SolveStatus::converged); // local subproblem
+        CHECK(rr.fw_error <= 1e-10);
+        CHECK(pen_glob > 1e-3);          // but globally wrong
+        CHECK(G_glob / (P2 * gref2) > 1e-3);
+        double outside = 0.0;
+        for (int iy = 0; iy < Ns2; ++iy)
+            for (int ix = Ns2 / 2; ix < Ns2; ++ix)
+                outside += std::abs(rr.pressure(iy * Ns2 + ix));
+        CHECK(outside == 0.0); // the iterate stays exactly zero outside C
     }
 
     std::printf("test_active (M2): all passed\n");

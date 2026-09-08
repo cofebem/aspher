@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
@@ -171,6 +172,7 @@ static ContactResult active_finest(const H2Operator& h2,
     std::vector<double> hist;
     std::vector<std::uint8_t> viol(N);
     int it_total = 0, rounds = 0;
+    long long verify_mv = 0;
     bool certified = false;
 
     while (rounds < np.active_max_rounds) {
@@ -182,7 +184,12 @@ static ContactResult active_finest(const H2Operator& h2,
                 h2.matvec_masked_compressed_single_into(x, y, mask);
         };
         SolveOptions aopt;
-        aopt.tol = lvl_tol;
+        // Split the level budget between the restricted certificate and the
+        // outside-C penetration allowance so that their SUM meets the level
+        // tolerance: with every outside gap >= -tol/2 * g_ref the global
+        // certificate gains at most P*(tol/2)*g_ref, i.e. tol/2 in normalised
+        // units, on top of the restricted certificate's tol/2 (spec A03).
+        aopt.tol = 0.5 * lvl_tol;
         aopt.max_iter = max_iter;
         aopt.use_pr = use_pr;
         aopt.record_history = record_history;
@@ -212,30 +219,68 @@ static ContactResult active_finest(const H2Operator& h2,
         const double a = res.approach - datum; // centred approach
         const int ls = h2.info().leaf_side;
         std::atomic<long> nviol{0};
+        // The stream visits EVERY leaf, so this pass sees all physical
+        // targets — candidates included — and yields the GLOBAL minimum
+        // gradient, which is what turns the restricted certificate into a
+        // global one (spec A03 step 3). The old code scanned only the points
+        // outside C, so a violation that expansion had just pulled INTO C
+        // could never be seen again.
+        std::atomic<double> vmin_g{std::numeric_limits<double>::infinity()};
         auto sink = [&](int ix0, int iy0, const Real* tile) {
             long local = 0;
+            double lmin = std::numeric_limits<double>::infinity();
             for (int ly = 0, t = 0; ly < ls; ++ly) {
                 const std::ptrdiff_t row =
                     static_cast<std::ptrdiff_t>(iy0 + ly) * Ns + ix0;
                 for (int lx = 0; lx < ls; ++lx, ++t) {
                     const std::ptrdiff_t i = row + lx;
-                    if (!cmask[i] &&
-                        static_cast<double>(tile[t]) +
-                                (static_cast<double>(g0(i)) - gsub) - a <
-                            vthresh) {
+                    const double v = static_cast<double>(tile[t]) +
+                                     (static_cast<double>(g0(i)) - gsub);
+                    if (v < lmin) lmin = v;
+                    if (!cmask[i] && v - a < vthresh) {
                         viol[i] = 1;
                         ++local;
                     }
                 }
             }
             if (local) nviol.fetch_add(local, std::memory_order_relaxed);
+            double cur = vmin_g.load(std::memory_order_relaxed);
+            while (lmin < cur &&
+                   !vmin_g.compare_exchange_weak(cur, lmin,
+                                                 std::memory_order_relaxed)) {
+            }
         };
         std::fill(viol.begin(), viol.end(), 0);
         if constexpr (is_double) h2.matvec_masked_stream(*psrc, mask, sink);
         else h2.matvec_masked_stream_single(*psrc, mask, sink);
+        ++verify_mv;
 
-        if (nviol.load() == 0) {
+        // Global certificate from the restricted one and the streamed global
+        // minimum. Written as G_local + P (vmin_local - vmin_global): both
+        // terms are non-negative, so no large near-equal totals are
+        // subtracted (spec §5.2).
+        const double vmin_glob = vmin_g.load();
+        const double G_glob =
+            res.fw_gap + cert.P_total * (cert.vmin_local - vmin_glob);
+        const double fw_glob = G_glob / (cert.P_total * cert.g_ref);
+        const double pen_glob = std::max(0.0, -(vmin_glob - a)) / cert.g_ref;
+        res.fw_gap = G_glob;
+        res.fw_error = fw_glob;
+        res.penetration_error = pen_glob;
+        res.effective_tol = lvl_tol;
+
+        // Accept only when the restricted solve met its own KKT conditions
+        // AND the global check passes: an empty outside-violation list is not
+        // by itself a certificate.
+        if (res.status == SolveStatus::converged && nviol.load() == 0 &&
+            fw_glob <= lvl_tol && pen_glob <= lvl_tol) {
             certified = true;
+            break;
+        }
+        if (nviol.load() == 0) {
+            // nothing to expand but still not certified (the restricted solve
+            // itself did not converge, or the global gap exceeds the budget):
+            // the candidate set cannot be improved, so go to the fallback.
             break;
         }
         // extend C with the dilated violations, rebuild the compressed
@@ -287,16 +332,12 @@ static ContactResult active_finest(const H2Operator& h2,
 #pragma omp parallel for schedule(static)
         for (std::ptrdiff_t k = 0; k < S; ++k) pf(gi[k]) = p0(k);
         p0.resize(0);
-        // Seed the (dilated) violating points into the warm start's contact
-        // set. The full solver's complementarity error Σ p|g| is blind to
-        // p=0 ∧ g<0 points, so a warm start that is converged on the old
-        // candidate set but penetrating outside it would "converge" at
-        // iteration 0 with the penetration unfixed. With pressure there,
-        // those points join the active set from the start; the seed's scale
-        // is irrelevant to correctness (any p ≥ 0 iterate is a valid start).
-#pragma omp parallel for schedule(static)
-        for (int i = 0; i < N; ++i)
-            if (viol[i] && pf(i) <= Real(0)) pf(i) = static_cast<Real>(p_bar);
+        // No violation seeding: the old code had to put pressure on the
+        // penetrating points because the Σ p|g| metric was blind to
+        // p = 0 ∧ g < 0 and would "converge" at iteration 0. The certified
+        // stopping rule (A01) sees that penetration directly and the
+        // identification step activates those points, so correctness no
+        // longer depends on the seed.
         SolveOptions fopt;
         fopt.tol = lvl_tol;
         fopt.max_iter = max_iter;
@@ -359,6 +400,16 @@ static ContactResult active_finest(const H2Operator& h2,
     }
     res.active_rounds = rounds;
     res.iterations = it_total;
+    res.verification_matvec_count = verify_mv;
+    // An uncertified restricted result must never be reported as success. The
+    // full-solve fallback carries its own global certificate, so its status
+    // stands as returned.
+    if (!certified && !res.active_fallback &&
+        res.status == SolveStatus::converged) {
+        res.status = SolveStatus::verification_failed;
+        res.status_reason = "global_check";
+    }
+    res.converged = (res.status == SolveStatus::converged);
     if (record_history) res.error_history = std::move(hist);
     return res;
 }
