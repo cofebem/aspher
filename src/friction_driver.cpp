@@ -264,7 +264,8 @@ FrictionStepResult FrictionDriver::step(const FrictionStepSpec& spec) {
                                        spec.tol_tangential, spec.max_iter, true,
                                        Mop, &q_warm, &u_hist, g_floor,
                                        tan_force ? &K_new : nullptr,
-                                       pass == 0 ? dinit0_p : dinit_p);
+                                       pass == 0 ? dinit0_p : dinit_p,
+                                       spec.tol_kkt);
             } catch (const std::invalid_argument& e) {
                 // e.g. an infeasible held force (|q_bar| >= mean s after the
                 // normal change). A request the caller did not make directly

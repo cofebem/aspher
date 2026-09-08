@@ -368,7 +368,7 @@ public:
                       const py::object& delta_t,
                       const std::string& tangential_hold, double dt,
                       const py::object& T, double tol_normal,
-                      double tol_tangential, int max_iter,
+                      double tol_tangential, double tol_kkt, int max_iter,
                       int max_threshold_iter, double threshold_rtol) {
         hmc::FrictionStepSpec spec;
         if (p_bar.is_none()) {
@@ -399,6 +399,7 @@ public:
         spec.dt = dt;
         spec.tol_normal = tol_normal;
         spec.tol_tangential = tol_tangential;
+        spec.tol_kkt = tol_kkt;
         spec.max_iter = max_iter;
         spec.max_threshold_iter = max_threshold_iter;
         spec.threshold_rtol = threshold_rtol;
@@ -833,6 +834,30 @@ PYBIND11_MODULE(aspher, m) {
                 return a;
             })
         .def_property_readonly(
+            "cone_violation",
+            [](const PyStepResult& s) { return s.r.tangential.cone_violation; },
+            "max(0, |q_i| - s_i) / max(s): cone feasibility of the RETURNED "
+            "tractions.")
+        .def_property_readonly(
+            "proj_residual",
+            [](const PyStepResult& s) { return s.r.tangential.proj_residual; },
+            "||q - proj[q - rho (Cq + u_hist - E dd)]||_inf / max(s), the "
+            "fixed-threshold projection residual recomputed on the returned "
+            "tractions after the terminal force correction.")
+        .def_property_readonly(
+            "stick_residual",
+            [](const PyStepResult& s) { return s.r.tangential.stick_residual; })
+        .def_property_readonly(
+            "slip_residual",
+            [](const PyStepResult& s) { return s.r.tangential.slip_residual; })
+        .def_property_readonly(
+            "force_error",
+            [](const PyStepResult& s) { return s.r.tangential.force_error; })
+        .def_property_readonly(
+            "kkt_tol",
+            [](const PyStepResult& s) { return s.r.tangential.kkt_tol; },
+            "Local-KKT acceptance threshold actually applied to this step.")
+        .def_property_readonly(
             "status_reason",
             [](const PyStepResult& s) { return s.r.status_reason; },
             "Empty on success; otherwise why the step was refused (the "
@@ -869,7 +894,7 @@ PYBIND11_MODULE(aspher, m) {
              py::arg("delta_t") = py::none(),
              py::arg("tangential_hold") = "displacement", py::arg("dt") = 1.0,
              py::arg("T") = py::none(), py::arg("tol_normal") = 1e-8,
-             py::arg("tol_tangential") = 1e-5, py::arg("max_iter") = 20000,
+             py::arg("tol_tangential") = 1e-5, py::arg("tol_kkt") = 0.0, py::arg("max_iter") = 20000,
              py::arg("max_threshold_iter") = 20,
              py::arg("threshold_rtol") = 1e-3,
              "One quasi-static load step.\n"

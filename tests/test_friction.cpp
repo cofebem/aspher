@@ -576,7 +576,90 @@ static int test_hist_offset() {
     return 0;
 }
 
+// ── T24: final traction KKT after the terminal force correction ───────────
+// The checker must work on the RETURNED q, and an exact total force must not
+// be able to buy a pass for a locally wrong state.
+static int test_final_kkt() {
+    const int Ns = 32, N = Ns * Ns;
+    const double L = 1.0, E = 1.0, nu = 0.3, mu = 0.4, p_bar = 0.01;
+    hmc::BoussinesqKernel BK(Ns, L, E);
+    hmc::FFTOperator S(BK);
+    S.build();
+    hmc::CerrutiKernel CK(Ns, L, E, nu);
+    hmc::TangentialFFTOperator C(CK);
+    C.build();
+    Eigen::VectorXd g0(N);
+    for (int iy = 0; iy < Ns; ++iy)
+        for (int ix = 0; ix < Ns; ++ix) {
+            const double x = (ix + 0.5) / Ns - 0.5, y = (iy + 0.5) / Ns - 0.5;
+            g0(iy * Ns + ix) = x * x + y * y;
+        }
+    hmc::MatVec Sop = [&S](const Eigen::VectorXd& x) { return S.matvec(x); };
+    hmc::ContactResult nr = hmc::solve_contact(Sop, g0, p_bar, 1e-12, 20000);
+    CHECK(nr.converged);
+    const Eigen::VectorXd sf = mu * nr.pressure;
+    hmc::TanMatVecInto Cop = [&C](const Eigen::VectorXd& x,
+                                  Eigen::VectorXd& y) { C.matvec_into(x, y); };
+
+    const Eigen::Vector2d qbar(0.4 * sf.mean(), 0.0);
+    hmc::TangentialResult r =
+        hmc::solve_tangential(Cop, sf, true, qbar, 1e-5, 20000);
+    std::printf("T24 force control: %s cone=%.2e proj=%.2e stick=%.2e "
+                "slip=%.2e force=%.2e (kkt_tol %.1e)\n",
+                hmc::to_string(r.status), r.cone_violation, r.proj_residual,
+                r.stick_residual, r.slip_residual, r.force_error, r.kkt_tol);
+    CHECK(r.converged);
+    CHECK(r.cone_violation <= 1e-9);
+    CHECK(r.proj_residual <= r.kkt_tol);
+    CHECK(r.force_error <= 1e-12);
+    CHECK(r.n_stick > 0 && r.n_slip > 0);
+
+    // Perturb the returned tractions in a way that PRESERVES the total force
+    // exactly (+d on one interior point, -d on another) but destroys local
+    // equilibrium. Force balance alone must not pass it.
+    hmc::TangentialResult bad = r;
+    int a = -1, b = -1;
+    for (int i = 0; i < N && (a < 0 || b < 0); ++i)
+        if (r.state[i] == 1) { (a < 0 ? a : b) = i; }
+    CHECK(a >= 0 && b >= 0);
+    const double d = 0.3 * sf(a);
+    bad.q(a) += d;
+    bad.q(b) -= d;
+    hmc::check_tangential_kkt(Cop, sf, bad.delta_t, true, qbar, nullptr, bad);
+    std::printf("T24 load-preserving perturbation: force=%.2e proj=%.2e "
+                "stick=%.2e\n",
+                bad.force_error, bad.proj_residual, bad.stick_residual);
+    CHECK(bad.force_error <= 1e-12);          // total force still exact
+    CHECK(bad.proj_residual > 10.0 * r.proj_residual); // but locally wrong
+    CHECK(bad.proj_residual > r.kkt_tol);
+
+    // A cone-violating perturbation is caught by the cone check
+    hmc::TangentialResult bad2 = r;
+    int c = -1;
+    for (int i = 0; i < N && c < 0; ++i)
+        if (r.state[i] == 2) c = i;
+    CHECK(c >= 0);
+    bad2.q(c) *= 1.5;
+    bad2.q(N + c) *= 1.5;
+    hmc::check_tangential_kkt(Cop, sf, bad2.delta_t, true, qbar, nullptr, bad2);
+    std::printf("T24 cone-violating perturbation: cone=%.2e\n",
+                bad2.cone_violation);
+    CHECK(bad2.cone_violation > 1e-3);
+
+    // rho is a fixed operator property: halving the threshold field scales
+    // s_ref and w_ref together, so rho is unchanged (it cannot be shrunk to
+    // make a residual look small)
+    hmc::TangentialResult probe = r;
+    const Eigen::VectorXd half = 0.5 * sf;
+    hmc::check_tangential_kkt(Cop, half, r.delta_t, false,
+                              Eigen::Vector2d::Zero(), nullptr, probe);
+    std::printf("T24 rho invariance: %.6e vs %.6e\n", probe.rho, r.rho);
+    CHECK(std::abs(probe.rho - r.rho) <= 1e-9 * r.rho);
+    return 0;
+}
+
 int main() {
+    if (int rc = test_final_kkt()) return rc;
     if (int rc = test_precond_symbol()) return rc;
     if (int rc = test_precond_mask_mean()) return rc;
     if (int rc = test_kkt_displacement()) return rc;

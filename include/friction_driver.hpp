@@ -45,6 +45,10 @@ struct FrictionStepSpec {
     double dt = 1.0;
     const Eigen::VectorXd* T = nullptr;
     double tol_normal = 1e-8, tol_tangential = 1e-5;
+    // Local-KKT acceptance for the tangential state (0 -> the solver's
+    // documented default). A step commits only when this is met on the
+    // RETURNED tractions, after the terminal force correction.
+    double tol_kkt = 0.0;
     int max_iter = 20000, max_threshold_iter = 20;
     double threshold_rtol = 1e-3;
 };
