@@ -98,7 +98,8 @@ static ContactResult active_finest(const H2Operator& h2,
                                    bool use_pr, const NestedParams& np, int Ns,
                                    Eigen::VectorXd& p_init_d,
                                    const Eigen::VectorXd& coarse_gap,
-                                   bool record_history, bool light) {
+                                   bool record_history, bool light,
+                                   double g_ref) {
     using Vec = VecT<Real>;
     constexpr bool is_double = std::is_same_v<Real, double>;
     const int N = Ns * Ns;
@@ -179,10 +180,17 @@ static ContactResult active_finest(const H2Operator& h2,
             else
                 h2.matvec_masked_compressed_single_into(x, y, mask);
         };
-        res = solve_contact_active_impl<Real>(
-            mv, g0c, static_cast<Real>(p_bar), static_cast<Real>(lvl_tol),
-            max_iter, use_pr, pc, cidx, &p0, record_history, N,
-            static_cast<Real>(g_scale));
+        SolveOptions aopt;
+        aopt.tol = lvl_tol;
+        aopt.max_iter = max_iter;
+        aopt.use_pr = use_pr;
+        aopt.record_history = record_history;
+        aopt.allow_tolerance_relaxation = true; // level policy, set by caller
+        aopt.n_grid = N;
+        aopt.scales.g_ref = g_ref;
+        RestrictedCertificate cert;
+        res = solve_contact_active_impl<Real>(mv, g0c, static_cast<Real>(p_bar),
+                                              aopt, pc, cidx, &p0, &cert);
         it_total += res.iterations;
         if (record_history)
             hist.insert(hist.end(), res.error_history.begin(),
@@ -286,9 +294,17 @@ static ContactResult active_finest(const H2Operator& h2,
 #pragma omp parallel for schedule(static)
         for (int i = 0; i < N; ++i)
             if (viol[i] && pf(i) <= Real(0)) pf(i) = static_cast<Real>(p_bar);
-        res = solve_contact_impl<Real>(mvf, g0, static_cast<Real>(p_bar),
-                                       static_cast<Real>(lvl_tol), max_iter,
-                                       use_pr, pcf, &pf, light, record_history);
+        SolveOptions fopt;
+        fopt.tol = lvl_tol;
+        fopt.max_iter = max_iter;
+        fopt.use_pr = use_pr;
+        fopt.light = light;
+        fopt.record_history = record_history;
+        fopt.keep_best = !light;
+        fopt.allow_tolerance_relaxation = true;
+        fopt.scales.g_ref = g_scale;
+        res = solve_contact_impl<Real>(mvf, g0, static_cast<Real>(p_bar), fopt,
+                                       pcf, &pf);
         it_total += res.iterations;
         if (record_history)
             hist.insert(hist.end(), res.error_history.begin(),
@@ -440,6 +456,26 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         // finest-level-only); coarse levels never record history.
         const bool record_history = finest && np.record_error_history;
 
+        // Physical scales (spec §3.1): g_ref = max(range(g0), p_bar L / E*)
+        // is invariant to an additive gap datum and transforms consistently
+        // under a change of units; the same scale is used for the level's
+        // diagnostics and for its tolerance normalisation.
+        double g_range = glvl.maxCoeff() - glvl.minCoeff();
+        const double g_ref = std::max(g_range, p_bar * L / E_star);
+        SolveOptions lopt;
+        lopt.tol = lvl_tol;
+        lopt.requested_tol = finest ? tol : np.coarse_tol;
+        lopt.max_iter = max_iter;
+        lopt.use_pr = use_pr;
+        lopt.light = light;
+        lopt.record_history = record_history;
+        lopt.keep_best = !light;
+        // the float floor and the coarse-level tolerances are deliberate
+        // stage policies, not silent relaxations of the user's target: the
+        // finest double stage carries the requested tolerance strictly.
+        lopt.allow_tolerance_relaxation = !finest || np.single_precision;
+        lopt.scales.g_ref = g_ref;
+
         if (finest && np.active_set) {
             // restricted (active-set) solve on the candidate set built from
             // the coarse contact + gap; p_init/coarse_gap are consumed
@@ -450,12 +486,12 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                 res = active_finest<float>(*h2, fpp, g0f, p_bar, lvl_tol,
                                            max_iter, use_pr, np, n, p_init,
                                            coarse_gap, record_history,
-                                           np.light_result);
+                                           np.light_result, g_ref);
             } else {
                 res = active_finest<double>(*h2, fpp, glvl, p_bar, lvl_tol,
                                             max_iter, use_pr, np, n, p_init,
                                             coarse_gap, record_history,
-                                            np.light_result);
+                                            np.light_result, g_ref);
             }
             coarse_gap.resize(0);
         } else if (np.single_precision) {
@@ -491,14 +527,12 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                 // pressure iterate), so neither copy outlives initialization.
                 p_init.resize(0);
             }
-            res = solve_contact_impl<float>(
-                mvf, g0f, static_cast<float>(p_bar), static_cast<float>(lvl_tol),
-                max_iter, use_pr, pcf, have_init ? &p0f : nullptr, light,
-                record_history);
+            res = solve_contact_impl<float>(mvf, g0f, static_cast<float>(p_bar),
+                                            lopt, pcf,
+                                            have_init ? &p0f : nullptr);
         } else {
-            res = solve_contact_impl<double>(
-                mv, glvl, p_bar, lvl_tol, max_iter, use_pr, pc,
-                have_init ? &p_init : nullptr, light, record_history);
+            res = solve_contact_impl<double>(mv, glvl, p_bar, lopt, pc,
+                                             have_init ? &p_init : nullptr);
             if (!finest) gap[li].resize(0);
         }
 

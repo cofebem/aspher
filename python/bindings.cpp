@@ -535,12 +535,75 @@ PYBIND11_MODULE(aspher, m) {
         .def_property_readonly(
             "active_fallback",
             [](const PyResult& s) { return s.r.active_fallback; })
+        // ── independently recomputed termination diagnostics (spec A01) ────
+        .def_property_readonly(
+            "status",
+            [](const PyResult& s) { return std::string(hmc::to_string(s.r.status)); },
+            "Termination state: 'converged', 'stagnated', 'max_iterations', "
+            "'nonpositive_curvature', 'nonfinite', 'verification_failed' or "
+            "'resource_limit'. `converged` is exactly status == 'converged'.")
+        .def_property_readonly(
+            "status_reason", [](const PyResult& s) { return s.r.status_reason; })
+        .def_property_readonly("pk_error",
+                               [](const PyResult& s) { return s.r.pk_error; })
+        .def_property_readonly("fw_gap",
+                               [](const PyResult& s) { return s.r.fw_gap; },
+                               "Frank-Wolfe certificate G = sum_i p_i (v_i - min v); "
+                               "0 <= f(p) - f(p*) <= G for the exact SPD operator.")
+        .def_property_readonly("fw_error",
+                               [](const PyResult& s) { return s.r.fw_error; },
+                               "G / (P g_ref): the normalised certificate the "
+                               "stopping rule tests.")
+        .def_property_readonly("load_error",
+                               [](const PyResult& s) { return s.r.load_error; })
+        .def_property_readonly(
+            "pressure_violation",
+            [](const PyResult& s) { return s.r.pressure_violation; })
+        .def_property_readonly(
+            "penetration_error",
+            [](const PyResult& s) { return s.r.penetration_error; })
+        .def_property_readonly("requested_tol",
+                               [](const PyResult& s) { return s.r.requested_tol; })
+        .def_property_readonly("effective_tol",
+                               [](const PyResult& s) { return s.r.effective_tol; })
+        .def_property_readonly("p_ref", [](const PyResult& s) { return s.r.p_ref; })
+        .def_property_readonly("g_ref", [](const PyResult& s) { return s.r.g_ref; })
+        .def_property_readonly(
+            "validation_scope",
+            [](const PyResult& s) { return s.r.validation_scope; })
+        .def_property_readonly(
+            "operator_error_kind",
+            [](const PyResult& s) { return s.r.operator_error_kind; })
+        .def_property_readonly(
+            "operator_error",
+            [](const PyResult& s) -> py::object {
+                if (!s.r.operator_error_valid) return py::none();
+                return py::float_(s.r.operator_error);
+            })
+        .def_property_readonly(
+            "objective_error_bound",
+            [](const PyResult& s) -> py::object {
+                if (!s.r.objective_error_bound_valid) return py::none();
+                return py::float_(s.r.objective_error_bound);
+            })
+        .def_property_readonly("matvec_count",
+                               [](const PyResult& s) { return s.r.matvec_count; })
+        .def_property_readonly(
+            "verification_matvec_count",
+            [](const PyResult& s) { return s.r.verification_matvec_count; })
+        .def_property_readonly("precond_count",
+                               [](const PyResult& s) { return s.r.precond_count; })
+        .def_property_readonly(
+            "identification_steps",
+            [](const PyResult& s) { return s.r.identification_steps; })
+        .def_property_readonly("returned_best",
+                               [](const PyResult& s) { return s.r.returned_best; })
         .def("__repr__", [](const PyResult& s) {
             std::ostringstream os;
-            os << "<ContactResult: " << (s.r.converged ? "converged" : "NOT converged")
-               << " in " << s.r.iterations << " iters, error " << s.r.error
-               << ", contact area " << s.r.contact_fraction << ", mean p "
-               << s.r.mean_pressure << ">";
+            os << "<ContactResult: " << hmc::to_string(s.r.status) << " in "
+               << s.r.iterations << " iters, fw_error " << s.r.fw_error
+               << ", penetration " << s.r.penetration_error << ", contact area "
+               << s.r.contact_fraction << ", mean p " << s.r.mean_pressure << ">";
             return os.str();
         });
 
