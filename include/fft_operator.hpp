@@ -14,7 +14,14 @@ struct FFTInfo {
     int N = 0, Ns = 0, M = 0; // M = 2 Ns padded grid side
     std::int64_t bytes_spectrum = 0; // stored real kernel spectrum (per precision)
     std::int64_t bytes_scratch = 0;  // padded grid + half-spectrum work buffers
-    std::int64_t bytes_total = 0;
+    std::int64_t bytes_total = 0;    // resident: spectrum + scratch ACTUALLY held
+    // A07: the caller-owned Love table this operator reads at build time and
+    // requires to outlive it — not part of the operator's own footprint, but
+    // part of the system's, and previously unreported.
+    std::int64_t bytes_kernel_borrowed = 0;
+    // What the next apply would allocate if it ran now (the scratch is sized
+    // lazily per precision). A prediction; never added to bytes_total.
+    std::int64_t estimated_next_apply_bytes = 0;
 };
 
 // Exact FFT-convolution operator for the translation-invariant Boussinesq

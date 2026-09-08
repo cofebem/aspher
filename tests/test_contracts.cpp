@@ -239,8 +239,138 @@ static int t13_compact_cache() {
     return 0;
 }
 
+// ── T23: allocation accounting (spec A06/A07/A19) ─────────────────────────
+static int t23_memory_accounting() {
+    const int Ns = 64, N = Ns * Ns;
+    hmc::BoussinesqKernel K(Ns, 1.0, 1.0);
+
+    // borrowed vs owned coefficients: the same operator, two ownership models
+    {
+        hmc::H2Operator borrowed(K, {8, 4, 1});
+        auto owned = hmc::make_boussinesq_h2(Ns, 1.0, 1.0, {8, 4, 1});
+        borrowed.build();
+        owned->build();
+        const auto mb = borrowed.memory(), mo = owned->memory();
+        std::printf("T23 borrowed: resident %lld B (+ %lld B caller-owned "
+                    "table) | owned: resident %lld B (compact table %lld B)\n",
+                    (long long)mb.resident, (long long)mb.kernel_borrowed,
+                    (long long)mo.resident, (long long)mo.kernel_owned);
+        CHECK(mb.kernel_owned == 0);
+        CHECK(mb.kernel_borrowed == 8LL * N); // the full Love table, reported
+        CHECK(mb.system_resident() == mb.resident + mb.kernel_borrowed);
+        CHECK(mo.kernel_borrowed == 0);
+        CHECK(mo.kernel_owned > 0);
+        // identical structure, so everything except the coefficients matches
+        CHECK(mb.tree == mo.tree && mb.far_csr == mo.far_csr &&
+              mb.near_csr == mo.near_csr && mb.couplings == mo.couplings &&
+              mb.near_stencils == mo.near_stencils);
+        // and the compact model is smaller in system terms
+        CHECK(mo.system_resident() < mb.system_resident());
+    }
+
+    // lifecycle: nothing lazy is called resident, and release frees it
+    {
+        auto op = hmc::make_boussinesq_h2(Ns, 1.0, 1.0, {8, 4, 1});
+        const auto m_pre = op->memory();
+        CHECK(m_pre.resident == 0 || m_pre.couplings == 0); // nothing built yet
+        op->build();
+        const auto m_built = op->memory();
+        std::printf("T23 built: resident %lld B, scratch %lld B, next apply "
+                    "predicts %lld B\n",
+                    (long long)m_built.resident, (long long)m_built.scratch,
+                    (long long)m_built.estimated_next_apply_bytes);
+        CHECK(m_built.resident > 0);
+        CHECK(m_built.scratch == 0);                        // lazy, not resident
+        CHECK(m_built.estimated_next_apply_bytes > 0);      // but predicted
+        CHECK(m_built.single_caches == 0);
+
+        Eigen::VectorXd x = Eigen::VectorXd::Random(N), y(N);
+        op->matvec_into(x, y);
+        const auto m_d = op->memory();
+        CHECK(m_d.scratch > 0);
+        CHECK(m_d.scratch == m_built.estimated_next_apply_bytes);
+        CHECK(m_d.resident == m_built.resident + m_d.scratch);
+
+        op->build_single_caches();
+        Eigen::VectorXf xf = x.cast<float>(), yf(N);
+        op->matvec_single_into(xf, yf);
+        const auto m_f = op->memory();
+        std::printf("T23 after float apply: single caches %lld B, scratch "
+                    "%lld B\n",
+                    (long long)m_f.single_caches, (long long)m_f.scratch);
+        CHECK(m_f.single_caches > 0);
+        CHECK(m_f.single_caches * 2 == m_d.couplings + m_d.near_stencils +
+                                           m_d.transfers); // float is half
+        CHECK(m_f.scratch > m_d.scratch); // both precisions now allocated
+
+        op->release_scratch();
+        const auto m_r = op->memory();
+        CHECK(m_r.scratch == 0);
+        CHECK(m_r.estimated_next_apply_bytes > 0);
+        CHECK(m_r.resident == m_built.resident + m_f.single_caches);
+        // the operator still works after release
+        op->matvec_into(x, y);
+        Eigen::VectorXd y2(N);
+        hmc::H2Operator ref(K, {8, 4, 1});
+        ref.build();
+        ref.matvec_into(x, y2);
+        CHECK((y - y2).norm() == 0.0);
+    }
+
+    // FFT operator: same contract
+    {
+        hmc::FFTOperator F(K);
+        F.build();
+        const auto i0 = F.info();
+        CHECK(i0.bytes_kernel_borrowed == 8LL * N);
+        CHECK(i0.estimated_next_apply_bytes > 0);
+        const std::int64_t scratch0 = i0.bytes_scratch;
+        Eigen::VectorXd x = Eigen::VectorXd::Random(N), y(N);
+        F.matvec_into(x, y);
+        const auto i1 = F.info();
+        std::printf("T23 fft: scratch %lld -> %lld B (predicted %lld)\n",
+                    (long long)scratch0, (long long)i1.bytes_scratch,
+                    (long long)i0.estimated_next_apply_bytes);
+        CHECK(i1.bytes_scratch == scratch0 + i0.estimated_next_apply_bytes);
+    }
+
+    // solver-side accounting tracks the documented buffer set
+    {
+        const Eigen::MatrixXd Sd = K.assemble_dense();
+        hmc::MatVecIntoT<double> op = [&Sd](const Eigen::VectorXd& v,
+                                            Eigen::VectorXd& o) { o = Sd * v; };
+        Eigen::VectorXd g0(N);
+        for (int i = 0; i < N; ++i) g0(i) = 1e-3 * ((i * 37) % 53);
+        hmc::SolveOptions o;
+        o.tol = 1e-10;
+        o.max_iter = 2000;
+        const auto full = hmc::solve_contact_impl<double>(op, g0, 0.02, o, {}, nullptr);
+        hmc::SolveOptions ol = o;
+        ol.light = true;
+        ol.keep_best = false;
+        const auto light = hmc::solve_contact_impl<double>(op, g0, 0.02, ol, {}, nullptr);
+        std::printf("T23 solver: full peak %lld B, light+nobest peak %lld B "
+                    "(difference %lld = 3 N doubles)\n",
+                    (long long)full.memory.peak, (long long)light.memory.peak,
+                    (long long)(full.memory.peak - light.memory.peak));
+        CHECK(full.memory.cg_state == 7LL * N * 8);
+        CHECK(full.memory.best_iterate == 8LL * N);
+        CHECK(light.memory.best_iterate == 0);
+        CHECK(full.memory.output_arrays == 2LL * N * 8); // moved pressure
+        CHECK(light.memory.output_arrays == 0);
+        CHECK(full.memory.peak - light.memory.peak == 3LL * N * 8);
+        // timings are populated and self-consistent
+        CHECK(full.time_total > 0.0);
+        CHECK(full.time_matvec > 0.0 && full.time_matvec <= full.time_total);
+        CHECK(full.time_precond == 0.0); // no preconditioner supplied
+    }
+    std::printf("T23 memory accounting: all contracts hold\n");
+    return 0;
+}
+
 int main() {
     if (t13_compact_cache()) return 1;
+    if (t23_memory_accounting()) return 1;
     if (t33_bad_inputs()) return 1;
     if (t34_lifecycle()) return 1;
     std::printf("test_contracts: all checks passed\n");

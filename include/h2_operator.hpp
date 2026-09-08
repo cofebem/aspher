@@ -20,6 +20,42 @@ struct H2Params {
     int near_radius = 1; // direct near field within this many leaf boxes
 };
 
+// A07: complete, itemised storage accounting. The old H2Info reported only
+// couplings + near stencils + a PREDICTED scratch size, which the review
+// measured as understating the real footprint by >=46% (15 365 952 B reported
+// against >=7 072 776 B of omitted tree nodes, CSR offsets, leaf arrays,
+// transfer matrices and float caches). Every field below is counted once;
+// nothing that has not actually been allocated is called resident.
+struct H2Memory {
+    // Immutable coefficient data. `owned` is what the operator itself holds
+    // (the compact near table from make_boussinesq_h2); `borrowed` is a
+    // caller-owned table the operator REQUIRES to exist — not part of the
+    // operator's own footprint, but part of the system's, and invisible in
+    // the old accounting.
+    std::int64_t kernel_owned = 0;
+    std::int64_t kernel_borrowed = 0;
+    // Structure
+    std::int64_t tree = 0;        // quad-tree boxes + level offsets
+    std::int64_t leaves = 0;      // leaf box-id array
+    std::int64_t far_csr = 0;     // far interaction list + row offsets
+    std::int64_t near_csr = 0;    // near interaction list + row offsets
+    // Numeric caches
+    std::int64_t transfers = 0;      // Wleaf + the 4 M2M/L2L matrices
+    std::int64_t couplings = 0;      // unique M2L blocks
+    std::int64_t near_stencils = 0;  // unique near blocks
+    std::int64_t single_caches = 0;  // float copies (0 until built)
+    // Workspace ACTUALLY allocated right now (0 before the first apply)
+    std::int64_t scratch = 0;
+
+    std::int64_t resident = 0;  // sum of the above, excluding kernel_borrowed
+    std::int64_t capacity = 0;  // same, using container capacity()
+    // What the next apply would allocate if it ran now; a prediction, never
+    // added to `resident`.
+    std::int64_t estimated_next_apply_bytes = 0;
+
+    std::int64_t system_resident() const { return resident + kernel_borrowed; }
+};
+
 struct H2Info {
     int N = 0, Ns = 0, nlevels = 0, leaf_side = 0, q = 0, r = 0;
     int n_boxes = 0, n_leaves = 0;
@@ -99,6 +135,10 @@ public:
         owned_kernel_bytes_ = bytes;
         owned_extent_ = extent;
     }
+    // Coefficient data the operator does not own but requires to outlive it.
+    void set_borrowed_kernel_bytes(std::int64_t bytes) {
+        borrowed_kernel_bytes_ = bytes;
+    }
 
     // u = S x, with x and u in natural flat order (global = iy*Ns + ix).
     // Reuses internal multipole/local scratch across calls: concurrent matvec
@@ -172,7 +212,15 @@ public:
         const;
 
     H2Info info() const { return info_; }
+    // Itemised, honest storage accounting (A07). Safe to call before build().
+    H2Memory memory() const;
     void print_statistics() const;
+
+    // Free the lazily-sized multipole/local workspace. The immutable caches
+    // are untouched, so the operator stays usable — the next apply simply
+    // re-allocates. Lets a memory-constrained driver drop the workspace
+    // before materialising full-grid output.
+    void release_scratch() const;
 
     int n_far_interactions() const { return static_cast<int>(info_.n_far_interactions); }
     int n_unique_couplings() const { return info_.n_unique_couplings; }
@@ -222,6 +270,7 @@ private:
     H2Info info_;
     bool built_ = false;
     std::int64_t owned_kernel_bytes_ = 0;
+    std::int64_t borrowed_kernel_bytes_ = 0;
     int owned_extent_ = 0;
 
     double far_kernel(double dx, double dy) const; // g(dx,dy)

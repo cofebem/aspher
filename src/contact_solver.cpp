@@ -1,5 +1,6 @@
 #include "contact_solver.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -81,6 +82,25 @@ struct Diag {
 
 inline double default_load_tol(bool is_double) {
     return is_double ? 1e-12 : 5e-7;
+}
+
+using Clock = std::chrono::steady_clock;
+inline double since(Clock::time_point t0) {
+    return std::chrono::duration<double>(Clock::now() - t0).count();
+}
+
+// A07: what the solver itself allocates, from the sizes it really asked for.
+// The double path MOVES its iterate into res.pressure, so the pressure array
+// is not an extra allocation there; the float path must cast, so it is.
+inline ContactResult::Memory solve_memory(long long n, int real_bytes,
+                                          bool keep_best, bool light) {
+    ContactResult::Memory m;
+    m.cg_state = 7 * n * real_bytes;   // p, t, u, g, g_prev, z, r
+    m.best_iterate = keep_best ? n * real_bytes : 0;
+    m.contact_mask = n;
+    m.output_arrays = (real_bytes == 8 ? 0 : n * 8) + (light ? 0 : 2 * n * 8);
+    m.peak = m.cg_state + m.best_iterate + m.contact_mask + m.output_arrays;
+    return m;
 }
 
 } // namespace
@@ -168,6 +188,21 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
 
     ContactResult res;
     long long mv = 0, pcount = 0;
+    double t_matvec = 0.0, t_precond = 0.0;
+    const auto t_start = Clock::now();
+    auto apply = [&](const Vec& x, Vec& y) {
+        const auto t0 = Clock::now();
+        S(x, y);
+        t_matvec += since(t0);
+        ++mv;
+    };
+    auto apply_precond = [&](const Vec& g_in,
+                             const std::vector<std::uint8_t>& mask, Vec& z_out) {
+        const auto t0 = Clock::now();
+        precond(g_in, mask, z_out);
+        t_precond += since(t0);
+        ++pcount;
+    };
     double G_old = 1.0;
     Real delta = 0.0; // conjugation switch: 0 restarts the direction
 
@@ -249,8 +284,7 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
 #pragma omp parallel for schedule(static)
             for (int i = 0; i < N; ++i) z(i) = p(i) - s * g(i);
             project_load_simplex<Real>(z, P_total);
-            S(z, r);
-            ++mv;
+            apply(z, r);
             double f_try = 0.0, gd = 0.0;
 #pragma omp parallel for schedule(static) reduction(+ : f_try, gd)
             for (int i = 0; i < N; ++i) {
@@ -288,7 +322,7 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
 
     int it = 0;
     for (it = 0; it < opt.max_iter; ++it) {
-        if (!u_fresh) { S(p, u); ++mv; }
+        if (!u_fresh) apply(p, u);
         u_fresh = false;
         d = evaluate();
         if (!d.finite) { status = SolveStatus::nonfinite; break; }
@@ -326,8 +360,7 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
 #pragma omp parallel for schedule(static)
             for (int i = 0; i < N; ++i) contact[i] = (p(i) > Real(0)) ? 1 : 0;
             if (precond) {
-                precond(g, contact, z);
-                ++pcount;
+                apply_precond(g, contact, z);
             } else {
 #pragma omp parallel for schedule(static)
                 for (int i = 0; i < N; ++i) z(i) = contact[i] ? g(i) : Real(0);
@@ -357,8 +390,7 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
             // line search tau = <g,t>/<St,t> on the contact set; den keeps the
             // centred (r - rmean)*t form (the expanded variant cancels
             // catastrophically in float).
-            S(t, r);
-            ++mv;
+            apply(t, r);
             double rsum = 0.0, num = 0.0;
 #pragma omp parallel for schedule(static) reduction(+ : rsum, num)
             for (int i = 0; i < N; ++i)
@@ -440,7 +472,7 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
         }
     }
     best_p.resize(0);
-    if (!u_fresh) { S(p, u); ++mv; }
+    if (!u_fresh) apply(p, u);
     d = evaluate();
     if (!d.finite && status != SolveStatus::nonfinite)
         status = SolveStatus::nonfinite;
@@ -490,6 +522,10 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
     res.g_ref = g_ref;
     res.matvec_count = mv;
     res.precond_count = pcount;
+    res.memory = solve_memory(N, sizeof(Real), opt.keep_best, opt.light);
+    res.time_matvec = t_matvec;
+    res.time_precond = t_precond;
+    res.time_total = since(t_start);
     if constexpr (is_double)
         res.pressure = std::move(p);
     else
@@ -596,6 +632,21 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
 
     ContactResult res;
     long long mv = 0, pcount = 0;
+    double t_matvec = 0.0, t_precond = 0.0;
+    const auto t_start = Clock::now();
+    auto apply = [&](const Vec& x, Vec& y) {
+        const auto t0 = Clock::now();
+        S(x, y);
+        t_matvec += since(t0);
+        ++mv;
+    };
+    auto apply_precond = [&](const Vec& g_in,
+                             const std::vector<std::uint8_t>& mask, Vec& z_out) {
+        const auto t0 = Clock::now();
+        precond(g_in, mask, z_out);
+        t_precond += since(t0);
+        ++pcount;
+    };
     double G_old = 1.0;
     Real delta = 0.0;
 
@@ -678,8 +729,7 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
             z.setZero();
 #pragma omp parallel for schedule(static)
             for (int j = 0; j < Nc; ++j) z(idx[j]) = y(j);
-            S(z, r);
-            ++mv;
+            apply(z, r);
             double f_try = 0.0, gd = 0.0;
 #pragma omp parallel for schedule(static) reduction(+ : f_try, gd)
             for (int j = 0; j < Nc; ++j) {
@@ -717,7 +767,7 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
 
     int it = 0;
     for (it = 0; it < opt.max_iter; ++it) {
-        if (!u_fresh) { S(p, u); ++mv; }
+        if (!u_fresh) apply(p, u);
         u_fresh = false;
         d = evaluate();
         if (!d.finite) { status = SolveStatus::nonfinite; break; }
@@ -756,8 +806,7 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
                 contact[i] = (p(i) > Real(0)) ? 1 : 0;
             }
             if (precond) {
-                precond(g, contact, z);
-                ++pcount;
+                apply_precond(g, contact, z);
             } else {
 #pragma omp parallel for schedule(static)
                 for (int j = 0; j < Nc; ++j) {
@@ -790,8 +839,7 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
             }
             G_old = G;
 
-            S(t, r);
-            ++mv;
+            apply(t, r);
             double rsum = 0.0, num = 0.0;
 #pragma omp parallel for schedule(static) reduction(+ : rsum, num)
             for (int j = 0; j < Nc; ++j) {
@@ -859,7 +907,7 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
         }
     }
     best_p.resize(0);
-    if (!u_fresh) { S(p, u); ++mv; }
+    if (!u_fresh) apply(p, u);
     d = evaluate();
     if (!d.finite && status != SolveStatus::nonfinite)
         status = SolveStatus::nonfinite;
@@ -905,6 +953,12 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
     res.g_ref = g_ref;
     res.matvec_count = mv;
     res.precond_count = pcount;
+    // the restricted solve is always light: its operator output is invalid off
+    // the candidate leaves, so the caller materialises the fields itself
+    res.memory = solve_memory(N, sizeof(Real), opt.keep_best, /*light=*/true);
+    res.time_matvec = t_matvec;
+    res.time_precond = t_precond;
+    res.time_total = since(t_start);
     if (cert) {
         // reported in the SHIFTED frame the caller's g0 view lives in, so a
         // streamed global minimum computed from the same g0 is comparable

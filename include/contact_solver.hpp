@@ -68,6 +68,25 @@ struct ContactResult {
     double objective_error_bound = 0.0;
     bool objective_error_bound_valid = false;
 
+    // ── A07: library-side allocation accounting and phase timing ───────────
+    // These are the SOLVER's own buffers, computed from the sizes it actually
+    // allocated. They are not process RSS, which also carries the caller's
+    // gap and surface arrays, the operator, and the Python heap.
+    struct Memory {
+        long long cg_state = 0;      // iterate, direction, residual, gradient
+        long long best_iterate = 0;  // 0 when keep_best is off
+        long long contact_mask = 0;
+        long long output_arrays = 0; // pressure (+ displacement and gap)
+        long long peak = 0;          // largest simultaneous total
+    } memory;
+    double time_total = 0.0;        // seconds inside the solve
+    double time_matvec = 0.0;       // in operator applications
+    double time_precond = 0.0;      // in preconditioner applications
+    double time_build = 0.0;        // operator construction (nested driver)
+    double time_coarse = 0.0;       // coarse-level solves (nested driver)
+    double time_verification = 0.0; // streamed global checks (active set)
+    double time_output = 0.0;       // materialising the full-grid fields
+
     long long matvec_count = 0;              // operator applies inside the solve
     long long verification_matvec_count = 0; // applies spent on verification
     long long precond_count = 0;             // preconditioner applications

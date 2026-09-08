@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <vector>
 
 namespace hmc {
@@ -29,6 +30,18 @@ public:
     int leaf_level() const { return nlevels_ - 1; }
 
     const std::vector<H2Box>& boxes() const { return boxes_; }
+
+    // A07: storage of the tree itself. `logical` counts the elements in use,
+    // `bytes` counts what the containers actually hold (capacity), which is
+    // what the process paid for.
+    std::size_t logical_bytes() const {
+        return boxes_.size() * sizeof(H2Box) +
+               level_begin_.size() * sizeof(int);
+    }
+    std::size_t bytes() const {
+        return boxes_.capacity() * sizeof(H2Box) +
+               level_begin_.capacity() * sizeof(int);
+    }
 
     int level_begin(int level) const { return level_begin_[level]; }
     int boxes_per_side(int level) const { return 1 << level; }

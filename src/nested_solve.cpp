@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -172,6 +173,7 @@ static ContactResult active_finest(const H2Operator& h2,
     std::vector<std::uint8_t> viol(N);
     int it_total = 0, rounds = 0;
     long long verify_mv = 0;
+    double t_verify = 0.0, t_output = 0.0;
     bool certified = false;
 
     while (rounds < np.active_max_rounds) {
@@ -250,8 +252,11 @@ static ContactResult active_finest(const H2Operator& h2,
             }
         };
         std::fill(viol.begin(), viol.end(), 0);
+        const auto t_ver = std::chrono::steady_clock::now();
         if constexpr (is_double) h2.matvec_masked_stream(*psrc, mask, sink);
         else h2.matvec_masked_stream_single(*psrc, mask, sink);
+        t_verify += std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t_ver).count();
         ++verify_mv;
 
         // Global certificate from the restricted one and the streamed global
@@ -361,6 +366,7 @@ static ContactResult active_finest(const H2Operator& h2,
         // certified: free the preconditioner's full-grid FFT scratch before
         // materialising any full field, then scatter the compressed pressure
         if (fp) fp->release_scratch();
+        const auto t_out = std::chrono::steady_clock::now();
         Eigen::VectorXd pfull = Eigen::VectorXd::Zero(N);
 #pragma omp parallel for schedule(static)
         for (std::ptrdiff_t k = 0; k < S; ++k) pfull(gi[k]) = res.pressure(k);
@@ -396,7 +402,11 @@ static ContactResult active_finest(const H2Operator& h2,
             res.gap = std::move(gp);
         }
         res.pressure = std::move(pfull);
+        t_output = std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - t_out).count();
     }
+    res.time_verification = t_verify;
+    res.time_output = t_output;
     res.active_rounds = rounds;
     res.iterations = it_total;
     res.verification_matvec_count = verify_mv;
@@ -516,9 +526,15 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
     Eigen::VectorXd coarse_gap; // next-to-finest gap field (active_set only)
     bool have_init = false;
     ContactResult res;
+    // A07 phase timing: operator/preconditioner construction across all
+    // levels, and the coarse solves, are part of the cost of a nested solve
+    // and must appear in any full-solve total (plan §8).
+    double t_build = 0.0, t_coarse = 0.0;
+    const auto t_nested = std::chrono::steady_clock::now();
 
     for (std::size_t li = 0; li < levels.size(); ++li) {
         const int n = levels[li];
+        const auto t_lvl_build = std::chrono::steady_clock::now();
         // A06: the FFT backend needs the full Love table (it transforms it);
         // the H2 backend never touches it after build(), so it is built
         // through the compact near-offset path instead — 8*n^2 bytes saved at
@@ -544,6 +560,8 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         }
 
         FourierPreconditioner fp(n);
+        t_build += std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - t_lvl_build).count();
         PrecondIntoT<double> pc;
         if (np.precond)
             pc = [&fp](const Eigen::VectorXd& g,
@@ -655,11 +673,16 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         }
 
         if (!finest) {
+            t_coarse += res.time_total;
             p_init = prolong_field(res.pressure, n);
             have_init = true;
             if (keep_gap) coarse_gap = std::move(res.gap);
         }
     }
+    res.time_build = t_build;
+    res.time_coarse = t_coarse;
+    res.time_total = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - t_nested).count();
     return res;
 }
 

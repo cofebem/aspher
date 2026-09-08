@@ -259,6 +259,26 @@ public:
             d["n_leaves"] = s.n_leaves;
             d["nlevels"] = s.nlevels;
             d["bytes"] = s.bytes_total;
+            // A07: itemised, honest accounting. `bytes` above is the legacy
+            // summary; these separate what is really allocated from what is
+            // merely predicted, and owned coefficients from borrowed ones.
+            const auto mem = h2_->memory();
+            d["mem_kernel_owned"] = static_cast<long long>(mem.kernel_owned);
+            d["mem_kernel_borrowed"] = static_cast<long long>(mem.kernel_borrowed);
+            d["mem_tree"] = static_cast<long long>(mem.tree);
+            d["mem_leaves"] = static_cast<long long>(mem.leaves);
+            d["mem_far_csr"] = static_cast<long long>(mem.far_csr);
+            d["mem_near_csr"] = static_cast<long long>(mem.near_csr);
+            d["mem_transfers"] = static_cast<long long>(mem.transfers);
+            d["mem_couplings"] = static_cast<long long>(mem.couplings);
+            d["mem_near_stencils"] = static_cast<long long>(mem.near_stencils);
+            d["mem_single_caches"] = static_cast<long long>(mem.single_caches);
+            d["mem_scratch"] = static_cast<long long>(mem.scratch);
+            d["mem_resident"] = static_cast<long long>(mem.resident);
+            d["mem_system_resident"] = static_cast<long long>(mem.system_resident());
+            d["mem_estimated_next_apply"] =
+                static_cast<long long>(mem.estimated_next_apply_bytes);
+            d["near_table_extent"] = s.near_table_extent;
             d["bytes_coupling"] = static_cast<long long>(s.bytes_coupling);
             d["bytes_near"] = static_cast<long long>(s.bytes_near);
             d["bytes_buffers"] = static_cast<long long>(s.bytes_buffers);
@@ -650,6 +670,36 @@ PYBIND11_MODULE(aspher, m) {
             [](const PyResult& s) { return s.r.identification_steps; })
         .def_property_readonly("returned_best",
                                [](const PyResult& s) { return s.r.returned_best; })
+        // ── A07: library-side allocation accounting and phase timing ───────
+        .def_property_readonly(
+            "memory",
+            [](const PyResult& s) {
+                py::dict d;
+                d["cg_state"] = s.r.memory.cg_state;
+                d["best_iterate"] = s.r.memory.best_iterate;
+                d["contact_mask"] = s.r.memory.contact_mask;
+                d["output_arrays"] = s.r.memory.output_arrays;
+                d["peak"] = s.r.memory.peak;
+                return d;
+            },
+            "Bytes the SOLVER allocated (not process RSS, which also carries "
+            "the caller's gap array, the operator and the Python heap).")
+        .def_property_readonly(
+            "timings",
+            [](const PyResult& s) {
+                py::dict d;
+                d["total"] = s.r.time_total;
+                d["matvec"] = s.r.time_matvec;
+                d["precond"] = s.r.time_precond;
+                d["build"] = s.r.time_build;
+                d["coarse"] = s.r.time_coarse;
+                d["verification"] = s.r.time_verification;
+                d["output"] = s.r.time_output;
+                return d;
+            },
+            "Seconds per phase. For a nested solve `total` covers operator "
+            "construction, the coarse solves, the finest solve, verification "
+            "and output materialisation.")
         .def("__repr__", [](const PyResult& s) {
             std::ostringstream os;
             os << "<ContactResult: " << hmc::to_string(s.r.status) << " in "

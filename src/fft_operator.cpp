@@ -176,6 +176,14 @@ FFTInfo FFTOperator::info() const {
         static_cast<std::int64_t>(sizeof(float)) * Gf_.size() +
         static_cast<std::int64_t>(sizeof(std::complex<float>)) * Cf_.size();
     s.bytes_total = s.bytes_spectrum + s.bytes_scratch;
+    s.bytes_kernel_borrowed =
+        kernel_ ? 8LL * kernel_->size() : 0;
+    const std::int64_t Mg = static_cast<std::int64_t>(M_) * M_;
+    const std::int64_t Ch = static_cast<std::int64_t>(nh_) * M_;
+    if (Gd_.size() == 0)
+        s.estimated_next_apply_bytes += 8 * Mg + 16 * Ch;
+    if (have_single_ && Gf_.size() == 0)
+        s.estimated_next_apply_bytes += 4 * Mg + 8 * Ch;
     return s;
 }
 
