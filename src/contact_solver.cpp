@@ -107,10 +107,10 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
         throw std::invalid_argument("solve_contact: g0 contains non-finite values");
 
     const double P_total = static_cast<double>(p_bar) * N;
+    const double gmin_v = static_cast<double>(g0.minCoeff());
+    const double gmax_v = static_cast<double>(g0.maxCoeff());
     double g_ref = opt.scales.g_ref;
-    if (!(g_ref > 0.0))
-        g_ref = static_cast<double>(g0.maxCoeff()) -
-                static_cast<double>(g0.minCoeff());
+    if (!(g_ref > 0.0)) g_ref = gmax_v - gmin_v;
     if (!(g_ref > 0.0)) g_ref = 1.0;
     const double p_ref =
         (opt.scales.p_ref > 0.0) ? opt.scales.p_ref : static_cast<double>(p_bar);
@@ -118,6 +118,27 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
         (opt.load_tol > 0.0) ? opt.load_tol : default_load_tol(is_double);
     const double tol = opt.tol;
     const double req_tol = (opt.requested_tol > 0.0) ? opt.requested_tol : tol;
+    // A04 gap datum: the solver evaluates v = u + (g0 - datum) and restores
+    // the datum into the reported approach and objective. `automatic` picks
+    // the midpoint of the range (computed as min + (max-min)/2 so a huge
+    // offset cannot overflow the sum) and subtracts it on the fly, so the
+    // caller's array is still read in place — no extra N-sized buffer.
+    double datum = 0.0;
+    bool subtract_datum = false;
+    switch (opt.scales.datum_mode) {
+        case SolveScales::DatumMode::automatic:
+            datum = gmin_v + 0.5 * (gmax_v - gmin_v);
+            subtract_datum = true;
+            break;
+        case SolveScales::DatumMode::solver:
+            datum = opt.scales.datum;
+            subtract_datum = true;
+            break;
+        case SolveScales::DatumMode::caller:
+            datum = opt.scales.datum;
+            break;
+    }
+    const Real gshift = subtract_datum ? static_cast<Real>(datum) : Real(0);
 
     Vec p;
     if (p_init) {
@@ -160,7 +181,7 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
 #pragma omp parallel for schedule(static) reduction(+ : gsum, nc) \
     reduction(min : vmin)
         for (int i = 0; i < N; ++i) {
-            const Real v = u(i) + g0(i);
+            const Real v = u(i) + (g0(i) - gshift);
             g(i) = v;
             const double vd = static_cast<double>(v);
             if (vd < vmin) vmin = vd;
@@ -210,7 +231,7 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
         for (int i = 0; i < N; ++i)
             f_cur += static_cast<double>(p(i)) *
                      (0.5 * static_cast<double>(u(i)) +
-                      static_cast<double>(g0(i)));
+                      static_cast<double>(g0(i) - gshift));
         if (!(s_id > 0.0)) {
             // initial inverse-stiffness estimate from the current iterate:
             // s = (p.p)/(p.Sp) has units pressure/displacement and is a lower
@@ -235,7 +256,7 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
             for (int i = 0; i < N; ++i) {
                 f_try += static_cast<double>(z(i)) *
                          (0.5 * static_cast<double>(r(i)) +
-                          static_cast<double>(g0(i)));
+                          static_cast<double>(g0(i) - gshift));
                 gd += static_cast<double>(g(i)) *
                       static_cast<double>(z(i) - p(i));
             }
@@ -438,7 +459,6 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
         }
     }
 
-    const double datum = opt.scales.datum;
     if (!opt.light) {
         res.displacement = u.template cast<double>();
         res.gap = g.template cast<double>();
@@ -448,7 +468,8 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
 #pragma omp parallel for schedule(static) reduction(+ : obj)
     for (int i = 0; i < N; ++i)
         obj += static_cast<double>(p(i)) *
-               (0.5 * static_cast<double>(u(i)) + static_cast<double>(g0(i)));
+               (0.5 * static_cast<double>(u(i)) +
+                static_cast<double>(g0(i) - gshift));
     res.objective = obj + datum * P_total;
     res.iterations = it;
     res.contact_fraction = double(d.nc) / N;
@@ -513,11 +534,27 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
     int N_grid = opt.n_grid > 0 ? opt.n_grid : N;
 
     const double P_total = static_cast<double>(p_bar) * N_grid;
+    const double gmin_v = static_cast<double>(g0.minCoeff());
+    const double gmax_v = static_cast<double>(g0.maxCoeff());
     double g_ref = opt.scales.g_ref;
-    if (!(g_ref > 0.0))
-        g_ref = static_cast<double>(g0.maxCoeff()) -
-                static_cast<double>(g0.minCoeff());
+    if (!(g_ref > 0.0)) g_ref = gmax_v - gmin_v;
     if (!(g_ref > 0.0)) g_ref = 1.0;
+    double datum = 0.0;
+    bool subtract_datum = false;
+    switch (opt.scales.datum_mode) {
+        case SolveScales::DatumMode::automatic:
+            datum = gmin_v + 0.5 * (gmax_v - gmin_v);
+            subtract_datum = true;
+            break;
+        case SolveScales::DatumMode::solver:
+            datum = opt.scales.datum;
+            subtract_datum = true;
+            break;
+        case SolveScales::DatumMode::caller:
+            datum = opt.scales.datum;
+            break;
+    }
+    const Real gshift = subtract_datum ? static_cast<Real>(datum) : Real(0);
     const double p_ref =
         (opt.scales.p_ref > 0.0) ? opt.scales.p_ref : static_cast<double>(p_bar);
     const double load_tol =
@@ -571,7 +608,7 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
     reduction(min : vmin)
         for (int j = 0; j < Nc; ++j) {
             const int i = idx[j];
-            const Real v = u(i) + g0(i);
+            const Real v = u(i) + (g0(i) - gshift);
             g(i) = v;
             const double vd = static_cast<double>(v);
             if (vd < vmin) vmin = vd;
@@ -615,7 +652,7 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
             const int i = idx[j];
             f_cur += static_cast<double>(p(i)) *
                      (0.5 * static_cast<double>(u(i)) +
-                      static_cast<double>(g0(i)));
+                      static_cast<double>(g0(i) - gshift));
         }
         if (!(s_id > 0.0)) {
             double pp = 0.0, pu = 0.0;
@@ -649,7 +686,7 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
                 const int i = idx[j];
                 f_try += static_cast<double>(z(i)) *
                          (0.5 * static_cast<double>(r(i)) +
-                          static_cast<double>(g0(i)));
+                          static_cast<double>(g0(i) - gshift));
                 gd += static_cast<double>(g(i)) *
                       static_cast<double>(z(i) - p(i));
             }
@@ -844,10 +881,10 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
     for (int j = 0; j < Nc; ++j) {
         const int i = idx[j];
         obj += static_cast<double>(p(i)) *
-               (0.5 * static_cast<double>(u(i)) + static_cast<double>(g0(i)));
+               (0.5 * static_cast<double>(u(i)) +
+                static_cast<double>(g0(i) - gshift));
     }
 
-    const double datum = opt.scales.datum;
     res.approach = d.alpha + datum;
     res.objective = obj + datum * P_total;
     res.iterations = it;
@@ -869,6 +906,8 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
     res.matvec_count = mv;
     res.precond_count = pcount;
     if (cert) {
+        // reported in the SHIFTED frame the caller's g0 view lives in, so a
+        // streamed global minimum computed from the same g0 is comparable
         cert->pv_sum = d.pv;
         cert->vmin_local = d.gmin + d.alpha;
         cert->P_total = P_total;

@@ -99,7 +99,7 @@ static ContactResult active_finest(const H2Operator& h2,
                                    Eigen::VectorXd& p_init_d,
                                    const Eigen::VectorXd& coarse_gap,
                                    bool record_history, bool light,
-                                   double g_ref) {
+                                   double g_ref, double datum, double gsub) {
     using Vec = VecT<Real>;
     constexpr bool is_double = std::is_same_v<Real, double>;
     const int N = Ns * Ns;
@@ -140,10 +140,11 @@ static ContactResult active_finest(const H2Operator& h2,
     // compressed gap, candidate positions
     Vec g0c(S);
     std::vector<int> cidx;
+    const Real gsub_r = static_cast<Real>(gsub);
     auto gather_level = [&] {
         g0c.resize(S);
 #pragma omp parallel for schedule(static)
-        for (std::ptrdiff_t k = 0; k < S; ++k) g0c(k) = g0(gi[k]);
+        for (std::ptrdiff_t k = 0; k < S; ++k) g0c(k) = g0(gi[k]) - gsub_r;
         cidx.clear();
         for (std::ptrdiff_t k = 0; k < S; ++k)
             if (cmask[gi[k]]) cidx.push_back(static_cast<int>(k));
@@ -188,6 +189,8 @@ static ContactResult active_finest(const H2Operator& h2,
         aopt.allow_tolerance_relaxation = true; // level policy, set by caller
         aopt.n_grid = N;
         aopt.scales.g_ref = g_ref;
+        aopt.scales.datum_mode = SolveScales::DatumMode::caller;
+        aopt.scales.datum = datum;
         RestrictedCertificate cert;
         res = solve_contact_active_impl<Real>(mv, g0c, static_cast<Real>(p_bar),
                                               aopt, pc, cidx, &p0, &cert);
@@ -206,7 +209,7 @@ static ContactResult active_finest(const H2Operator& h2,
             pr = res.pressure.template cast<Real>();
             psrc = &pr;
         }
-        const double a = res.approach;
+        const double a = res.approach - datum; // centred approach
         const int ls = h2.info().leaf_side;
         std::atomic<long> nviol{0};
         auto sink = [&](int ix0, int iy0, const Real* tile) {
@@ -218,7 +221,7 @@ static ContactResult active_finest(const H2Operator& h2,
                     const std::ptrdiff_t i = row + lx;
                     if (!cmask[i] &&
                         static_cast<double>(tile[t]) +
-                                static_cast<double>(g0(i)) - a <
+                                (static_cast<double>(g0(i)) - gsub) - a <
                             vthresh) {
                         viol[i] = 1;
                         ++local;
@@ -302,7 +305,11 @@ static ContactResult active_finest(const H2Operator& h2,
         fopt.record_history = record_history;
         fopt.keep_best = !light;
         fopt.allow_tolerance_relaxation = true;
-        fopt.scales.g_ref = g_scale;
+        fopt.scales.g_ref = g_ref;
+        fopt.scales.datum_mode = (gsub != 0.0)
+                                     ? SolveScales::DatumMode::solver
+                                     : SolveScales::DatumMode::caller;
+        fopt.scales.datum = datum;
         res = solve_contact_impl<Real>(mvf, g0, static_cast<Real>(p_bar), fopt,
                                        pcf, &pf);
         it_total += res.iterations;
@@ -329,7 +336,7 @@ static ContactResult active_finest(const H2Operator& h2,
                 psrc = &pr;
             }
             Eigen::VectorXd disp(N), gp(N);
-            const double a = res.approach;
+            const double a = res.approach - datum; // centred approach
             const int ls = h2.info().leaf_side;
             auto fill = [&](int ix0, int iy0, const Real* tile) {
                 for (int ly = 0, t = 0; ly < ls; ++ly) {
@@ -338,7 +345,8 @@ static ContactResult active_finest(const H2Operator& h2,
                     for (int lx = 0; lx < ls; ++lx, ++t) {
                         const std::ptrdiff_t i = row + lx;
                         disp(i) = static_cast<double>(tile[t]);
-                        gp(i) = disp(i) + static_cast<double>(g0(i)) - a;
+                        gp(i) =
+                            disp(i) + (static_cast<double>(g0(i)) - gsub) - a;
                     }
                 }
             };
@@ -403,6 +411,14 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             gap[i] = restrict_field(gap[i + 1], levels[i + 1]);
     }
 
+    // One consistent physical scale and gap datum for the whole hierarchy
+    // (spec §3.1/A04): level diagnostics are only comparable when they use the
+    // same normalisation, and every level's float cast must remove the same
+    // additive datum. Both come from the finest gap, in double.
+    const double g_min_f = g0.minCoeff(), g_max_f = g0.maxCoeff();
+    const double datum = g_min_f + 0.5 * (g_max_f - g_min_f);
+    const double g_ref = std::max(g_max_f - g_min_f, p_bar * L / E_star);
+
     Eigen::VectorXd p_init;
     Eigen::VectorXd coarse_gap; // next-to-finest gap field (active_set only)
     bool have_init = false;
@@ -456,12 +472,6 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         // finest-level-only); coarse levels never record history.
         const bool record_history = finest && np.record_error_history;
 
-        // Physical scales (spec §3.1): g_ref = max(range(g0), p_bar L / E*)
-        // is invariant to an additive gap datum and transforms consistently
-        // under a change of units; the same scale is used for the level's
-        // diagnostics and for its tolerance normalisation.
-        double g_range = glvl.maxCoeff() - glvl.minCoeff();
-        const double g_ref = std::max(g_range, p_bar * L / E_star);
         SolveOptions lopt;
         lopt.tol = lvl_tol;
         lopt.requested_tol = finest ? tol : np.coarse_tol;
@@ -475,6 +485,13 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         // finest double stage carries the requested tolerance strictly.
         lopt.allow_tolerance_relaxation = !finest || np.single_precision;
         lopt.scales.g_ref = g_ref;
+        lopt.scales.datum = datum;
+        // double levels read their gap in place and subtract the datum on the
+        // fly (no extra N-sized buffer); float levels get it removed inside
+        // the cast, before any information can be rounded away.
+        lopt.scales.datum_mode = np.single_precision
+                                     ? SolveScales::DatumMode::caller
+                                     : SolveScales::DatumMode::solver;
 
         if (finest && np.active_set) {
             // restricted (active-set) solve on the candidate set built from
@@ -482,16 +499,19 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             const FourierPreconditioner* fpp = np.precond ? &fp : nullptr;
             if (np.single_precision) {
                 h2->build_single_caches();
-                Eigen::VectorXf g0f = glvl.cast<float>();
+                // centre inside the cast: rounding a large offset first is
+                // exactly what destroyed the float solution (review §4)
+                Eigen::VectorXf g0f = (glvl.array() - datum).cast<float>();
                 res = active_finest<float>(*h2, fpp, g0f, p_bar, lvl_tol,
                                            max_iter, use_pr, np, n, p_init,
                                            coarse_gap, record_history,
-                                           np.light_result, g_ref);
+                                           np.light_result, g_ref, datum, 0.0);
             } else {
                 res = active_finest<double>(*h2, fpp, glvl, p_bar, lvl_tol,
                                             max_iter, use_pr, np, n, p_init,
                                             coarse_gap, record_history,
-                                            np.light_result, g_ref);
+                                            np.light_result, g_ref, datum,
+                                            datum);
             }
             coarse_gap.resize(0);
         } else if (np.single_precision) {
@@ -514,7 +534,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                             Eigen::VectorXf& z) {
                     fp.apply_single_into(g, contact, z);
                 };
-            Eigen::VectorXf g0f = glvl.cast<float>();
+            Eigen::VectorXf g0f = (glvl.array() - datum).cast<float>();
             // free the coarse double gap once cast to float (the finest-level
             // double buffer is caller-owned and stays alive)
             if (!finest) gap[li].resize(0);

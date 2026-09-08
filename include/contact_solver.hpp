@@ -77,11 +77,26 @@ struct ContactResult {
 
 // Physical scales used for normalising diagnostics and tolerances (spec §3.1).
 // Both are computed in double and are invariant to an additive gap datum.
+//
+// A04: adding a constant c to g0 cannot change p* (it only adds c to the
+// approach and cP to the objective), but it destroys the small variations
+// that carry the physics once the field is rounded — a 1e6 offset changed the
+// float nested solution by relative error 1.08 (review §4). The solver
+// therefore always works on a centred gap and restores the datum into the
+// reported approach and objective.
 struct SolveScales {
     double p_ref = 0.0; // pressure scale; <= 0 -> p_bar
     double g_ref = 0.0; // displacement/gap scale; <= 0 -> range(g0)
-    double datum = 0.0; // additive gap datum already removed from g0 (A04);
-                        // restored into the reported approach/objective
+
+    enum class DatumMode {
+        automatic, // solver picks c = midpoint(min g0, max g0) and subtracts it
+                   // on the fly (no extra N-sized buffer, zero-copy preserved)
+        solver,    // subtract the supplied `datum` on the fly
+        caller,    // `datum` was already removed from g0 by the caller (e.g.
+                   // fused into a float cast); restore it only
+    };
+    DatumMode datum_mode = DatumMode::automatic;
+    double datum = 0.0;
 };
 
 // Solver policy. `tol` is the target this stage works to (effective);
