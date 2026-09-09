@@ -1,6 +1,6 @@
 # Sparse stencil preconditioner — design
 
-Status: agreed in discussion 2026-09-09, not yet implemented.
+Status: **approved 2026-09-09**, implementation in progress.
 Supersedes the A13 "sparse preconditioner + coarse space" sketch in
 `doc/specs/2026-09-08-accuracy-efficiency-improvements.md`: the coarse-space
 half of that idea is **measured dead** (§3.2) and the sparse half turns out to
@@ -136,7 +136,8 @@ coarse-grid correction could carry. Ns=1024, single level, p̄=0.002:
 is *far worse than no preconditioner at all*.) Coarsening removes precisely the
 part of the operator that does the work: `M⁻¹` acts most strongly at high `k`,
 so truncating the top of the spectrum annihilates the subspace it exists to
-correct. **A13's coarse space should be struck from the roadmap.**
+correct. **A13's coarse space is struck from the roadmap** (agreed
+2026-09-09); the sparse half of A13 is what this spec delivers.
 
 ### 3.3 Real-space truncation costs nothing
 
@@ -358,7 +359,10 @@ S5 is a band rather than an equality because the stencil is a *different*
   be 8; R=2 is safe, a future R=8 would not be.
 - **High occupancy is unmeasured above 24%.** §3.3 stops at 24.4% contact.
   Near-full contact is where the low-`k` behaviour of `ŵ_R` differs most from
-  `|k|`. The B04 sweep infrastructure covers this; add 50% and 99% points.
+  `|k|`. The B04 sweep infrastructure covers this; **add a 50% point, required
+  before the default flips** (agreed 2026-09-09). 99% is deliberately not
+  required: B04 already showed the active-set path is the wrong tool there and
+  the occupancy gate closes it, so the regime is out of the stencil's way.
 - **Coarse levels** use the same preconditioner and the same change; their
   `Ns < 512` weights are computed exactly rather than taken from the limit.
 - **Out-of-range index, pre-existing.** The band-limit probe of §3.2 crashed
