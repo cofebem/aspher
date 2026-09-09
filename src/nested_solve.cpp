@@ -280,7 +280,6 @@ static ContactResult active_finest(const H2Operator& h2,
         res.fw_error = fw_glob;
         res.penetration_error = pen_glob;
         res.effective_tol = lvl_tol;
-        res.requested_tol = lvl_tol;
 
         // Accept only when the restricted solve met its own KKT conditions
         // AND the global check passes: an empty outside-violation list is not
@@ -682,6 +681,12 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                                             datum);
             }
             coarse_gap.resize(0);
+            // active_finest works in level terms and cannot know the caller's
+            // original target: `lvl_tol` is the EFFECTIVE level tolerance
+            // (clamped to the float floor), while requested_tol must stay the
+            // tolerance the caller actually asked for, or two runs of the same
+            // request look like different accuracy contracts.
+            res.requested_tol = lopt.requested_tol;
         } else if (level_float) {
             MatVecIntoT<float> mvf;
             if (fop) {
