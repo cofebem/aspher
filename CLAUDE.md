@@ -80,8 +80,14 @@ comparing any timing.
 python bench/harness.py preflight --ns 16384 --variant h2-f32-active
 python bench/harness.py run --workload rough-H0.8 --ns 1024     --variants h2-f64,h2-f64-active --reps 5
 python bench/analyze.py --pair h2-f64,h2-f64-active --metric wall_cold_s
-# long jobs: detach, do NOT background inside a tool call
-OMP_NUM_THREADS=20 nohup python bench/harness.py run ...     > data/bench_16384.log 2>&1 < /dev/null & disown
+# Long jobs must run OUTSIDE the agent sandbox: each sandboxed shell gets its
+# own PID namespace and everything in it dies when the call ends (nohup,
+# disown and setsid do not help - verified with a bare `sleep 900`).
+OMP_NUM_THREADS=20 OPENBLAS_NUM_THREADS=1 setsid nohup \
+    python bench/harness.py run ... > data/bench_16384.log 2>&1 < /dev/null & disown
+# A killed job leaves NO ledger row; a job that fails inside the harness leaves
+# an oom/timeout/error row. That difference is the diagnostic. Also: `ps` from
+# inside the sandbox cannot see a host job - check the log mtime and the ledger.
 ```
 
 ## Run Tests
