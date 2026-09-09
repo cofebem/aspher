@@ -122,6 +122,23 @@ VARIANTS = {
                                 active_set=True, active_all_levels=True,
                                 active_delta=0.0, active_halo=0,
                                 active_max_rounds=8),
+    # Stencil vs the historical full-grid transform
+    # (doc/specs/2026-09-09-stencil-preconditioner-design.md). Both arms name
+    # the engine explicitly: the default flipped, so a bare "h2-f32-active"
+    # row means different things before and after that commit.
+    "h2-f32-active-stencil": dict(backend="h2", precision="float",
+                                  allow_tolerance_relaxation=True,
+                                  active_set=True, precond_engine="stencil"),
+    "h2-f32-active-fft":     dict(backend="h2", precision="float",
+                                  allow_tolerance_relaxation=True,
+                                  active_set=True, precond_engine="fft"),
+    "h2-f32-active-nopc":    dict(backend="h2", precision="float",
+                                  allow_tolerance_relaxation=True,
+                                  active_set=True, precond=False),
+    "h2-f64-active-stencil": dict(backend="h2", precision="double",
+                                  active_set=True, precond_engine="stencil"),
+    "h2-f64-active-fft":     dict(backend="h2", precision="double",
+                                  active_set=True, precond_engine="fft"),
     "h2-polish":         dict(backend="h2", precision="float_then_double"),
     "fft-f64":           dict(backend="fft", precision="double"),
     "fft-f32":           dict(backend="fft", precision="float",
