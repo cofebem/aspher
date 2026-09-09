@@ -14,19 +14,37 @@ struct NestedParams {
     int leaf_side = 8;        // H2 leaf side on every level
     bool precond = true;      // |q| spectral preconditioner per level
     // Which implementation applies the |q| preconditioner.
-    //   stencil — a 13-tap real-space disc evaluated only on the contact set,
-    //             O(taps·N_c) with no grid allocation (the default).
-    //   fft     — the historical full-grid transform, O(N log N) per apply.
-    //             Kept as the equivalence reference and an escape hatch; it
-    //             was 77–81% of an Ns=16384 active-set run.
+    //   stencil   — a 13-tap real-space disc evaluated only on the contact
+    //               set, O(taps·N_c) with no grid allocation.
+    //   fft       — the historical full-grid transform, O(N log N) per
+    //               apply. Kept as the equivalence reference and an escape
+    //               hatch; it was 77–81% of an Ns=16384 active-set run.
+    //   automatic — pick per level from the previous level's measured
+    //               occupancy (see precond_occupancy_max below). Default:
+    //               the stencil wins by 12–65% below ~2.5% contact but loses
+    //               by 16.9% at 56.8% contact (measured,
+    //               doc/bench/2026-09-09-stencil-preconditioner.md), because
+    //               above active_occupancy_max the active-set restriction
+    //               switches off and the level runs the plain full-grid
+    //               solve — the regime where the truncated kernel's low-k
+    //               error costs iterations.
     // Both apply the same operator; see
     // doc/specs/2026-09-09-stencil-preconditioner-design.md.
-    enum class PrecondEngine { stencil, fft };
-    PrecondEngine precond_engine = PrecondEngine::stencil;
+    enum class PrecondEngine { stencil, fft, automatic };
+    PrecondEngine precond_engine = PrecondEngine::automatic;
     // l2 disc radius of the stencil, in cells. 2 (13 taps) matched or beat
     // the full transform in every regime measured; 1 (5 taps) costs up to 13%
     // more iterations. Must not exceed leaf_side.
     int precond_radius = 2;
+    // Occupancy above which `automatic` prefers the FFT engine. Measured
+    // (doc/bench/2026-09-09-stencil-preconditioner.md): the stencil wins by
+    // 12-65% below ~2.5% contact and loses by 16.9% at 56.8%, because above
+    // active_occupancy_max the active-set restriction switches off and the
+    // level runs the plain full-grid solve -- the regime where the truncated
+    // kernel's low-k error costs iterations. The crossover coincides with
+    // active_occupancy_max by construction, but this is a SEPARATE knob:
+    // disabling the active-set gate must not silently disable this one.
+    double precond_occupancy_max = 0.4;
     double coarse_tol = 1e-4; // cascadic: looser tolerance on coarse levels
     // ── A09: precision policy ─────────────────────────────────────────────
     // `double_only`       every stage in double (default).
@@ -95,6 +113,20 @@ struct NestedParams {
     int active_halo = 2;        // dilation radius for candidate/violation sets
     int active_max_rounds = 5;  // verification rounds before full-solve fallback
 };
+
+// Which preconditioner engine a level should use.
+//   prev_occupancy < 0 means "no measurement yet" (the coarsest level), where
+//   the stencil is preferred: it is the cheaper engine and the coarsest level
+//   is the smallest.
+// Semantics:
+//   !precond (any engine)                               -> false (no preconditioner)
+//   engine == stencil                                    -> true
+//   engine == fft                                        -> false
+//   engine == automatic, prev_occupancy < 0              -> true
+//   engine == automatic, prev_occupancy < occupancy_max  -> true
+//   engine == automatic, otherwise                       -> false
+bool stencil_for_level(NestedParams::PrecondEngine engine, bool precond,
+                       double prev_occupancy, double occupancy_max);
 
 // Single-entry nested-grid (cascadic / full-multigrid) contact solve. Builds
 // the grid hierarchy coarsest..Ns by doubling, restricts the fine gap g0 to

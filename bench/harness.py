@@ -132,6 +132,11 @@ VARIANTS = {
     "h2-f32-active-fft":     dict(backend="h2", precision="float",
                                   allow_tolerance_relaxation=True,
                                   active_set=True, precond_engine="fft"),
+    # Task 7: occupancy-gated engine choice (default). Picks stencil/fft per
+    # level from the previous level's measured contact fraction.
+    "h2-f32-active-auto":    dict(backend="h2", precision="float",
+                                  allow_tolerance_relaxation=True,
+                                  active_set=True, precond_engine="auto"),
     "h2-f32-active-nopc":    dict(backend="h2", precision="float",
                                   allow_tolerance_relaxation=True,
                                   active_set=True, precond=False),
@@ -495,7 +500,7 @@ def worker(workload, Ns, variant, reps, tol, light, coarsest, max_iter):
     for k in ("allow_tolerance_relaxation", "active_set", "active_all_levels",
               "active_halo", "active_max_rounds", "active_delta",
               "active_occupancy_max", "precond", "precond_engine",
-              "precond_radius"):
+              "precond_radius", "precond_occupancy_max"):
         if k in v:
             kwargs[k] = v[k]
 

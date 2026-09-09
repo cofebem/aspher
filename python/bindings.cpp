@@ -348,7 +348,8 @@ PyResult py_solve_nested(
     const py::array_t<double, py::array::c_style | py::array::forcecast>& gap,
     double p_nominal, double domain_size, double E_star, int coarsest, int q,
     int leaf_side, bool precond, const std::string& precond_engine,
-    int precond_radius, double tol, double coarse_tol, int max_iter,
+    int precond_radius, double precond_occupancy_max, double tol,
+    double coarse_tol, int max_iter,
     bool use_pr, bool single_precision, const std::string& precision,
     double float_floor, bool allow_tolerance_relaxation, bool light_result,
     const std::string& backend, bool record_error_history, bool active_set,
@@ -374,9 +375,13 @@ PyResult py_solve_nested(
         np.precond_engine = hmc::NestedParams::PrecondEngine::stencil;
     else if (precond_engine == "fft")
         np.precond_engine = hmc::NestedParams::PrecondEngine::fft;
+    else if (precond_engine == "auto")
+        np.precond_engine = hmc::NestedParams::PrecondEngine::automatic;
     else
-        throw std::invalid_argument("precond_engine must be 'stencil' or 'fft'");
+        throw std::invalid_argument(
+            "precond_engine must be 'auto', 'stencil' or 'fft'");
     np.precond_radius = precond_radius;
+    np.precond_occupancy_max = precond_occupancy_max;
     np.coarse_tol = coarse_tol;
     np.single_precision = single_precision;
     if (precision == "double") np.precision = hmc::NestedParams::Precision::double_only;
@@ -810,7 +815,8 @@ PYBIND11_MODULE(aspher, m) {
           py::arg("gap"), py::arg("p_nominal"), py::arg("domain_size") = 1.0,
           py::arg("E_star") = 1.0, py::arg("coarsest") = 64, py::arg("q") = 6,
           py::arg("leaf_side") = 8, py::arg("precond") = true,
-          py::arg("precond_engine") = "stencil", py::arg("precond_radius") = 2,
+          py::arg("precond_engine") = "auto", py::arg("precond_radius") = 2,
+          py::arg("precond_occupancy_max") = 0.4,
           py::arg("tol") = 1e-8, py::arg("coarse_tol") = 1e-4,
           py::arg("max_iter") = 20000, py::arg("use_pr") = true,
           py::arg("single_precision") = false, py::arg("precision") = "",
@@ -827,6 +833,12 @@ PYBIND11_MODULE(aspher, m) {
           "each level with the prolonged coarse pressure. grid_size must equal "
           "coarsest * 2^k. Returns a ContactResult. backend='h2' (O(N) memory) "
           "or 'fft' (exact convolution, fastest at Ns<=8192). "
+          "precond_engine='auto' (default) picks per level from the previous "
+          "level's measured occupancy: the stencil below "
+          "precond_occupancy_max (default 0.4), else the historical full-grid "
+          "FFT transform (the regime where the truncated stencil kernel's "
+          "low-k error costs iterations). 'stencil' or 'fft' force that "
+          "engine at every level regardless of occupancy. "
           "precision='double' (default) | 'float' (== single_precision=True; "
           "cannot reach a tolerance below float_floor, and now reports "
           "'stagnated'/'precision_limit' rather than a relaxed success unless "

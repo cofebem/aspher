@@ -23,6 +23,20 @@
 
 namespace hmc {
 
+bool stencil_for_level(NestedParams::PrecondEngine engine, bool precond,
+                       double prev_occupancy, double occupancy_max) {
+    if (!precond) return false;
+    switch (engine) {
+        case NestedParams::PrecondEngine::stencil:
+            return true;
+        case NestedParams::PrecondEngine::fft:
+            return false;
+        case NestedParams::PrecondEngine::automatic:
+        default:
+            return prev_occupancy < 0.0 || prev_occupancy < occupancy_max;
+    }
+}
+
 // 2x2 block-average restriction: fine (Ns x Ns) -> coarse (Ns/2 x Ns/2).
 static Eigen::VectorXd restrict_field(Eigen::Ref<const Eigen::VectorXd> f,
                                       int Ns) {
@@ -529,6 +543,9 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             throw std::invalid_argument(
                 "solve_contact_nested: active_occupancy_max must be > 0");
     }
+    if (!(np.precond_occupancy_max > 0.0))
+        throw std::invalid_argument(
+            "solve_contact_nested: precond_occupancy_max must be > 0");
 
     // ── A09: resolve the precision policy (legacy flag folds into it) ─────
     NestedParams::Precision policy = np.precision;
@@ -648,9 +665,9 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         // discovered mid-solve inside a GIL-released CG loop).
         const int r_lvl = std::min(
             {np.precond_radius, std::max(1, n / 4), np.leaf_side});
-        const bool use_stencil =
-            np.precond &&
-            np.precond_engine == NestedParams::PrecondEngine::stencil;
+        const bool use_stencil = stencil_for_level(
+            np.precond_engine, np.precond, prev_occupancy,
+            np.precond_occupancy_max);
         // Construct only the engine that will actually be used this level.
         // FourierPreconditioner's constructor EAGERLY allocates its
         // half-spectrum symbol table ((Ns/2+1)*Ns floats, ~512 MiB at
