@@ -471,8 +471,14 @@ def worker(workload, Ns, variant, reps, tol, light, coarsest, max_iter):
         kwargs["q"] = q
         kwargs["leaf_side"] = ls
     kwargs["precision"] = v["precision"]
+    # Every solver-facing key a variant may set must be listed here. A key set
+    # in VARIANTS but missing from this list is SILENTLY DROPPED and the run
+    # measures the default instead -- which is what happened to active_delta
+    # in the B04 "evolving C" arm (see doc/bench/2026-09-09-b04-candidate-density.md).
     for k in ("allow_tolerance_relaxation", "active_set", "active_all_levels",
-              "active_halo", "active_max_rounds"):
+              "active_halo", "active_max_rounds", "active_delta",
+              "active_occupancy_max", "precond", "precond_engine",
+              "precond_radius"):
         if k in v:
             kwargs[k] = v[k]
 

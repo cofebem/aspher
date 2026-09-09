@@ -81,25 +81,33 @@ Same shape, smaller amplitude: −17% to −23% peak RSS below 10% occupancy
 (Ns=1024), parity to slightly worse above. Memory is not the reason to choose
 either path.
 
-## Evolving C — attempted, did not reproduce
+## Evolving C — VOID, the arm never ran the intended configuration
 
-The plan asks for "a case with evolving C where preprocessing cannot be
-amortized over many iterations". The construction used —
-`active_delta=0, active_halo=0, active_max_rounds=8`, which forced two
-expansion rounds in the Ns=256 regression test — **did not produce expansion
-at Ns=1024**: every run reports `active_rounds=1, active_fallback=0`, and the
-tight and normal variants are within noise of each other everywhere.
+**Retracted 2026-09-09.** The `h2-f32-active-tight` variant sets
+`active_delta=0.0`, but `active_delta` was not in the harness's allowlist of
+variant keys forwarded to the solver, so it was **silently dropped** and every
+"tight" run used the default `active_delta=0.05`. The ledger rows show it:
+their `solver_args` carry `active_halo=0` and `active_max_rounds=8` and no
+`active_delta` at all. Only the halo was actually tightened.
 
-That is a null result on the intended test, and a small finding in its own
-right: the candidate set taken from the prolonged coarse pressure alone is
-already adequate on both geometries at this resolution, so the δ and halo
-margins are not doing much work here. It does *not* establish that
-amortisation is a non-issue — it establishes that this construction failed to
-create the condition. A genuine evolving-C case needs violations injected
-deliberately rather than induced by starving the candidate set, and remains
-open. The flat 3–9 ms `time_candidate` across the whole sweep is weak evidence
-that it would not matter much even so, since construction never exceeds 0.3%
-of any run.
+So the original conclusion — that "the candidate set taken from the prolonged
+coarse pressure alone is already adequate", inferred from seeing
+`active_rounds=1` everywhere — **is not supported by these runs**. The δ margin
+that would have had to be absent was present throughout. Nothing here says
+anything about a starved candidate set.
+
+The harness bug is fixed (the allowlist now carries `active_delta`,
+`active_occupancy_max` and the preconditioner keys, with a comment saying that
+an unlisted key is silently dropped). The evolving-C measurement itself is
+**still open** and needs re-running. The flat 3–9 ms `time_candidate` across
+the whole sweep remains valid and is weak evidence that candidate construction
+would not dominate even under expansion, since it never exceeds 0.3% of any
+run — but that is an argument, not the measurement.
+
+Nothing else in this document depends on the tight arm: the occupancy sweep,
+the crossover, the masked-matvec attribution and the gate all come from the
+`h2-f32-active` / `h2-f32-active-all` / standard arms, whose keys were all
+forwarded correctly.
 
 ## Outcome: implemented as the default (2026-09-09)
 
