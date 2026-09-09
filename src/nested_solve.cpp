@@ -503,6 +503,9 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         if (!(np.active_delta >= 0.0))
             throw std::invalid_argument(
                 "solve_contact_nested: active_delta must be >= 0");
+        if (!(np.active_occupancy_max > 0.0))
+            throw std::invalid_argument(
+                "solve_contact_nested: active_occupancy_max must be > 0");
     }
 
     // ── A09: resolve the precision policy (legacy flag folds into it) ─────
@@ -565,6 +568,9 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
     // levels, and the coarse solves, are part of the cost of a nested solve
     // and must appear in any full-solve total (plan §8).
     double t_build = 0.0, t_coarse = 0.0, t_candidate_all = 0.0;
+    // contact fraction measured by the level below; -1 before any level has
+    // run, which the gate treats as "no prediction available"
+    double prev_occupancy = -1.0;
     const auto t_nested = std::chrono::steady_clock::now();
     std::vector<ContactResult::Stage> stages;
     auto record_stage = [&stages](const std::string& name, const char* prec,
@@ -642,8 +648,18 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         // the active-set candidate set needs the next-to-finest gap field
         // ((Ns/2)²-sized, ~N/4 — negligible next to the finest solve).
         // The next level's candidate set is built from this level's gap, so
-        // every level that will be restricted must keep its gap field.
-        const bool keep_gap = np.active_set && !finest &&
+        // every level that will be restricted must keep its gap field —
+        // and only those. Keeping it forces the level off the light path and
+        // costs two N-sized arrays it would otherwise never materialise.
+        // Whether the NEXT level gets restricted depends on THIS level's
+        // contact fraction, which is not known yet, so predict it from the
+        // level below: occupancy varies slowly between levels. A wrong
+        // prediction degrades gracefully — the next level simply finds no
+        // coarse gap and solves in full, which is what the gate would have
+        // decided anyway.
+        const bool gate_open_next =
+            prev_occupancy < 0.0 || prev_occupancy < np.active_occupancy_max;
+        const bool keep_gap = np.active_set && !finest && gate_open_next &&
                               (np.active_all_levels || li + 2 == levels.size());
         const bool light = finest ? np.light_result : !keep_gap;
         // only the finest level's trace is meaningful (iterations is also
@@ -678,9 +694,16 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
 
         // A level can be restricted once there is a coarser level beneath it
         // to predict its contact from; the coarsest level always solves in
-        // full.
+        // full. The occupancy gate (B04) then asks whether restriction is
+        // worth it HERE: the level below has just measured the contact
+        // fraction, and above ~40% the masked matvec's per-box guards cost
+        // more than the skipping saves. Applied to the finest level too —
+        // at 99% contact even finest-only restriction measured 3.7x slower
+        // than the plain solve.
+        const bool occupancy_ok =
+            prev_occupancy < np.active_occupancy_max;
         const bool use_active = np.active_set && have_init &&
-                                coarse_gap.size() > 0 &&
+                                coarse_gap.size() > 0 && occupancy_ok &&
                                 (finest || np.active_all_levels);
         if (use_active) {
             // restricted (active-set) solve on the candidate set built from
@@ -764,6 +787,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         }
 
         t_candidate_all += res.time_candidate;
+        prev_occupancy = res.contact_fraction;
         record_stage(std::string(finest ? "finest:" : "coarse:") +
                          std::to_string(n) + (use_active ? "(active)" : ""),
                      level_float ? "float" : "double", np.q,

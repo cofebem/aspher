@@ -422,13 +422,41 @@ int main() {
         // it) must have been restricted
         CHECK(n_coarse >= 2);
         CHECK(n_active_coarse == n_coarse - 1);
-        // and the finest-only default must NOT restrict any coarse level
-        int n_active_default = 0;
-        for (const auto& st : r1.stage_stats)
+        // active_all_levels=false restricts only the finest level
+        hmc::NestedParams np_fin = np_act;
+        np_fin.active_all_levels = false;
+        auto r6 = hmc::solve_contact_nested(Nr, 1.0, 1.0, gap, pbar, tol,
+                                            20000, true, np_fin);
+        CHECK(r6.converged);
+        int n_active_fin = 0;
+        for (const auto& st : r6.stage_stats)
             if (st.name.rfind("coarse:", 0) == 0 &&
                 st.name.find("(active)") != std::string::npos)
-                ++n_active_default;
-        CHECK(n_active_default == 0);
+                ++n_active_fin;
+        CHECK(n_active_fin == 0);
+        CHECK((r6.pressure - r0.pressure).norm() / r0.pressure.norm() <= 1e-6);
+
+        // ── B04 occupancy gate: above the threshold no level is restricted,
+        // because once the mask skips nothing its per-box guards cost more
+        // than the skipping saves (6.4x on the masked matvec at 99% contact).
+        hmc::NestedParams np_gate = np_act;
+        np_gate.active_occupancy_max = 1e-6; // nothing can be below this
+        auto r7 = hmc::solve_contact_nested(Nr, 1.0, 1.0, gap, pbar, tol,
+                                            20000, true, np_gate);
+        CHECK(r7.converged);
+        int n_gated = 0;
+        for (const auto& st : r7.stage_stats)
+            if (st.name.find("(active)") != std::string::npos) ++n_gated;
+        std::printf("occupancy gate: threshold 1e-6 -> %d levels restricted "
+                    "(area %.5f), relL2 %.2e\n",
+                    n_gated, r7.contact_fraction,
+                    (r7.pressure - r0.pressure).norm() / r0.pressure.norm());
+        CHECK(n_gated == 0);            // the gate closed every level
+        CHECK(r7.active_rounds == 0);   // and no restricted solve ran
+        // the answer is unchanged either way — the gate is a cost decision,
+        // never an accuracy one
+        CHECK((r7.pressure - r0.pressure).norm() / r0.pressure.norm() <= 1e-6);
+        CHECK(std::abs(r7.contact_fraction - r0.contact_fraction) <= 1e-6);
     }
 
     // ── T06: a restricted certificate is NOT a global one ───────────────────

@@ -59,11 +59,24 @@ struct NestedParams {
     bool active_set = false;
     // Restrict EVERY level that has a coarser level beneath it, not only the
     // finest. Measured at Ns=16384 (doc/bench/2026-09-09-ns16384-rebaseline.md):
-    // with the finest-only default the 8192 level alone is 42% of the whole
-    // solve, because it runs a standard full-grid solve and pays the matvec
-    // cost the finest level no longer pays. Opt-in until the paired A/B
-    // clears the promotion gate.
-    bool active_all_levels = false;
+    // with the finest-only behaviour the 8192 level alone was 42% of the whole
+    // solve, because it ran a standard full-grid solve and paid the matvec
+    // cost the finest level no longer pays. Removing that is worth -43…-48%
+    // of total wall time. Default on, gated by the occupancy rule below; set
+    // false to restrict only the finest level (the pre-2026-09-09 behaviour).
+    bool active_all_levels = true;
+    // Occupancy gate (B04, doc/bench/2026-09-09-b04-candidate-density.md).
+    // Restriction wins below ~40% contact and loses above it — at 99% contact
+    // the masked matvec costs 6.4x the unmasked one, because once the mask
+    // skips nothing its per-box guards and compressed indirection are pure
+    // overhead. Occupancy is not known before solving, but the cascade
+    // measures it: each level's contact fraction predicts the next one's. A
+    // level is therefore restricted only when the level BELOW it reported a
+    // fraction under this threshold; the coarsest level always solves in full.
+    // 0.4 is deliberately conservative — 48% still wins at Ns=2048 — because
+    // the cost of being wrong is asymmetric: forgoing a 15% gain is cheaper
+    // than taking a 6x loss. Set >= 1.0 to disable the gate.
+    double active_occupancy_max = 0.4;
     double active_delta = 0.05; // gap threshold, fraction of the level gap scale
     int active_halo = 2;        // dilation radius for candidate/violation sets
     int active_max_rounds = 5;  // verification rounds before full-solve fallback

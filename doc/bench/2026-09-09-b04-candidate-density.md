@@ -101,6 +101,26 @@ open. The flat 3–9 ms `time_candidate` across the whole sweep is weak evidence
 that it would not matter much even so, since construction never exceeds 0.3%
 of any run.
 
+## Outcome: implemented as the default (2026-09-09)
+
+The rule below is now in `solve_contact_nested` as `active_occupancy_max=0.4`,
+with `active_all_levels` defaulting to true. Measured at Ns=1024 on the
+self-affine surface with the gate active, median of 3:
+
+| occupancy | levels restricted | standard | gated | ratio |
+|---|---|---|---|---|
+| 0.11% | 4/5 | 0.502 s | 0.222 s | **2.26×** |
+| 11.0% | 4/5 | 4.333 s | 3.211 s | **1.35×** |
+| 47.0% | **0/5** | 18.68 s | 18.57 s | 1.01× |
+| 99.0% | **0/5** | 2.589 s | 2.600 s | 1.00× |
+
+All of the upside below the threshold, and exact parity above it. One
+refinement was needed to reach parity: a level whose successor the gate will
+close no longer keeps its gap field, since keeping it forces the level off the
+light path and materialises two N-sized arrays nothing will read. That alone
+was a 19% penalty at 47% occupancy — the gate closed correctly but the
+bookkeeping it implies had not been closed with it.
+
 ## Recommendation: a *measured* conditional default
 
 The restriction should be on by default where it wins and off where it loses,

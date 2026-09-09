@@ -340,7 +340,7 @@ PyResult py_solve_nested(
     double float_floor, bool allow_tolerance_relaxation, bool light_result,
     const std::string& backend, bool record_error_history, bool active_set,
     double active_delta, int active_halo, int active_max_rounds,
-    bool active_all_levels) {
+    bool active_all_levels, double active_occupancy_max) {
     const py::ssize_t expected =
         static_cast<py::ssize_t>(grid_size) * grid_size;
     if (gap.size() != expected)
@@ -377,6 +377,7 @@ PyResult py_solve_nested(
     np.active_halo = active_halo;
     np.active_max_rounds = active_max_rounds;
     np.active_all_levels = active_all_levels;
+    np.active_occupancy_max = active_occupancy_max;
     PyResult out;
     out.Ns = grid_size;
     {
@@ -794,7 +795,8 @@ PYBIND11_MODULE(aspher, m) {
           py::arg("backend") = "h2", py::arg("record_error_history") = false,
           py::arg("active_set") = false, py::arg("active_delta") = 0.05,
           py::arg("active_halo") = 2, py::arg("active_max_rounds") = 5,
-          py::arg("active_all_levels") = false,
+          py::arg("active_all_levels") = true,
+          py::arg("active_occupancy_max") = 0.4,
           "Single-entry nested-grid (cascadic/FMG) contact solve: builds the "
           "coarse->fine hierarchy and H2 operators internally and warm-starts "
           "each level with the prolonged coarse pressure. grid_size must equal "
