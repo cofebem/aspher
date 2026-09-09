@@ -737,6 +737,7 @@ PYBIND11_MODULE(aspher, m) {
                 d["build"] = s.r.time_build;
                 d["coarse"] = s.r.time_coarse;
                 d["verification"] = s.r.time_verification;
+                d["candidate"] = s.r.time_candidate;
                 d["output"] = s.r.time_output;
                 return d;
             },

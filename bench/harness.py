@@ -105,12 +105,40 @@ VARIANTS = {
                               active_all_levels=True),
     "h2-f64-active-all": dict(backend="h2", precision="double",
                               active_set=True, active_all_levels=True),
+    # B04 "evolving C": a deliberately tight candidate set forces expansion
+    # rounds, so the mask build and compressed gather cannot amortise over
+    # many iterations.
+    "h2-f32-active-tight": dict(backend="h2", precision="float",
+                                allow_tolerance_relaxation=True,
+                                active_set=True, active_all_levels=True,
+                                active_delta=0.0, active_halo=0,
+                                active_max_rounds=8),
     "h2-polish":         dict(backend="h2", precision="float_then_double"),
     "fft-f64":           dict(backend="fft", precision="double"),
     "fft-f32":           dict(backend="fft", precision="float",
                               allow_tolerance_relaxation=True),
     "fft-polish":        dict(backend="fft", precision="float_then_double"),
 }
+
+
+def resolve_workload(spec):
+    """`name` or `name@p_bar`.
+
+    B04 sweeps occupancy, and occupancy is reached through the LOAD. Spelling
+    the load into the workload name keeps it part of the ledger key, so runs at
+    different loads never collide, and keeps the WORKLOADS table free of a row
+    per rung of the ladder. The achieved contact fraction is what the report
+    plots — the load is only the dial, and the mapping from one to the other is
+    surface-dependent.
+    """
+    if "@" in spec:
+        base, pb = spec.split("@", 1)
+        if base not in WORKLOADS:
+            raise KeyError(base)
+        w = dict(WORKLOADS[base])
+        w["p_bar"] = float(pb)
+        return base, w
+    return spec, WORKLOADS[spec]
 
 
 def h2_shape(Ns):
@@ -205,7 +233,7 @@ def build_gap(workload, Ns):
     """Deterministic gap field plus a hash of the exact bytes measured."""
     import numpy as np
     sys.path.insert(0, os.path.join(ROOT, "python"))
-    w = WORKLOADS[workload]
+    _, w = resolve_workload(workload)
 
     if w["kind"] == "selfaffine":
         import rfgen as rf
@@ -368,7 +396,8 @@ def worker(workload, Ns, variant, reps, tol, light, coarsest, max_iter):
     t_gen = time.perf_counter() - t_gen
     rss_after_surface = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 
-    kwargs = dict(grid_size=Ns, gap=gap, p_nominal=WORKLOADS[workload]["p_bar"],
+    _, wl = resolve_workload(workload)
+    kwargs = dict(grid_size=Ns, gap=gap, p_nominal=wl["p_bar"],
                   coarsest=coarsest, precond=True, tol=tol, coarse_tol=1e-4,
                   max_iter=max_iter, light_result=light)
     kwargs["backend"] = v["backend"]
@@ -390,7 +419,10 @@ def worker(workload, Ns, variant, reps, tol, light, coarsest, max_iter):
     rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     rec = {
         "workload": workload, "Ns": Ns, "N": Ns * Ns, "variant": variant,
-        "surface_sha": digest, "workload_params": WORKLOADS[workload],
+        "surface_sha": digest, "workload_params": wl,
+        # the dial and what it actually achieved — B04 plots the latter
+        "p_bar": wl["p_bar"],
+        "occupancy": float(res.contact_area),
         "solver_args": {k: val for k, val in kwargs.items() if k != "gap"},
         # timing: the first rep is cold, the rest warm (plan §8)
         "wall_cold_s": times[0],
@@ -481,74 +513,80 @@ def run(args):
     for v in variants:
         if v not in VARIANTS:
             sys.exit(f"unknown variant {v}; known: {', '.join(VARIANTS)}")
-    for Ns in args.ns:
-        reps = 1 if Ns > args.manual_above else args.reps
-        for rep, variant in paired_order(variants, reps):
-            key = (args.workload, Ns, variant, rep)
-            if key in done:
-                print(f"skip  {args.workload} Ns={Ns:6d} {variant:16s} "
-                      f"rep={rep} (recorded)", flush=True)
-                continue
-            # Preflight PER VARIANT, and immediately before the case runs.
-            # Doing it once per Ns against the first variant lets a heavier
-            # arm through on a lighter arm's budget, and doing it up front
-            # uses a memory reading that the earlier cases have since
-            # invalidated. A refusal is recorded as a result, not skipped
-            # silently: "this configuration does not fit here" is a finding.
-            if Ns > args.manual_above:
-                est = preflight(Ns, variant, headroom=args.headroom,
-                                light=not args.full_result, verbose=False)
-                if not est["fits"] and not args.force_memory:
-                    need = est["peak_bytes"] * args.headroom
-                    print(f"SKIP  {args.workload} Ns={Ns:6d} {variant:16s}: "
-                          f"needs {need / 2**30:.1f} GiB, "
-                          f"{est['available_bytes'] / 2**30:.1f} GiB available",
-                          flush=True)
-                    with open(ledger, "a") as f:
-                        f.write(json.dumps({
-                            "workload": args.workload, "Ns": Ns,
-                            "variant": variant, "rep": rep,
-                            "run_status": "skipped_preflight",
-                            "preflight": est, "provenance": prov,
-                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                        }) + "\n")
+    for wl_spec in args.workload:
+        try:
+            resolve_workload(wl_spec)
+        except KeyError as e:
+            sys.exit(f"unknown workload {e}; known: {', '.join(WORKLOADS)}")
+    for wl_spec in args.workload:
+        for Ns in args.ns:
+            reps = 1 if Ns > args.manual_above else args.reps
+            for rep, variant in paired_order(variants, reps):
+                key = (wl_spec, Ns, variant, rep)
+                if key in done:
+                    print(f"skip  {wl_spec} Ns={Ns:6d} {variant:16s} "
+                          f"rep={rep} (recorded)", flush=True)
                     continue
-            print(f"run   {args.workload} Ns={Ns:6d} {variant:16s} rep={rep}",
-                  flush=True)
-            cmd = [sys.executable, os.path.abspath(__file__), "worker",
-                   "--workload", args.workload, "--ns", str(Ns),
-                   "--variant", variant, "--reps", str(args.inner_reps),
-                   "--tol", repr(args.tol), "--coarsest", str(args.coarsest),
-                   "--max-iter", str(args.max_iter)]
-            if not args.full_result:
-                cmd.append("--light")
-            t0 = time.time()
-            try:
-                r = subprocess.run(cmd, capture_output=True, text=True,
-                                   timeout=args.timeout)
-                line = next((l for l in r.stdout.splitlines()
-                             if l.startswith("JSON ")), None)
-                if line and r.returncode == 0:
-                    rec = json.loads(line[5:])
-                else:
-                    rec = {"workload": args.workload, "Ns": Ns,
-                           "variant": variant,
-                           "run_status": classify(r.returncode, r.stderr),
-                           "stderr_tail": r.stderr[-2000:]}
-            except subprocess.TimeoutExpired as e:
-                tail = (e.stderr or b"").decode(errors="replace")
-                rec = {"workload": args.workload, "Ns": Ns, "variant": variant,
-                       "run_status": "timeout", "stderr_tail": tail[-2000:]}
-            rec["rep"] = rep
-            rec["provenance"] = prov
-            rec["elapsed_s"] = time.time() - t0
-            with open(ledger, "a") as f:
-                f.write(json.dumps(rec) + "\n")
-            print(f"      -> {rec.get('run_status')} "
-                  f"{rec.get('status', '')} "
-                  f"{rec.get('wall_cold_s', float('nan')):.2f}s "
-                  f"{rec.get('peak_rss_gib', float('nan')):.2f} GiB",
-                  flush=True)
+                # Preflight PER VARIANT, and immediately before the case runs.
+                # Doing it once per Ns against the first variant lets a heavier
+                # arm through on a lighter arm's budget, and doing it up front
+                # uses a memory reading that the earlier cases have since
+                # invalidated. A refusal is recorded as a result, not skipped
+                # silently: "this configuration does not fit here" is a finding.
+                if Ns > args.manual_above:
+                    est = preflight(Ns, variant, headroom=args.headroom,
+                                    light=not args.full_result, verbose=False)
+                    if not est["fits"] and not args.force_memory:
+                        need = est["peak_bytes"] * args.headroom
+                        print(f"SKIP  {wl_spec} Ns={Ns:6d} {variant:16s}: "
+                              f"needs {need / 2**30:.1f} GiB, "
+                              f"{est['available_bytes'] / 2**30:.1f} GiB available",
+                              flush=True)
+                        with open(ledger, "a") as f:
+                            f.write(json.dumps({
+                                "workload": wl_spec, "Ns": Ns,
+                                "variant": variant, "rep": rep,
+                                "run_status": "skipped_preflight",
+                                "preflight": est, "provenance": prov,
+                                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            }) + "\n")
+                        continue
+                print(f"run   {wl_spec} Ns={Ns:6d} {variant:16s} rep={rep}",
+                      flush=True)
+                cmd = [sys.executable, os.path.abspath(__file__), "worker",
+                       "--workload", wl_spec, "--ns", str(Ns),
+                       "--variant", variant, "--reps", str(args.inner_reps),
+                       "--tol", repr(args.tol), "--coarsest", str(args.coarsest),
+                       "--max-iter", str(args.max_iter)]
+                if not args.full_result:
+                    cmd.append("--light")
+                t0 = time.time()
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True,
+                                       timeout=args.timeout)
+                    line = next((l for l in r.stdout.splitlines()
+                                 if l.startswith("JSON ")), None)
+                    if line and r.returncode == 0:
+                        rec = json.loads(line[5:])
+                    else:
+                        rec = {"workload": wl_spec, "Ns": Ns,
+                               "variant": variant,
+                               "run_status": classify(r.returncode, r.stderr),
+                               "stderr_tail": r.stderr[-2000:]}
+                except subprocess.TimeoutExpired as e:
+                    tail = (e.stderr or b"").decode(errors="replace")
+                    rec = {"workload": wl_spec, "Ns": Ns, "variant": variant,
+                           "run_status": "timeout", "stderr_tail": tail[-2000:]}
+                rec["rep"] = rep
+                rec["provenance"] = prov
+                rec["elapsed_s"] = time.time() - t0
+                with open(ledger, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+                print(f"      -> {rec.get('run_status')} "
+                      f"{rec.get('status', '')} "
+                      f"{rec.get('wall_cold_s', float('nan')):.2f}s "
+                      f"{rec.get('peak_rss_gib', float('nan')):.2f} GiB",
+                      flush=True)
 
 
 def main():
@@ -565,7 +603,9 @@ def main():
     pf.add_argument("--full-result", action="store_true")
 
     rn = sub.add_parser("run")
-    rn.add_argument("--workload", default="rough-H0.8")
+    rn.add_argument("--workload", nargs="+", default=["rough-H0.8"],
+                    help="workload name, or name@p_bar to override the load "
+                         "(the B04 occupancy dial); repeatable")
     rn.add_argument("--ns", type=int, nargs="+", default=[1024])
     rn.add_argument("--variants", default="h2-f64,h2-f64-active")
     rn.add_argument("--reps", type=int, default=5)

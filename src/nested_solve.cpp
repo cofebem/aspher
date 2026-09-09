@@ -121,6 +121,8 @@ static ContactResult active_level(const H2Operator& h2,
     const double vthresh = -lvl_tol * g_scale;
 
     // candidate set C = dilate(prolonged coarse contact) ∪ {coarse gap < δ}
+    double t_candidate = 0.0;
+    auto t_cand0 = std::chrono::steady_clock::now();
     std::vector<std::uint8_t> cmask(N, 0);
 #pragma omp parallel for schedule(static)
     for (int i = 0; i < N; ++i) cmask[i] = (p_init_d(i) > 0.0) ? 1 : 0;
@@ -157,6 +159,8 @@ static ContactResult active_level(const H2Operator& h2,
             if (cmask[gi[k]]) cidx.push_back(static_cast<int>(k));
     };
     gather_level();
+    t_candidate += std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - t_cand0).count();
 
     // compressed warm start; the driver's full double array is consumed here
     Vec p0(S);
@@ -303,6 +307,7 @@ static ContactResult active_level(const H2Operator& h2,
         // extend C with the dilated violations, rebuild the compressed
         // layout (old slots are a subset of the new ones), remap the warm
         // start slot-block-wise, and resume
+        t_cand0 = std::chrono::steady_clock::now();
         dilate_mask(viol, Ns, np.active_halo);
 #pragma omp parallel for schedule(static)
         for (int i = 0; i < N; ++i)
@@ -323,6 +328,8 @@ static ContactResult active_level(const H2Operator& h2,
                 psrc->segment(static_cast<std::ptrdiff_t>(s) * ls2, ls2);
         }
         p0 = std::move(pnew);
+        t_candidate += std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - t_cand0).count();
     }
 
     if (!certified) {
@@ -420,6 +427,7 @@ static ContactResult active_level(const H2Operator& h2,
     }
     res.time_verification = t_verify;
     res.time_output = t_output;
+    res.time_candidate = t_candidate;
     res.active_rounds = rounds;
     res.iterations = it_total;
     res.verification_matvec_count = verify_mv;
@@ -556,7 +564,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
     // A07 phase timing: operator/preconditioner construction across all
     // levels, and the coarse solves, are part of the cost of a nested solve
     // and must appear in any full-solve total (plan §8).
-    double t_build = 0.0, t_coarse = 0.0;
+    double t_build = 0.0, t_coarse = 0.0, t_candidate_all = 0.0;
     const auto t_nested = std::chrono::steady_clock::now();
     std::vector<ContactResult::Stage> stages;
     auto record_stage = [&stages](const std::string& name, const char* prec,
@@ -755,6 +763,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             if (!finest) gap[li].resize(0);
         }
 
+        t_candidate_all += res.time_candidate;
         record_stage(std::string(finest ? "finest:" : "coarse:") +
                          std::to_string(n) + (use_active ? "(active)" : ""),
                      level_float ? "float" : "double", np.q,
@@ -813,6 +822,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
     res.stage_stats = std::move(stages);
     res.time_build = t_build;
     res.time_coarse = t_coarse;
+    res.time_candidate = t_candidate_all;
     res.time_total = std::chrono::duration<double>(
                          std::chrono::steady_clock::now() - t_nested).count();
     return res;

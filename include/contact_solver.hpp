@@ -85,6 +85,12 @@ struct ContactResult {
     double time_build = 0.0;        // operator construction (nested driver)
     double time_coarse = 0.0;       // coarse-level solves (nested driver)
     double time_verification = 0.0; // streamed global checks (active set)
+    // Candidate-set construction: mask build, slot mapping and the compressed
+    // gather, summed over every round. Separated from the solve because it is
+    // the part that does NOT amortise when the candidate set keeps changing,
+    // and the part that turns the restriction into pure overhead as occupancy
+    // rises (B04).
+    double time_candidate = 0.0;
     double time_output = 0.0;       // materialising the full-grid fields
 
     // One entry per solve stage (coarse level, finest, polish). Spec §3.2
