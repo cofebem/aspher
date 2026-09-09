@@ -52,6 +52,7 @@ import argparse
 import ctypes
 import gc
 import hashlib
+import inspect
 import json
 import os
 import platform
@@ -84,6 +85,14 @@ WORKLOADS = {
     "rough-H0.8-dense": dict(kind="selfaffine", Hurst=0.8, rms=0.02,
                              k_low_cells=12.0, k_high=0.33, seed=42,
                              p_bar=0.02),
+    # same spectral parameters, generated in float32 (rfgen >= 0.2.3): a
+    # DIFFERENT realisation, not the same surface cheaper -- float32
+    # standard_normal consumes the stream differently -- so it is its own
+    # workload.  It exists because float64 generation needs 36.5 GiB at
+    # Ns=32768 and this needs 14.2.
+    "rough-H0.8-f32": dict(kind="selfaffine", Hurst=0.8, rms=0.02,
+                           k_low_cells=12.0, k_high=0.33, seed=42,
+                           p_bar=0.002, surface_dtype="float32"),
     "hertz": dict(kind="hertz", radius=2.0, p_bar=0.003),
     "flat-patch": dict(kind="flat_patch", frac=0.35, depth=0.01, p_bar=0.01),
 }
@@ -238,10 +247,21 @@ def build_gap(workload, Ns):
     if w["kind"] == "selfaffine":
         import rfgen as rf
         rng = np.random.default_rng(w["seed"])
+        kw = {}
+        if w.get("surface_dtype", "float64") == "float32":
+            # rfgen >= 0.2.3 only; scipy.fft keeps the transforms in float32
+            # (numpy.fft would silently promote to complex128 and cost more
+            # than the float64 path).
+            if "dtype" not in inspect.signature(rf.selfaffine_field).parameters:
+                raise RuntimeError(
+                    f"workload asks for a float32 surface but the installed "
+                    f"rfgen ({getattr(rf, '__version__', '?')}) has no dtype "
+                    f"parameter; rfgen >= 0.2.3 is required")
+            kw["dtype"] = np.float32
         h = rf.selfaffine_field(dim=2, N=Ns, Hurst=w["Hurst"],
                                 k_low=w["k_low_cells"] / Ns, k_high=w["k_high"],
                                 plateau=False, noise=True, rng=rng,
-                                verbose=False)
+                                verbose=False, **kw)
         h *= w["rms"] / np.std(h)
         gap = (-h).astype(np.float64).ravel()
         del h
@@ -276,12 +296,17 @@ def build_gap(workload, Ns):
 # single item in the budget, and at Ns=16384 it IS the measured peak RSS of a
 # float active-set run (9.115 GiB to generate; 9.116 GiB for the whole case).
 #
-#   generator      Ns=8192   Ns=16384   asymptotic B/DOF
-#   rfgen 0.2.2      37.3      36.5           36.5
+#   generator                  Ns=8192   Ns=16384   asymptotic B/DOF
+#   rfgen 0.2.2/0.2.3 float64     37.3      36.5           36.5
+#   rfgen 0.2.3 float32           14.9      14.2           14.2
 #
+# The float32 path (rfgen >= 0.2.3) routes through scipy.fft, which honours
+# single precision where numpy.fft promotes to complex128.  0.2.3's float64
+# path is bit-identical to 0.2.2, so existing ledger rows stay comparable.
 # Analytic workloads build one Ns x Ns temporary beside the gap.
 SURFACE_BYTES_PER_DOF = {
     "selfaffine": 36.5,
+    "selfaffine-f32": 14.2,
     "hertz": 16.0,
     "flat_patch": 24.0,
 }
@@ -292,9 +317,13 @@ def _surface_kind(workload):
     if workload is None:
         return "selfaffine"
     try:
-        return resolve_workload(workload)[1]["kind"]
+        w = resolve_workload(workload)[1]
     except Exception:
         return "selfaffine"
+    kind = w["kind"]
+    if kind == "selfaffine" and w.get("surface_dtype", "float64") == "float32":
+        return "selfaffine-f32"
+    return kind
 
 
 # ── preflight ───────────────────────────────────────────────────────────────
