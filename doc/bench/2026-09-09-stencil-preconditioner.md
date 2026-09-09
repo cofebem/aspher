@@ -325,19 +325,32 @@ Ns=1024  n=5  stencil: 24.28s   auto: 18.45s   change +34.73%
   REGRESSION beyond 5%: -34.7% (stencil, forced everywhere, vs auto)
 ```
 
-**At the required gate point (`@2.0`, ≈57% contact):** `automatic` is not
-merely "at parity" with `fft` — it is measurably *faster* by 16.57%
-(CI[−22.86,−3.53]%, excludes zero), because it still uses the stencil at the
-coarsest level (`prev_occupancy < 0`) while every other level's own measured
-occupancy (92%, 82%, 72%, 63% at n=128/256/512/1024 respectively, confirmed
-with an ad-hoc per-level trace) is above 0.4 and routes to `fft`, matching
-forced-`fft` at every level that matters. A single non-paired debug
-measurement (one `auto` run vs one `fft` run, both 14.9-15.1s) showed the two
-essentially indistinguishable at the per-run level — the coarsest-level
-stencil-vs-fft difference is 0.03s out of a ~15s solve, i.e. negligible on
-its own — so the 16.57% paired-A/B gap is plausibly dominated by desktop
-co-tenancy noise rather than a large mechanistic effect; either way it is
-comfortably on the *favourable* side of the ±5% band, not a violation of it.
+**At the required gate point (`@2.0`, ≈57% contact): parity, not a win.**
+The raw paired-A/B number (−16.57%, CI[−22.86,−3.53]%) does not survive
+scrutiny as a genuine speed advantage, and is not being claimed as one.
+Routing is confirmed correct by a per-level trace of median iteration counts
+(five levels, coarsest→finest, Ns=64…1024): `automatic` 36/51/103/192/516,
+`fft` 26/51/103/192/519, `stencil` 36/67/122/209/625. `automatic` matches
+`stencil` only at the coarsest level (`prev_occupancy < 0`, unmeasured) and
+matches `fft` at every level above it, where the measured occupancy
+(92%/82%/72%/63%) sits above the 0.4 threshold — exactly the designed
+behaviour.
+
+But the wall-time gap between `automatic` and `fft` is dominated by run-to-run
+noise, not by this routing difference: at *identical* iteration counts across
+reps, matvec wall time alone spans 13.82–15.64 s for the `fft` reps and
+10.67–13.42 s for the `auto` reps — a noise band wider than the reported
+16.57% gap. What is real, and deterministic, is a small cascade effect: the
+finest level takes 516 iterations under `automatic` versus 519 under `fft`
+(reproduced across all five reps of each arm) — the coarsest level's stencil
+solve produces a marginally better prolonged warm start for the level above
+it. That is ~0.6% fewer finest-level iterations; it cannot account for a ~3 s
+wall-time difference on its own.
+
+**Conclusion: `automatic` is at parity with `fft` at the gate point, plus a
+genuine but tiny (~0.6% iteration) cascade benefit from using the stencil at
+the coarsest, unmeasured level.** The −16.57% headline number should not be
+read as "automatic is faster here" — it is noise-dominated.
 
 **At the dilute point (`@0.002`):** `automatic` is statistically
 indistinguishable from the forced `stencil` arm (−0.31%, CI includes zero)
@@ -345,7 +358,9 @@ and both are faster than forced `fft`, so `automatic` **retains the
 stencil's win** as required — it did not regress toward `fft`'s slower
 behaviour at low occupancy.
 
-**Promotion-rule verdict: satisfied.** The occupancy gate removes the sole
-confirmed regression (`@2.0`, previously +16.9% slower under an unconditional
-stencil default) without giving up any of the low-occupancy win. `automatic`
-is now the default `precond_engine`.
+**Promotion-rule verdict: satisfied, on the corrected reading.** The
+promotion rule only requires that the gate point not regress beyond 5%; parity
+(not the overstated 16.57% "win") clears that bar just as well, and the
+occupancy gate removes the sole confirmed regression (`@2.0`, previously
++16.9% slower under an unconditional stencil default) without giving up any
+of the low-occupancy win. `automatic` is now the default `precond_engine`.

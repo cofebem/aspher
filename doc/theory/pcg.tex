@@ -802,6 +802,147 @@ error remains bounded by the float noise floor
 tolerance clamp, with a 200-iteration stagnation guard retained as a safety
 net.
 
+\subsection{Real-space stencil application: exact restriction to the contact set}
+\label{sec:impl-stencil}
+
+Section~\ref{sec:impl-capped} showed that na\"ively \emph{capping} the symbol
+at low $|\mathbf k|$ fails, because $1/|\mathbf q|$ conditioning is spread
+across the whole resolved band, not concentrated at low frequency. That
+result concerns the \emph{spectral} domain. A different, and successful,
+economy is available in the \emph{spatial} domain: the symbol
+$\widehat{M^{-1}}(\mathbf k) = |\mathbf k|$ is a positive-order (degree-1,
+homogeneous) function of $\mathbf k$, and a positive-order symbol on
+$\mathbb R^2$ corresponds, by the theory of pseudodifferential operators, to a
+kernel with algebraic (not exponential) but strictly \emph{decaying}
+real-space support: for $|\mathbf k|$ specifically the inverse Fourier
+transform decays like $1/r^3$ in two dimensions away from the origin, so most
+of its action is local even though none of it is exactly zero at finite $r$.
+This is the opposite regime from the low-pass cap: instead of discarding
+which \emph{wavenumbers} contribute, we discard which \emph{neighbours}
+contribute, and the two are not interchangeable — the capped-symbol result
+does not predict, and is not contradicted by, what follows.
+
+\paragraph{Truncated kernel and retained mass.}
+Let $w(\mathbf r)$ be the real-space kernel of $\widehat{M^{-1}} = |\mathbf
+k|$ on the periodic $N_s\times N_s$ grid, obtained by inverse DFT of the
+symbol. Because $w$ decays but does not vanish, an exact real-space
+application would touch every grid point; the stencil preconditioner instead
+truncates $w$ to a fixed footprint of radius $R$ (grid units),
+\begin{equation}
+  w_R(\mathbf r) = \begin{cases} w(\mathbf r) & \|\mathbf r\|_\infty \le R \\
+                                   0 & \text{otherwise,} \end{cases}
+  \label{eq:stencil-trunc}
+\end{equation}
+and renormalises so that $\widehat w_R(\bzero) = \widehat w(\bzero)$ is
+preserved on the modes that matter to CG (the DC mode is masked out of the
+preconditioner application in any case, per~\eqref{eq:precond-apply}, so this
+is a convenience rather than a necessity). $R=2$ gives a 13-tap footprint
+(the $5\times 5$ square with its four corners removed, since $\|\mathbf
+r\|_\infty \le 2$ under the taxicab corner cut used in the implementation).
+Retained mass $\sum_{\|\mathbf r\|_\infty \le R} |w(\mathbf r)| \big/
+\sum_{\mathbf r} |w(\mathbf r)|$ is $74.6\%$ at $R=1$ and $83.9\%$ at $R=2$ —
+a majority of the kernel's weight sits within two grid cells of the origin,
+consistent with the $1/r^3$ decay estimate above.
+
+\paragraph{Restriction to the contact set is exact, not approximate.}
+The preconditioner is only ever applied to the masked residual $\Pi_\calC
+\tilde{\mathbf g}$, which is identically zero off the contact set $\calC$ by
+construction. Consider evaluating $(\bM^{-1}\Pi_\calC\tilde{\mathbf g})_i$ for
+a target index $i$, whether $i \in \calC$ or not, using the \emph{full-grid}
+circular convolution with $w_R$:
+\begin{equation}
+  \bigl(w_R * \Pi_\calC \tilde{\mathbf g}\bigr)_i
+  \;=\; \sum_{\mathbf r:\,\|\mathbf r\|_\infty \le R} w_R(\mathbf r)\,
+        \bigl(\Pi_\calC\tilde{\mathbf g}\bigr)_{i - \mathbf r}
+  \;=\; \sum_{\substack{\mathbf r:\,\|\mathbf r\|_\infty \le R \\ i-\mathbf r
+        \,\in\, \calC}} w_R(\mathbf r)\, \tilde g_{i-\mathbf r},
+  \label{eq:stencil-exact}
+\end{equation}
+where the second equality drops exactly the terms where $i - \mathbf r
+\notin \calC$, since those factors of $\Pi_\calC \tilde{\mathbf g}$ are
+identically zero — not approximately small, zero. The right-hand side of
+\eqref{eq:stencil-exact} is precisely the compressed sum the implementation
+computes: for each occupied slot $i$ (in practice, each $i \in \calC$, since
+the preconditioner is only needed there) it walks the $\le 13$ neighbours
+within the stencil footprint and adds the tap weight for each neighbour that
+is itself in $\calC$, skipping the rest. There is no approximation in this
+step: the full-grid convolution sampled on $\calC$ and the local neighbour
+sum over $\calC$ are the \emph{same finite sum}, term for term, reordered.
+The only approximation in the whole construction is the truncation
+$w \to w_R$ itself \eqref{eq:stencil-trunc} — a statement about the operator
+$\bM^{-1}$, independent of and prior to any question about which grid points
+are occupied. This is why the same 13 taps and the same compressed
+data structure serve both the full-grid ($R$-truncated) preconditioner and
+the active-set-restricted one: restricting a convolution's \emph{evaluation}
+to a support where its \emph{input} is already zero elsewhere changes nothing
+about the output, at any radius.
+
+\paragraph{Positivity of the truncated symbol.}
+CG convergence theory requires the preconditioner to remain SPD; a truncated,
+non-negative-definite $\bM^{-1}_R$ would be unsound regardless of any speed
+argument. The truncated symbol $\widehat w_R(\mathbf k)$ — the DFT of the
+13-tap stencil — was checked numerically to be strictly positive off the DC
+mode for $R \in \{1, 2, 4\}$ on the grids tested (the DC mode is masked
+out of the CG inner product in any case). Truncation does flatten the
+symbol substantially relative to the untruncated $|\mathbf k|$: at $R=2$ the
+ratio $\min\widehat w_R/\max\widehat w_R$ is $0.137$, against
+$6.9\times10^{-4}$ for the untruncated symbol — the stencil is a much milder,
+better-conditioned reweighting of the residual than the exact operator it
+approximates.
+
+\paragraph{Measured iteration counts.}
+Table~\ref{tab:stencil} reports median PCG iteration counts on the h2
+active-set path, rough self-affine ($H=0.8$) surfaces, at low occupancy
+($\sim 0.1\%$ contact). The result is stronger than the design intended:
+the truncated stencil is not merely a cheaper application of the same
+$|\mathbf k|$ operator, it \emph{converges the iteration faster} than the
+exact full-grid FFT application of the same symbol, and the gap widens with
+$N_s$. The most telling comparison is $N_s=1024$: the full-grid FFT
+preconditioner (22 it) barely improves on no preconditioner at all (23 it),
+while the truncated stencil (13 it) does markedly better — consistent with
+the flatter truncated symbol reported above, and suggesting that the
+long-range spectral content the exact $|\mathbf k|$ operator computes so
+expensively is largely irrelevant once contact is dilute. This is reported as
+a measured finding on one surface family (self-affine rough-$H0.8$, seeded),
+not yet as a proven general property of the operator.
+
+\begin{table}[ht]
+\centering
+\caption{PCG iteration counts, exact full-grid FFT $|\mathbf k|$
+         preconditioner vs.\ the truncated 13-tap stencil ($R=2$), h2
+         active-set nested solve, rough $H{=}0.8$ surfaces, low occupancy.}
+\label{tab:stencil}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Case & FFT (full $|\mathbf k|$) & Stencil ($R{=}2$) & None \\
+\midrule
+$N_s{=}1024$, float32 & 22 & \textbf{13} & 23 \\
+$N_s{=}4096$, float32 & 62 & \textbf{25} & 69 \\
+$N_s{=}16384$, float32 & 208 & \textbf{61} & --- \\
+$N_s{=}4096$, float64 & 79 & \textbf{33} & --- \\
+$N_s{=}16384$, float64 & 272 & \textbf{94} & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{A regime where truncation costs iterations, and the resulting gate.}
+The exactness argument above concerns the arithmetic of restricting a fixed
+truncated kernel to $\calC$; it says nothing about whether the truncation
+$w \to w_R$ itself is a good approximation of $\bM^{-1}$ at a given occupancy.
+At high contact fraction ($\sim 57\%$ on the surfaces tested), where the
+active-set restriction of Section~\ref{sec:active} disables itself and the
+level runs the plain full-grid P-K iteration, the stencil measurably
+\emph{costs} iterations relative to the exact FFT application (625 vs.\ 519,
+a confirmed regression, not noise) — the low-$|\mathbf k|$ error the
+truncation introduces matters once the iteration is no longer confined to a
+sparse, localised contact patch. Production selects the engine
+(\texttt{precond\_engine = "auto"} by default) per level from the
+occupancy the level below has already measured, using the stencil below a
+threshold (default $0.4$) and the exact FFT application at or above it — the
+same self-measuring signal the active-set restriction of
+Section~\ref{sec:active} already computes, exposed as a separate knob so that
+disabling one gate does not silently disable the other.
+
 % ---------------------------------------------------------
 \section{Active-Set Acceleration: Restricted Iteration on Candidate Sets}
 \label{sec:active}

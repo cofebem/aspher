@@ -277,7 +277,51 @@ nothing but the approach (14 it, rel 3.0e-6 at every offset).
 Projected CG for the QP `min ½p'Sp + p'g₀  s.t. p≥0, mean(p)=p_bar`.
 Default β formula: **Polak-Ribière+** (`use_pr=true`); Fletcher-Reeves available via `use_pr=false`.
 **Convergence acceleration** (2026-06): the iteration count grows ~√Ns from the operator's `1/|q|` spectral conditioning (κ(S)∼Ns), plus active-set cost.
-- **Spectral preconditioner** (`precond="fourier"`, `fourier_precond.hpp`): `M⁻¹` with symbol `∝|q|` (inverse of `Ŝ∝1/|q|`) applied by FFT to the contact-masked residual, mean-zeroed, DC zeroed. Only the CG direction/β change (M-inner product); exact line search untouched; `precond="none"` follows the original algorithm exactly (identical solution; since the 2026-07 OpenMP reductions the floating-point summation order differs, so no longer bit-for-bit). ~1.7–2.9× fewer iterations (more at larger Ns).
+- **Spectral preconditioner** (`precond="fourier"`, `fourier_precond.hpp`): `M⁻¹` with symbol `∝|q|` (inverse of `Ŝ∝1/|q|`) applied to the contact-masked residual, mean-zeroed, DC zeroed. Only the CG direction/β change (M-inner product); exact line search untouched; `precond="none"` follows the original algorithm exactly (identical solution; since the 2026-07 OpenMP reductions the floating-point summation order differs, so no longer bit-for-bit). ~1.7–2.9× fewer iterations (more at larger Ns).
+  - **Stencil engine (2026-09-09, default).** Because `|q|` is a positive-order
+    (degree-1) symbol, its real-space kernel is short-ranged (decays like
+    `1/r³` in 2-D) rather than requiring the full-grid FFT `fourier-fft` used
+    to. `precond_engine="auto"` (default) / `"stencil"` / `"fft"` selects the
+    application: the stencil truncates the kernel to a 13-tap real-space
+    footprint (`R=2`) applied **only on the current contact set** —
+    restricting to `C` is *exact*, not approximate, because the residual is
+    zero off `C`, so the full-grid convolution sampled on `C` and the local
+    sum over neighbours in `C` are the same sum term-for-term. Retained
+    kernel mass is 74.6% at `R=1`, 83.9% at `R=2`; the truncated symbol `ŵ_R`
+    is positive off DC and much flatter than the true `|q|` symbol
+    (min/max 0.137 at `R=2` vs 6.9e-4 untruncated).
+  - **Measured result is stronger than "same convergence, cheaper
+    application": the stencil is a *better* preconditioner, not merely a
+    cheaper one.** Iteration counts (float32 unless noted, rough-H0.8):
+    Ns=1024 fft 22 / stencil **13** / no-precond 23; Ns=4096 fft 62 /
+    stencil **25** / no-precond 69; Ns=16384 fft 208 / stencil **61**;
+    Ns=4096 f64 fft 79 / stencil **33**; Ns=16384 f64 fft 272 / stencil
+    **94**. At Ns=1024 the full-grid `|q|` FFT preconditioner (22 it) is
+    barely earning its keep over no preconditioner at all (23 it), while the
+    truncated stencil (13 it) does markedly better — consistent with the
+    truncated symbol being far flatter, i.e. the long-range content the FFT
+    computes so expensively is largely irrelevant once contact is dilute.
+    Measured on one surface family (self-affine rough-H0.8, seeded) —
+    established behaviour on that family, not yet a proven general property.
+  - **Occupancy gate (`precond_occupancy_max`, default 0.4, separate knob
+    from `active_occupancy_max`).** At 56.75% contact the stencil is
+    **16.9% slower** than `fft` (CI[+9.4,+30.0]%, 5 paired samples; 625 vs
+    519 iterations) — above `active_occupancy_max` the active-set
+    restriction itself switches off, so this is stencil-vs-fft on the plain
+    full-grid solve, the regime where the truncated kernel's low-`k` error
+    costs conditioning rather than helps it. `automatic` uses the stencil
+    while the level below reported contact under the threshold and `fft`
+    above it, giving the low-occupancy win with no regression at the gate
+    point (measured at parity with `fft` there, plus a small ~0.6%
+    iteration-count cascade benefit from a marginally better coarsest-level
+    warm start — not the double-digit "win" a first pass over the ledger
+    suggested; see `doc/bench/2026-09-09-stencil-preconditioner.md`).
+  - **Projections that did not fully hold.** Total wall time at Ns=16384
+    improved 2.87–2.90× (float/double) — a large real win, short of the
+    design's projected 4–5×. Memory gains were 0–20%, modest rather than
+    dramatic: the full-grid gap/warm-start/output buffers dominate peak RSS
+    at these sizes far more than the preconditioner's own scratch, so
+    removing the FFT engine's buffers barely moves total peak memory.
 - **Warm start** (`p_init=`): start PCG from a given pressure (renormalised to the load).
 - **Nested-grid (cascadic/FMG) continuation** — single C++ entry point `hc.solve_nested(grid_size, gap, p_nominal, coarsest=64, q=6, ...)` (`nested_solve.hpp`): builds the coarse→fine hierarchy and per-level H2 operators internally, restricts the gap (2×2 average), and warm-starts each level by injecting the prolonged coarse pressure (sharp contact boundary; injection beats bilinear). `grid_size` must be `coarsest·2^k`. Combined with the preconditioner → up to 4× fewer iterations at Ns=1024 (180→45), full solve cheaper than one cold solve. Prototypes in `experiments/`; design in `doc/specs/2026-06-30-spectral-preconditioner-design.md`.
 - **Precision policy (2026-09, A09)** — `hc.solve_nested(..., precision=...)`:
@@ -438,7 +482,7 @@ Fix: use plain `\begin{enumerate}` and `\begin{itemize}` without optional argume
 | Nested build share of wall time (Ns=256, h2 q=6) | 17% (build 0.036 s of 0.215 s total) |
 | Float achievable certificate (Ns=256 rough, fft) | 2e-7 converges (102 it); tighter stalls at 1.88e-7; pressure error vs double saturates at ~5e-6 either way |
 | Precision policy at Ns=256, requested 1e-8 (vs double tol=1e-12) | double 31 it / rel 8.0e-9 / 0.074 s; float 23 it / rel 5.0e-6 / **stagnated**; float_then_double 23+8 it / rel **2.1e-8** / 0.056 s |
-| float_then_double polish gain (T17 fixture, Ns=64) | pressure rel vs double 2.03e-5 → **1.76e-9** for 4 extra double iterations |
+| float_then_double polish gain (T17 fixture, Ns=64, stencil precond engine — 2026-09-09) | pressure rel vs double 2.03e-5 → **3.11e-9** for 6 extra double iterations (was 1.76e-9 / 4 iterations under the fft engine; the polish behaviour moved when the default preconditioner engine changed) |
 | Harness paired A/B, active-set vs standard (rough-H0.8, 5 paired samples, corrected solver) | wall −57.8% CI[−61.7,−55.4] at Ns=512; −69.4% CI[−71.3,−64.6] at Ns=1024; peak RSS −13.5% / −29.3%; contact-area spread exactly 0 |
 | Preflight prediction vs measured RSS at Ns=16384 | 8.29/14.82/8.99/21.82 GiB predicted vs 9.12/15.99/9.31/refused measured — **−3…−9%** on the corrected solver (older records gave −20…−25%) |
 | **Ns=16384 rebaseline vs the corrected solver (2026-09-09, rev 982ef0c, rfgen study surface, 1 rep)** | see `doc/bench/2026-09-09-ns16384-rebaseline.md` |
@@ -452,6 +496,12 @@ Fix: use plain `\begin{enumerate}` and `\begin{itemize}` without optional argume
 | Active-set vs standard, float, same session | 5.19× faster (647.0→124.7 s), 1.75× less memory (15.99→9.12 GiB), identical area |
 | Single precision on the ACTIVE path | 9.12 vs 9.31 GiB = **2% memory**, but 2.5× time. The `single_precision`-as-memory-lever advice holds for the STANDARD path only |
 | Certified stopping cost (std f32, same surface, vs the 2026-07-10 record) | 43 it / 647 s vs 25 it / 396 s — the price of certifying penetration + the FW gap instead of Σp\|g\| alone; the active path more than absorbs it (124.7 s certified vs 396 s uncertified) |
+| **Stencil preconditioner (2026-09-09)** — iteration counts, fft vs stencil, rough-H0.8, active-set | f32: Ns=1024 22→**13**, Ns=4096 62→**25**, Ns=16384 208→**61**; f64: Ns=1024 30→**17**, Ns=4096 79→**33**, Ns=16384 272→**94** (no-precond reference at Ns=1024/4096 f32: 23/69 — barely worse than the full-grid FFT preconditioner at Ns=1024) |
+| Stencil paired A/B wall time (low occupancy 0.04–0.11%, 5 reps unless noted) | f32: Ns=1024 −12.2% CI[−39.3,−0.6]%, Ns=4096 **−26.3%** CI[−34.3,−17.7]%, Ns=16384 −65.1% (n=1, indicative); f64: Ns=1024 −17.5% (CI includes 0), Ns=4096 **−32.5%** CI[−44.9,−27.5]%, Ns=16384 −65.5% (n=1, indicative) |
+| Stencil peak RSS change (same pairs) | f32: −2.8%/−5.4%/~0% (Ns=1024/4096/16384); f64: −7.5%/**−19.9%**/−2.1% — modest, not dramatic; full-grid gap/warm-start/output buffers dominate peak RSS at these sizes, not preconditioner scratch |
+| Stencil vs fft at required ≥40% occupancy gate point (rough-H0.8@2.0, 56.75% contact, Ns=1024, 5 paired reps) | stencil **+16.9% slower** CI[+9.4,+30.0]% (625 vs 519 it) — genuine regression, not noise; occurs because above `active_occupancy_max` the active-set restriction is off and the finest level runs the plain full-grid solve, where the truncated symbol's low-`k` error costs conditioning |
+| `automatic` engine at the gate point vs forced `fft` (same case) | parity, not a win: per-level median iterations automatic 36/51/103/192/516 vs fft 26/51/103/192/519 vs stencil 36/67/122/209/625 — automatic tracks fft everywhere except the unmeasured coarsest level; matvec wall time alone spans 13.82–15.64 s (fft reps) vs 10.67–13.42 s (auto reps), wider than the raw −16.57% paired gap, so that headline number is noise-dominated. Real effect: ~0.6% fewer finest-level iterations (516 vs 519, deterministic) from a marginally better coarsest-level warm start |
+| Total wall-time projection vs measured (Ns=16384, stencil default) | design projected 4–5×; measured **2.87×** (f32) / **2.90×** (f64) — a large real win, short of the projection |
 
 ---
 
@@ -591,10 +641,11 @@ de Saxcé–Feng reference cross-check (slow; not for production).
   - **D2 remaining**: A14 ACA storage protections (parked — the H-matrix backend is superseded by H2/FFT).
   - ✅ **B04 done 2026-09-09**: candidate-density sweep settles the A11 default — restriction wins below ~40% occupancy, loses badly near full contact, and the benefit grows with Ns. Penalty is in the masked matvec's per-box guards, not candidate construction. Recommends an occupancy-triggered conditional default using the coarse level's own measured contact fraction. The plan's evolving-C case did **not** reproduce (candidate set from the prolonged coarse pressure alone was already adequate at Ns=1024) and remains open. `doc/bench/2026-09-09-b04-candidate-density.md`.
   - ✅ **A11 (partial) done 2026-09-09**: `active_all_levels` restricts every level with a coarser one beneath it, not just the finest — the coarse cascade collapses (8192 level 47.95→3.98 s) for **−43…−48%** total wall at Ns=16384 and −37.7% (CI[−44.5,−22.3], 5 samples) at Ns=2048, at memory parity and identical contact area. Opt-in pending B04.
-  - ⚠️ **Measured 2026-09-09 at Ns=16384 — the D3 order is wrong.** On the active-set path (the one to run at this size) the H² matvec is **4–6%** of wall time; the full-grid |q| preconditioner is **41–47%** and the coarse cascade **45–50%**. A08 and A10 both optimise the matvec, i.e. that 4–6% — below the 10% the promotion rule demands of a new default. **A13** (sparse preconditioner + coarse space, parked in D4) targets 41–47% — and **~79% once `active_all_levels` is on**, which removes the coarse cascade and leaves the finest level's full-grid preconditioner as almost the entire cost — and the coarse-level tolerance schedule (`coarse_tol=1e-4` uniformly over nine levels) is in no package at all and needs no new algorithm. See `doc/bench/2026-09-09-ns16384-rebaseline.md`; B04 (candidate-density sweep) would show whether a dilute or smaller-Ns workload weights it differently.
+  - ⚠️ **Measured 2026-09-09 at Ns=16384 — the D3 order is wrong.** On the active-set path (the one to run at this size) the H² matvec is **4–6%** of wall time; the full-grid |q| preconditioner is **41–47%** and the coarse cascade **45–50%**. A08 and A10 both optimise the matvec, i.e. that 4–6% — below the 10% the promotion rule demands of a new default. **A13's sparse half** (then parked in D4, delivered 2026-09-09 as the stencil preconditioner — see below) targets 41–47% — and **~79% once `active_all_levels` is on**, which removes the coarse cascade and leaves the finest level's full-grid preconditioner as almost the entire cost — and the coarse-level tolerance schedule (`coarse_tol=1e-4` uniformly over nine levels) is in no package at all and needs no new algorithm. See `doc/bench/2026-09-09-ns16384-rebaseline.md`; B04 (candidate-density sweep) would show whether a dilute or smaller-Ns workload weights it differently.
   - **Evidence already on record before building anything**: `experiments/review_20260908_baseline.md` maps every review probe to what fixed it. Three D3 items have *negative* pre-existing evidence — the tensor M2M/L2L transfer is **slower** at production q (0.65×/0.61× at q=4/6, only 1.20× at q=8), M2L SVD compression has a flop ratio **worse than dense** at q=4 (1.175), and the displacement recurrence saved 18% of matvecs but only 4% of wall time with its precondition holding just 8 of 22 iterations. Measure before implementing.
   - **D3 (measured optimisation)**: A08 displacement recurrence, A10 M2L compression/batching, A11 occupied traversal + screening (its safe-screening bound needs `fw_gap`, which A01 now provides), A17 vector H². A09's remaining half — staged **q** and operator-error propagation `G_S ≤ G̃ + 2Pε_u` — is still open.
-  - **D4/D5 (research)**: A12 two-phase simplex/reduced-CG, A13 sparse preconditioner, A16 semismooth Newton for friction (the path to lowering the 1e-2 tangential KKT default), A18 observables + Galerkin/periodic/multigrid.
+  - ⛔ **A13's coarse-space half struck as a measured no-go (2026-09-09, approved).** Band-limiting the `|k|` symbol to `k_max/2` to emulate a coarse-grid correction turns 27 iterations into **3985, stagnated** — worse than no preconditioner at all (34 iterations); `k_max/4`, `/8`, `/16` all stagnate too (2261/2222/3437 it). `M⁻¹` acts most strongly at high `k`, so band-limiting removes precisely the subspace the preconditioner exists to correct — coarsening is not a cheaper approximation of `M⁻¹`, it is a different and much worse operator. See spec §3.2, `doc/specs/2026-09-09-stencil-preconditioner-design.md`. **A13's sparse half is delivered**: the 13-tap real-space stencil preconditioner (`doc/bench/2026-09-09-stencil-preconditioner.md`) is exactly the "sparse preconditioner" A13 proposed, now the default engine.
+  - **D4/D5 (research)**: A12 two-phase simplex/reduced-CG, A16 semismooth Newton for friction (the path to lowering the 1e-2 tangential KKT default), A18 observables + Galerkin/periodic/multigrid.
 - ~~FFT preconditioner speed~~ ✅ done (2026-07): half-spectrum transforms on pocketfft (default, BSD) or FFTW3 plans (opt-in, GPL; ~16%/~5% faster double/float end-to-end at Ns=4096), object-owned scratch/plans. The FFT is now a small share of the iteration.
 - ~~FFT-convolution matvec backend (`backend="fft"`)~~ ✅ done (2026-07): exact zero-padded Love-kernel convolution per `doc/specs/2026-07-09-fft-convolution-backend-design.md`, plumbed into `ContactSolver` and `solve_nested`. **Measured outcome**: exactness is the headline (matches dense to ~1e-15 double / ~1.4e-7 float — no interpolation, no Gibbs); performance is modestly better than H2 at Ns ≤ 2048 (~1.5–1.6× matvec), ≈parity at Ns=4096 (measured under desktop load) — the padded transforms are bandwidth-bound, so the spec's flop-count 2–3× estimate did not materialise; H2 remains preferred for very large Ns.
 - **FFTW-engine pruned transforms (many-plan decomposition)** — the pocketfft path skips structurally-zero forward lines and unread inverse lines in the operator's padded transforms; the FFTW path still runs full 2-D plans there.

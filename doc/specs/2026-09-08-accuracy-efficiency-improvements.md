@@ -53,7 +53,7 @@ experiments MUST NOT silently alter the default model or accuracy contract.
 | A10 | M2L compression/batching/symmetry; transfer/leaf tuning | Optimization experiments | A05, A07, A09 | h2_operator, cheb_basis |
 | A11 | Occupied traversal, compact M/L and screening | Optimization | A03, A07; A09 for certified screening | h2_operator, H2Mask |
 | A12 | Two-phase simplex/reduced-CG solver | Solver experiment | A01–A04, A07 | new solver implementation |
-| A13 | Sparse preconditioner with coarse correction | Solver experiment | A11–A12 | new preconditioner implementation |
+| A13 | ~~Sparse preconditioner with coarse correction~~ — coarse-space half **struck as a measured no-go (2026-09-09)**: band-limiting `\|k\|` to `k_max/2` turns 27 iterations into 3985 (stagnated), worse than no preconditioner (34 it) — see `doc/specs/2026-09-09-stencil-preconditioner-design.md` §3.2. The sparse half is delivered as the 13-tap real-space stencil preconditioner (`doc/bench/2026-09-09-stencil-preconditioner.md`), now the default `precond_engine`. | Solver experiment | A11–A12 | new preconditioner implementation |
 | A14 | Bounded ACA storage and H-matrix symmetry/matvec | Secondary backend | A01, A07 | hmatrix, cluster_tree |
 | A15 | Friction diagnostics, loading semantics and transactions | Correctness | A01–A04 | friction_solve, friction_driver, bindings |
 | A16 | Projection-residual tangential Newton solver | Solver experiment | A05, A15 | friction_solve, bipotential references |
@@ -610,8 +610,10 @@ Tests: T09, T13, T23, T29, T33–T36.
    protections. Pass independent kernel and memory gates.
 4. **D3: measured optimization release.** A08–A11 and A17. Promote each
    variant independently only after equal-accuracy full-solve benchmarks.
-5. **D4: solver research.** A12–A13/A16, benchmark against the corrected
-   reference and publish go/no-go findings.
+5. **D4: solver research.** A12/A16, benchmark against the corrected
+   reference and publish go/no-go findings. (A13's coarse-space half is
+   struck as a measured no-go, 2026-09-09; its sparse half shipped as the
+   stencil preconditioner — see the A13 row above.)
 6. **D5: model research.** A18 alternative operators/multigrid. The area API
    may ship earlier once its boundary conventions pass tests.
 
