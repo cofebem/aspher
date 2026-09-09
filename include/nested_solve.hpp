@@ -13,6 +13,20 @@ struct NestedParams {
     int q = 6;                // H2 Chebyshev order on every level
     int leaf_side = 8;        // H2 leaf side on every level
     bool precond = true;      // |q| spectral preconditioner per level
+    // Which implementation applies the |q| preconditioner.
+    //   stencil — a 13-tap real-space disc evaluated only on the contact set,
+    //             O(taps·N_c) with no grid allocation (the default).
+    //   fft     — the historical full-grid transform, O(N log N) per apply.
+    //             Kept as the equivalence reference and an escape hatch; it
+    //             was 77–81% of an Ns=16384 active-set run.
+    // Both apply the same operator; see
+    // doc/specs/2026-09-09-stencil-preconditioner-design.md.
+    enum class PrecondEngine { stencil, fft };
+    PrecondEngine precond_engine = PrecondEngine::stencil;
+    // l2 disc radius of the stencil, in cells. 2 (13 taps) matched or beat
+    // the full transform in every regime measured; 1 (5 taps) costs up to 13%
+    // more iterations. Must not exceed leaf_side.
+    int precond_radius = 2;
     double coarse_tol = 1e-4; // cascadic: looser tolerance on coarse levels
     // ── A09: precision policy ─────────────────────────────────────────────
     // `double_only`       every stage in double (default).

@@ -404,6 +404,26 @@ std::vector<int> H2Operator::slot_grid_indices(const H2Mask& mask) const {
     return gi;
 }
 
+StencilBlockLayout H2Operator::block_layout(const H2Mask& mask) const {
+    const auto& boxes = tree_.boxes();
+    StencilBlockLayout L;
+    L.Ns = Ns_;
+    L.ls = ls_;
+    L.nslots = mask.nslots();
+    const int nl = Ns_ / ls_;
+    L.slot_bx.resize(L.nslots);
+    L.slot_by.resize(L.nslots);
+    L.block_slot.assign(static_cast<std::size_t>(nl) * nl, -1);
+    for (int s = 0; s < L.nslots; ++s) {
+        const H2Box& b = boxes[leaves_[mask.slot_leaf[s]]];
+        const int bx = b.ix0 / ls_, by = b.iy0 / ls_;
+        L.slot_bx[s] = bx;
+        L.slot_by[s] = by;
+        L.block_slot[static_cast<std::size_t>(by) * nl + bx] = s;
+    }
+    return L;
+}
+
 void H2Operator::matvec_masked_into(const Eigen::VectorXd& x, Eigen::VectorXd& y,
                                     const H2Mask& src, const H2Mask* tgt) const {
     matvec_masked_impl<double>(x, y, src, tgt, Wleaf_, R_, couplings_,

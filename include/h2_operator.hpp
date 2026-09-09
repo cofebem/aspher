@@ -2,6 +2,7 @@
 
 #include "boussinesq_kernel.hpp"
 #include "cheb_basis.hpp"
+#include "stencil_precond.hpp"
 #include "uniform_quadtree.hpp"
 
 #include <Eigen/Dense>
@@ -184,6 +185,12 @@ public:
     // Flat grid index of every compressed-vector entry, in slot order
     // (size nslots()*ls²): the driver's gather/scatter map.
     std::vector<int> slot_grid_indices(const H2Mask& mask) const;
+
+    // Block layout for the stencil preconditioner's compressed apply: the
+    // same slot convention as slot_grid_indices, expressed as block
+    // coordinates plus a block->slot map, so the preconditioner can find a
+    // slot's neighbours without an N-sized grid->slot table.
+    StencilBlockLayout block_layout(const H2Mask& mask) const;
 
     // Compressed masked matvec, src = tgt = mask: xc and yc are compressed
     // vectors (nslots()*ls² entries, see H2Mask). No N-sized array anywhere.

@@ -16,6 +16,7 @@
 #include "hmatrix.hpp"
 #include "nested_solve.hpp"
 #include "runtime_policy.hpp"
+#include "stencil_precond.hpp"
 #include "tangential_operator.hpp"
 
 #include <cstring>
@@ -185,14 +186,25 @@ public:
 
         hmc::Precond pc;
         if (precond == "fourier") {
-            auto fp = std::make_shared<hmc::FourierPreconditioner>(
-                Ns_);
+            // "fourier" now means the stencil: the same operator, applied as
+            // a 13-tap real-space disc on the contact set instead of two
+            // full-grid transforms
+            auto sp = std::make_shared<hmc::StencilPreconditioner>(Ns_, 2);
+            pc = [sp](const Eigen::VectorXd& g,
+                      const std::vector<std::uint8_t>& contact) {
+                Eigen::VectorXd z;
+                sp->apply_into(g, contact, z);
+                return z;
+            };
+        } else if (precond == "fourier-fft") {
+            auto fp = std::make_shared<hmc::FourierPreconditioner>(Ns_);
             pc = [fp](const Eigen::VectorXd& g,
                       const std::vector<std::uint8_t>& contact) {
                 return fp->apply(g, contact);
             };
         } else if (precond != "none" && !precond.empty()) {
-            throw std::invalid_argument("precond must be 'none' or 'fourier'");
+            throw std::invalid_argument(
+                "precond must be 'none', 'fourier' or 'fourier-fft'");
         }
 
         Eigen::VectorXd p0;
@@ -335,7 +347,8 @@ PyResult py_solve_nested(
     int grid_size,
     const py::array_t<double, py::array::c_style | py::array::forcecast>& gap,
     double p_nominal, double domain_size, double E_star, int coarsest, int q,
-    int leaf_side, bool precond, double tol, double coarse_tol, int max_iter,
+    int leaf_side, bool precond, const std::string& precond_engine,
+    int precond_radius, double tol, double coarse_tol, int max_iter,
     bool use_pr, bool single_precision, const std::string& precision,
     double float_floor, bool allow_tolerance_relaxation, bool light_result,
     const std::string& backend, bool record_error_history, bool active_set,
@@ -357,6 +370,13 @@ PyResult py_solve_nested(
     np.q = q;
     np.leaf_side = leaf_side;
     np.precond = precond;
+    if (precond_engine == "stencil")
+        np.precond_engine = hmc::NestedParams::PrecondEngine::stencil;
+    else if (precond_engine == "fft")
+        np.precond_engine = hmc::NestedParams::PrecondEngine::fft;
+    else
+        throw std::invalid_argument("precond_engine must be 'stencil' or 'fft'");
+    np.precond_radius = precond_radius;
     np.coarse_tol = coarse_tol;
     np.single_precision = single_precision;
     if (precision == "double") np.precision = hmc::NestedParams::Precision::double_only;
@@ -786,6 +806,7 @@ PYBIND11_MODULE(aspher, m) {
           py::arg("gap"), py::arg("p_nominal"), py::arg("domain_size") = 1.0,
           py::arg("E_star") = 1.0, py::arg("coarsest") = 64, py::arg("q") = 6,
           py::arg("leaf_side") = 8, py::arg("precond") = true,
+          py::arg("precond_engine") = "stencil", py::arg("precond_radius") = 2,
           py::arg("tol") = 1e-8, py::arg("coarse_tol") = 1e-4,
           py::arg("max_iter") = 20000, py::arg("use_pr") = true,
           py::arg("single_precision") = false, py::arg("precision") = "",

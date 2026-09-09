@@ -1,6 +1,7 @@
 #include "boussinesq_kernel.hpp"
 #include "contact_solver.hpp"
 #include "fourier_precond.hpp"
+#include "stencil_precond.hpp"
 
 #include <cstdio>
 
@@ -76,6 +77,28 @@ int main() {
                 r3.iterations, relpf);
     CHECK(relpf < 1e-3);
     CHECK(std::abs(r3.contact_fraction - r0.contact_fraction) < 2e-3);
+
+    // ── S4/S5: the stencil preconditioner solves the same problem ─────────
+    // Same operator, different implementation: the answer must agree to
+    // roundoff and the iteration count must stay in a documented band.
+    {
+        hmc::StencilPreconditioner sp(Ns, 2);
+        hmc::Precond pcs = [&sp](const Eigen::VectorXd& g,
+                                 const std::vector<std::uint8_t>& contact) {
+            Eigen::VectorXd z;
+            sp.apply_into(g, contact, z);
+            return z;
+        };
+        auto r4 = hmc::solve_contact(op, g0, p_bar, 1e-10, 5000, true, pcs);
+        CHECK(r4.converged);
+        const double rel = (r4.pressure - r1.pressure).norm() / r1.pressure.norm();
+        std::printf("stencil: %d it (fft %d), pressure rel %.2e, dArea %.2e\n",
+                    r4.iterations, r1.iterations, rel,
+                    std::abs(r4.contact_fraction - r1.contact_fraction));
+        CHECK(rel < 1e-6);                                        // S4
+        CHECK(r4.contact_fraction == r1.contact_fraction);        // S4
+        CHECK(r4.iterations <= r1.iterations * 6 / 5 + 1);        // S5: +20%
+    }
 
     return 0;
 }
