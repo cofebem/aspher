@@ -827,19 +827,35 @@ Let $w(\mathbf r)$ be the real-space kernel of $\widehat{M^{-1}} = |\mathbf
 k|$ on the periodic $N_s\times N_s$ grid, obtained by inverse DFT of the
 symbol. Because $w$ decays but does not vanish, an exact real-space
 application would touch every grid point; the stencil preconditioner instead
-truncates $w$ to a fixed footprint of radius $R$ (grid units),
+truncates $w$ to a fixed footprint of radius $R$ (grid units), a
+\emph{Euclidean ($L^2$) disc}, not an $L^\infty$ (square) neighbourhood:
 \begin{equation}
-  w_R(\mathbf r) = \begin{cases} w(\mathbf r) & \|\mathbf r\|_\infty \le R \\
+  w_R(\mathbf r) = \begin{cases} w(\mathbf r) & r_x^2 + r_y^2 \le R^2 \\
                                    0 & \text{otherwise,} \end{cases}
   \label{eq:stencil-trunc}
 \end{equation}
+matching \texttt{src/stencil\_precond.cpp}'s admission test
+\texttt{dx*dx + dy*dy <= radius*radius}. The disc, not the square, is what
+gives 13 taps at $R=2$: a $5\times5$ square minus its four corners would hold
+21 points, not 13. The correct enumeration at $R=2$ is
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+$(0,0)$ & 1 offset & weight $1$ \\
+$(\pm1,0)$, $(0,\pm1)$ & 4 offsets & weight $-0.180875$ \\
+$(\pm1,\pm1)$ & 4 offsets & weight $-0.032860$ \\
+$(\pm2,0)$, $(0,\pm2)$ & 4 offsets & weight $0.021189$ \\
+\end{tabular}
+\end{center}
+for $1 + 4 + 4 + 4 = 13$ taps in total; $(\pm2,\pm1)$ is excluded because
+$4+1=5 > 4$, and $(\pm2,\pm2)$ is excluded because $8 > 4$ — exactly the
+points an $L^\infty$ description would wrongly include. At $R=1$ the disc is
+the 5-point cross $(0,0)$, $(\pm1,0)$, $(0,\pm1)$ (not a $3\times3$ block),
+since $(\pm1,\pm1)$ has $1+1=2>1$ and is excluded.
 and renormalises so that $\widehat w_R(\bzero) = \widehat w(\bzero)$ is
 preserved on the modes that matter to CG (the DC mode is masked out of the
 preconditioner application in any case, per~\eqref{eq:precond-apply}, so this
-is a convenience rather than a necessity). $R=2$ gives a 13-tap footprint
-(the $5\times 5$ square with its four corners removed, since $\|\mathbf
-r\|_\infty \le 2$ under the taxicab corner cut used in the implementation).
-Retained mass $\sum_{\|\mathbf r\|_\infty \le R} |w(\mathbf r)| \big/
+is a convenience rather than a necessity).
+Retained mass $\sum_{r_x^2+r_y^2 \le R^2} |w(\mathbf r)| \big/
 \sum_{\mathbf r} |w(\mathbf r)|$ is $74.6\%$ at $R=1$ and $83.9\%$ at $R=2$ —
 a majority of the kernel's weight sits within two grid cells of the origin,
 consistent with the $1/r^3$ decay estimate above.
@@ -852,9 +868,9 @@ a target index $i$, whether $i \in \calC$ or not, using the \emph{full-grid}
 circular convolution with $w_R$:
 \begin{equation}
   \bigl(w_R * \Pi_\calC \tilde{\mathbf g}\bigr)_i
-  \;=\; \sum_{\mathbf r:\,\|\mathbf r\|_\infty \le R} w_R(\mathbf r)\,
+  \;=\; \sum_{\mathbf r:\,r_x^2+r_y^2 \le R^2} w_R(\mathbf r)\,
         \bigl(\Pi_\calC\tilde{\mathbf g}\bigr)_{i - \mathbf r}
-  \;=\; \sum_{\substack{\mathbf r:\,\|\mathbf r\|_\infty \le R \\ i-\mathbf r
+  \;=\; \sum_{\substack{\mathbf r:\,r_x^2+r_y^2 \le R^2 \\ i-\mathbf r
         \,\in\, \calC}} w_R(\mathbf r)\, \tilde g_{i-\mathbf r},
   \label{eq:stencil-exact}
 \end{equation}

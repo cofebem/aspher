@@ -280,16 +280,28 @@ Default β formula: **Polak-Ribière+** (`use_pr=true`); Fletcher-Reeves availab
 - **Spectral preconditioner** (`precond="fourier"`, `fourier_precond.hpp`): `M⁻¹` with symbol `∝|q|` (inverse of `Ŝ∝1/|q|`) applied to the contact-masked residual, mean-zeroed, DC zeroed. Only the CG direction/β change (M-inner product); exact line search untouched; `precond="none"` follows the original algorithm exactly (identical solution; since the 2026-07 OpenMP reductions the floating-point summation order differs, so no longer bit-for-bit). ~1.7–2.9× fewer iterations (more at larger Ns).
   - **Stencil engine (2026-09-09, default).** Because `|q|` is a positive-order
     (degree-1) symbol, its real-space kernel is short-ranged (decays like
-    `1/r³` in 2-D) rather than requiring the full-grid FFT `fourier-fft` used
-    to. `precond_engine="auto"` (default) / `"stencil"` / `"fft"` selects the
-    application: the stencil truncates the kernel to a 13-tap real-space
-    footprint (`R=2`) applied **only on the current contact set** —
-    restricting to `C` is *exact*, not approximate, because the residual is
-    zero off `C`, so the full-grid convolution sampled on `C` and the local
-    sum over neighbours in `C` are the same sum term-for-term. Retained
-    kernel mass is 74.6% at `R=1`, 83.9% at `R=2`; the truncated symbol `ŵ_R`
-    is positive off DC and much flatter than the true `|q|` symbol
-    (min/max 0.137 at `R=2` vs 6.9e-4 untruncated).
+    `1/r³` in 2-D) rather than needing a full-grid FFT to apply. The stencil
+    truncates that kernel to the 13-tap **Euclidean (`L²`) disc**
+    `dx²+dy² ≤ R²` at `R=2` (not an `L∞`/square neighbourhood — a 5×5 square
+    minus its 4 corners would be 21 points, not 13; the disc excludes
+    `(±2,±1)` (5>4) and `(±2,±2)` (8>4) in addition to the square's corners),
+    applied **only on the current contact set** — restricting to `C` is
+    *exact*, not approximate, because the residual is zero off `C`, so the
+    full-grid convolution sampled on `C` and the local sum over neighbours in
+    `C` are the same sum term-for-term. Retained kernel mass is 74.6% at
+    `R=1` (the 5-point cross, not a 3×3 block), 83.9% at `R=2`; the truncated
+    symbol `ŵ_R` is positive off DC and much flatter than the true `|q|`
+    symbol (min/max 0.137 at `R=2` vs 6.9e-4 untruncated).
+  - **Two different APIs select this, with different vocabularies — do not
+    mix them up.** `ContactSolver.solve(precond=...)` takes the string
+    `"none"` / `"fourier"` (now means: the stencil, applied as a 13-tap
+    real-space disc on the contact set instead of two full-grid transforms)
+    / `"fourier-fft"` (the historical full-grid FFT application of the same
+    `|q|` operator, kept for comparison). `solve_nested(...)` takes a
+    separate boolean `precond=True/False` for whether a preconditioner runs
+    at all, plus `precond_engine="auto"` (default) / `"stencil"` / `"fft"`
+    for which application it uses, plus `precond_occupancy_max` (default
+    0.4, see below) for where `"auto"` switches between them.
   - **Measured result is stronger than "same convergence, cheaper
     application": the stencil is a *better* preconditioner, not merely a
     cheaper one.** Iteration counts (float32 unless noted, rough-H0.8):
