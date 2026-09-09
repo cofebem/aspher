@@ -172,6 +172,77 @@ def summary(rows):
               f"{r['iterations']:5d} {r['fw_error']:10.2e}")
 
 
+def sweep(rows, metric, variants, target):
+    """B04 view: cost against ACHIEVED occupancy, per geometry.
+
+    Groups by (geometry, workload spec) rather than by nominal target, because
+    the load is only the dial — what matters is the contact fraction it
+    actually produced, which is surface- and resolution-dependent.
+    """
+    ok_rows = [r for r in rows if ok(r) and "occupancy" in r]
+    if not ok_rows:
+        print("no rows with occupancy recorded")
+        return
+    geoms = sorted({r["workload"].split("@")[0] for r in ok_rows})
+    for geom in geoms:
+        for Ns in sorted({r["Ns"] for r in ok_rows if r["workload"].startswith(geom)}):
+            sel = [r for r in ok_rows
+                   if r["workload"].startswith(geom + "@") and r["Ns"] == Ns]
+            if not sel:
+                continue
+            print(f"\n=== {geom}  Ns={Ns}  metric={metric} ===")
+            hdr = f"  {'occupancy':>10s}"
+            for v in variants:
+                hdr += f" {v:>20s}"
+            hdr += f" {'best':>16s}"
+            print(hdr)
+            specs = sorted({r["workload"] for r in sel},
+                           key=lambda w: st.median(
+                               [x["occupancy"] for x in sel if x["workload"] == w]))
+            for spec in specs:
+                grp = [r for r in sel if r["workload"] == spec]
+                occ = st.median(r["occupancy"] for r in grp)
+                line = f"  {100 * occ:9.3f}%"
+                med = {}
+                for v in variants:
+                    vals = [r[metric] for r in grp if r["variant"] == v]
+                    if vals:
+                        med[v] = st.median(vals)
+                        line += f" {med[v]:20.4g}"
+                    else:
+                        line += f" {'-':>20s}"
+                if med:
+                    winner = min(med, key=med.get)
+                    ref = med.get(variants[0])
+                    gain = (100 * (1 - med[winner] / ref)) if ref else 0.0
+                    line += f" {winner.replace('h2-f32-', ''):>10s} {gain:+5.0f}%"
+                print(line)
+
+
+def phases(rows, variant):
+    """Where the time goes, against achieved occupancy."""
+    sel = [r for r in rows if ok(r) and r.get("variant") == variant
+           and "occupancy" in r]
+    if not sel:
+        return
+    print(f"\n=== phase split for {variant} (median over reps) ===")
+    print(f"  {'geometry':12s} {'occup.':>8s} {'total':>8s} {'coarse':>8s} "
+          f"{'precond':>8s} {'matvec':>8s} {'candid.':>8s} {'verif.':>8s} "
+          f"{'rounds':>6s} {'fallback':>8s}")
+    specs = sorted({r["workload"] for r in sel},
+                   key=lambda w: (w.split("@")[0],
+                                  st.median([x["occupancy"] for x in sel
+                                             if x["workload"] == w])))
+    for spec in specs:
+        grp = [r for r in sel if r["workload"] == spec]
+        m = lambda k: st.median(r["timings"][k] for r in grp)
+        print(f"  {spec.split('@')[0]:12s} {100 * st.median(r['occupancy'] for r in grp):7.3f}% "
+              f"{m('total'):8.3f} {m('coarse'):8.3f} {m('precond'):8.3f} "
+              f"{m('matvec'):8.3f} {m('candidate'):8.4f} {m('verification'):8.4f} "
+              f"{st.median(r['active_rounds'] for r in grp):6.0f} "
+              f"{sum(1 for r in grp if r['active_fallback']):8d}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -182,8 +253,22 @@ def main():
     ap.add_argument("--target", type=float, default=0.10,
                     help="median improvement required to become a default")
     ap.add_argument("--summary", action="store_true")
+    ap.add_argument("--sweep", action="store_true",
+                    help="B04: cost against achieved occupancy, per geometry")
+    ap.add_argument("--variants",
+                    default="h2-f32,h2-f32-active,h2-f32-active-all")
+    ap.add_argument("--phases", help="phase split for this variant")
     a = ap.parse_args()
     rows = load(a.ledger)
+    if a.sweep:
+        vs = a.variants.split(",")
+        sweep(rows, a.metric, vs, a.target)
+        for v in vs:
+            phases(rows, v)
+        return
+    if a.phases:
+        phases(rows, a.phases)
+        return
     if a.summary or not a.pair:
         summary(rows)
         return
