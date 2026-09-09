@@ -100,5 +100,40 @@ int main() {
         CHECK(r4.iterations <= r1.iterations * 6 / 5 + 1);        // S5: +20%
     }
 
+    // ── the cost gate fires on a deliberately expensive preconditioner ────
+    {
+        hmc::FourierPreconditioner slow_fp(Ns);
+        hmc::PrecondIntoT<double> slow =
+            [&slow_fp](const Eigen::VectorXd& g,
+                       const std::vector<std::uint8_t>& contact,
+                       Eigen::VectorXd& z) {
+                // same operator, applied 40 times: correct, just costly
+                for (int rep = 0; rep < 40; ++rep)
+                    slow_fp.apply_into(g, contact, z);
+            };
+        hmc::MatVecIntoT<double> opi = [&S](const Eigen::VectorXd& v,
+                                            Eigen::VectorXd& out) {
+            out = S * v;
+        };
+        hmc::SolveOptions go;
+        go.tol = 1e-10;
+        go.max_iter = 5000;
+        auto rg = hmc::solve_contact_impl<double>(opi, g0, p_bar, go, slow,
+                                                  nullptr);
+        CHECK(rg.converged);
+        CHECK(rg.precond_dropped);
+        std::printf("cost gate: dropped=%d, %d it, area matches %d\n",
+                    int(rg.precond_dropped), rg.iterations,
+                    int(rg.contact_fraction == r0.contact_fraction));
+        CHECK(std::abs(rg.contact_fraction - r0.contact_fraction) < 1e-3);
+
+        // and does NOT fire when disabled
+        go.precond_cost_gate = 0.0;
+        auto rn = hmc::solve_contact_impl<double>(opi, g0, p_bar, go, slow,
+                                                  nullptr);
+        CHECK(rn.converged);
+        CHECK(!rn.precond_dropped);
+    }
+
     return 0;
 }

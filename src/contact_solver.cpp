@@ -206,6 +206,24 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
     double G_old = 1.0;
     Real delta = 0.0; // conjugation switch: 0 restarts the direction
 
+    // Cost gate: after the first preconditioned iteration, compare one apply
+    // against one matvec and drop the preconditioner if it is not paying for
+    // itself. Restarting the direction (delta = 0) is required -- the
+    // conjugacy recurrence is only valid for a fixed M.
+    bool precond_on = static_cast<bool>(precond);
+    bool precond_dropped = false;
+    auto cost_gate = [&]() {
+        if (!precond_on || opt.precond_cost_gate <= 0.0) return;
+        if (pcount < 1 || mv < 1) return;
+        const double per_pc = t_precond / static_cast<double>(pcount);
+        const double per_mv = t_matvec / static_cast<double>(mv);
+        if (per_mv > 0.0 && per_pc > opt.precond_cost_gate * per_mv) {
+            precond_on = false;
+            precond_dropped = true;
+            delta = Real(0); // restart conjugacy: M changed
+        }
+    };
+
     // Evaluate v = Sp + g0 from a *fresh* u, centre it, and recompute every
     // acceptance diagnostic. g holds the centred gap on return.
     auto evaluate = [&](void) -> Diag {
@@ -359,8 +377,9 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
         if (d.nc >= 2) {
 #pragma omp parallel for schedule(static)
             for (int i = 0; i < N; ++i) contact[i] = (p(i) > Real(0)) ? 1 : 0;
-            if (precond) {
+            if (precond_on) {
                 apply_precond(g, contact, z);
+                cost_gate();
             } else {
 #pragma omp parallel for schedule(static)
                 for (int i = 0; i < N; ++i) z(i) = contact[i] ? g(i) : Real(0);
@@ -522,6 +541,7 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
     res.g_ref = g_ref;
     res.matvec_count = mv;
     res.precond_count = pcount;
+    res.precond_dropped = precond_dropped;
     res.memory = solve_memory(N, sizeof(Real), opt.keep_best, opt.light);
     res.time_matvec = t_matvec;
     res.time_precond = t_precond;
@@ -649,6 +669,24 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
     };
     double G_old = 1.0;
     Real delta = 0.0;
+
+    // Cost gate: after the first preconditioned iteration, compare one apply
+    // against one matvec and drop the preconditioner if it is not paying for
+    // itself. Restarting the direction (delta = 0) is required -- the
+    // conjugacy recurrence is only valid for a fixed M.
+    bool precond_on = static_cast<bool>(precond);
+    bool precond_dropped = false;
+    auto cost_gate = [&]() {
+        if (!precond_on || opt.precond_cost_gate <= 0.0) return;
+        if (pcount < 1 || mv < 1) return;
+        const double per_pc = t_precond / static_cast<double>(pcount);
+        const double per_mv = t_matvec / static_cast<double>(mv);
+        if (per_mv > 0.0 && per_pc > opt.precond_cost_gate * per_mv) {
+            precond_on = false;
+            precond_dropped = true;
+            delta = Real(0); // restart conjugacy: M changed
+        }
+    };
 
     auto evaluate = [&](void) -> Diag {
         Diag d;
@@ -805,8 +843,9 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
                 const int i = idx[j];
                 contact[i] = (p(i) > Real(0)) ? 1 : 0;
             }
-            if (precond) {
+            if (precond_on) {
                 apply_precond(g, contact, z);
+                cost_gate();
             } else {
 #pragma omp parallel for schedule(static)
                 for (int j = 0; j < Nc; ++j) {
@@ -953,6 +992,7 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
     res.g_ref = g_ref;
     res.matvec_count = mv;
     res.precond_count = pcount;
+    res.precond_dropped = precond_dropped;
     // the restricted solve is always light: its operator output is invalid off
     // the candidate leaves, so the caller materialises the fields itself
     res.memory = solve_memory(N, sizeof(Real), opt.keep_best, /*light=*/true);

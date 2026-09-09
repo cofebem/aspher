@@ -115,6 +115,8 @@ struct ContactResult {
     long long precond_count = 0;             // preconditioner applications
     int identification_steps = 0;            // feasible projected-gradient steps
     bool returned_best = false;  // returned the best checked iterate (not last)
+    // the cost gate fired and the solve finished unpreconditioned
+    bool precond_dropped = false;
 };
 
 // Physical scales used for normalising diagnostics and tolerances (spec §3.1).
@@ -153,6 +155,15 @@ struct SolveOptions {
     bool keep_best = true;      // retain the best checked iterate (1 N-vector)
     double load_tol = 0.0;      // 0 -> 1e-12 (double) / 5e-7 (float)
     int stall_limit = 200;      // insufficient-improvement window
+    // Drop the preconditioner mid-solve when it stops paying for itself:
+    // after the first iteration, if one apply costs more than
+    // precond_cost_gate matvecs, the remaining iterations run unpreconditioned
+    // and the CG direction restarts. Measured (spec §3.1): running without
+    // the preconditioner wins exactly when that ratio exceeds m-1, where m is
+    // the iteration multiplier, itself 1.8-4.6 and growing with Ns; 1.5 fires
+    // on the cases that lose and not on the ones at parity. 0 disables.
+    // With the stencil engine the ratio is ~1e-3 and this never fires.
+    double precond_cost_gate = 1.5;
     // Success at an effective tolerance looser than the requested one is only
     // permitted when this is set; otherwise such a solve reports `stagnated`
     // with reason "precision_limit".
