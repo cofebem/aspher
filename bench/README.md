@@ -31,15 +31,30 @@ python bench/analyze.py --pair h2-f64,h2-f64-active --metric wall_cold_s
 python bench/analyze.py --pair h2-f64,h2-f64-active --metric peak_rss_gib --target 0.0
 ```
 
-A long job must be **detached from the tool shell**, not backgrounded inside
-it (the harness's Bash tool kills backgrounded commands at its timeout):
+A long job must be launched **outside the agent sandbox**. Every sandboxed
+shell invocation runs in its own PID namespace, so when the invocation ends
+the kernel kills everything in it — `nohup`, `disown` and `setsid` all act on
+sessions and job tables, not namespaces, and none of them help. Verified with
+a bare `sleep 900`, which does not survive either. From a normal terminal
+this is simply:
 
 ```bash
-OMP_NUM_THREADS=20 nohup python bench/harness.py run \
-    --workload rough-H0.8 --ns 16384 \
-    --variants h2-f32-active,h2-f64-active,h2-f32 \
+OMP_NUM_THREADS=20 OPENBLAS_NUM_THREADS=1 setsid nohup \
+    python bench/harness.py run --workload rough-H0.8 --ns 16384 \
+    --variants h2-f32-active,h2-f64-active,h2-f32,h2-f64 \
     > data/bench_16384.log 2>&1 < /dev/null & disown
 ```
+
+Two consequences worth knowing:
+
+* the ledger is the ground truth for whether a job ran. A killed job leaves
+  **no record at all**, which is distinguishable from a failed one: the
+  harness records `oom` / `timeout` / `error` rows for anything that fails
+  *inside* it.
+* `ps` from inside the sandbox cannot see a host job, so an empty process list
+  there is not evidence of death. Use the log's mtime and the ledger, which
+  are visible either way — the filesystem is shared, only the PID namespace
+  is not.
 
 The ledger (`data/bench_ledger.jsonl`) is append-only and resumable: a case
 already recorded with `run_status == "ok"` is skipped, so an interrupted sweep
