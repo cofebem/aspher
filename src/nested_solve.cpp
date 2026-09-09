@@ -683,6 +683,14 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                 // centre inside the cast: rounding a large offset first is
                 // exactly what destroyed the float solution (review §4)
                 Eigen::VectorXf g0f = (glvl.array() - datum).cast<float>();
+                // Free this level's double gap now that the float copy exists
+                // — the standard float branch has always done this, and with
+                // every level restricted the retained doubles otherwise sum to
+                // 8N/3 bytes (0.71 GiB at Ns=16384, measured as a +7% peak-RSS
+                // regression). glvl aliases gap[li], so this must come after
+                // the cast and only on the float path; the double path passes
+                // glvl straight through and must keep it alive.
+                if (!finest) gap[li].resize(0);
                 res = active_level<float>(*h2, fpp, g0f, p_bar, lvl_tol,
                                            max_iter, use_pr, np, n, p_init,
                                            coarse_gap, record_history,
@@ -692,6 +700,11 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                                             max_iter, use_pr, np, n, p_init,
                                             coarse_gap, record_history,
                                             light, g_ref, datum, datum);
+                // The double path reads glvl (which aliases gap[li]) for the
+                // whole solve — its compressed gather, its streamed
+                // verification and its field materialisation — so this level's
+                // gap can only be released once the call returns.
+                if (!finest) gap[li].resize(0);
             }
             coarse_gap.resize(0);
             // active_level works in level terms and cannot know the caller's
