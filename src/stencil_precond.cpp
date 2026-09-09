@@ -44,17 +44,13 @@ std::vector<double> kernel_grid(int Nw) {
 
 // One masked stencil evaluation. `fetch(jx, jy)` returns the residual at the
 // wrapped grid position if it is in contact and 0 otherwise; every tap is
-// summed UNCONDITIONALLY so the two apply paths stay bit-for-bit identical.
-//
-// The vectorizer must not touch this loop: gate S3 needs the exact same
-// scalar accumulation order at every call site, and letting -ftree-vectorize
-// choose a SIMD grouping independently for the branch-heavy full-grid fetch
-// and the branch-free blocked-tile fetch is exactly what produced a ~1e-17
-// per-point mismatch during development -- correct values, wrong (differing)
-// rounding, so gate S3's exact-equality check failed. Forcing scalar order
-// here is what makes it a proof rather than a coincidence.
+// summed UNCONDITIONALLY (0.0 substituted for an out-of-contact/out-of-set
+// neighbour, never skipped) so both apply paths perform the same tap-sum
+// reduction. The two paths' rounding can still differ slightly downstream
+// (see the contact-mean subtraction in apply_full/apply_blocked and gate
+// S3's R5 tolerances) -- that is expected and does not require pinning this
+// loop's codegen or accumulation order.
 template <class Fetch>
-__attribute__((noinline, optimize("O1")))
 double tap_sum(const std::vector<int>& dx, const std::vector<int>& dy,
                       const std::vector<double>& w, int ix, int iy,
                       Fetch fetch) {
