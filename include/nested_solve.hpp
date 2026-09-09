@@ -57,6 +57,13 @@ struct NestedParams {
     // verification while boundary pressures are subtly wrong (prototype
     // study, experiments/active_set_results.md Q2).
     bool active_set = false;
+    // Restrict EVERY level that has a coarser level beneath it, not only the
+    // finest. Measured at Ns=16384 (doc/bench/2026-09-09-ns16384-rebaseline.md):
+    // with the finest-only default the 8192 level alone is 42% of the whole
+    // solve, because it runs a standard full-grid solve and pays the matvec
+    // cost the finest level no longer pays. Opt-in until the paired A/B
+    // clears the promotion gate.
+    bool active_all_levels = false;
     double active_delta = 0.05; // gap threshold, fraction of the level gap scale
     int active_halo = 2;        // dilation radius for candidate/violation sets
     int active_max_rounds = 5;  // verification rounds before full-solve fallback

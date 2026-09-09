@@ -393,6 +393,42 @@ int main() {
         CHECK(r4.converged);
         CHECK(rel4 <= 1e-4);
         CHECK(std::abs(r4.contact_fraction - r0.contact_fraction) <= 1e-4);
+        // ── all-levels restriction: every level with a coarser one beneath
+        // it is restricted, not just the finest. Same answer, and the stage
+        // names prove the coarse levels really took the restricted path.
+        hmc::NestedParams np_all = np_act;
+        np_all.active_all_levels = true;
+        auto r5 = hmc::solve_contact_nested(Nr, 1.0, 1.0, gap, pbar, tol,
+                                            20000, true, np_all);
+        CHECK(r5.converged);
+        CHECK(!r5.active_fallback);
+        const double rel5 =
+            (r5.pressure - r0.pressure).norm() / r0.pressure.norm();
+        int n_active_coarse = 0, n_coarse = 0;
+        for (const auto& st : r5.stage_stats)
+            if (st.name.rfind("coarse:", 0) == 0) {
+                ++n_coarse;
+                if (st.name.find("(active)") != std::string::npos)
+                    ++n_active_coarse;
+            }
+        std::printf("active all-levels: %d it, relL2 %.2e, dArea %.2e, "
+                    "%d/%d coarse levels restricted\n",
+                    r5.iterations, rel5,
+                    std::abs(r5.contact_fraction - r0.contact_fraction),
+                    n_active_coarse, n_coarse);
+        CHECK(rel5 <= 1e-6);
+        CHECK(std::abs(r5.contact_fraction - r0.contact_fraction) <= 1e-6);
+        // every coarse level except the coarsest (which has nothing beneath
+        // it) must have been restricted
+        CHECK(n_coarse >= 2);
+        CHECK(n_active_coarse == n_coarse - 1);
+        // and the finest-only default must NOT restrict any coarse level
+        int n_active_default = 0;
+        for (const auto& st : r1.stage_stats)
+            if (st.name.rfind("coarse:", 0) == 0 &&
+                st.name.find("(active)") != std::string::npos)
+                ++n_active_default;
+        CHECK(n_active_default == 0);
     }
 
     // ── T06: a restricted certificate is NOT a global one ───────────────────

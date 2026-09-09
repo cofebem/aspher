@@ -83,17 +83,22 @@ static void dilate_mask(std::vector<std::uint8_t>& m, int Ns, int r) {
     }
 }
 
-// Finest-level active-set solve (plan doc/plans/2026-07-10-active-set-solver.md
-// M2 driver + M3 O(N_c) state): candidate set from the coarse level,
+// Active-set solve for ONE level (plan doc/plans/2026-07-10-active-set-solver.md
+// M2 driver + M3 O(N_c) state). Nothing here is specific to the finest level:
+// it needs only this level's gap, the prolonged pressure from the level below
+// and that level's gap field, so it serves any level with a coarser one
+// beneath it. Candidate set from the coarse level,
 // restricted Polonsky-Keer on COMPRESSED slot-blocked vectors through the
 // compressed masked H2 matvec, streamed full-grid verification per round
 // (per-leaf tiles, no N-sized u), violation-extension, and a full-solve
 // fallback after active_max_rounds. p_init_d (the prolonged coarse pressure)
 // is consumed. coarse_gap is the NEXT-TO-FINEST level's gap field ((Ns/2)²
 // entries), sampled by injection — the prolonged fine-grid copy is never
-// materialised (an N-sized array at Ns=16384 is 2.1 GiB).
+// materialised (an N-sized array at Ns=16384 is 2.1 GiB). `light` follows the
+// level's own policy: a coarse level must keep its gap field, because the
+// NEXT level's candidate set is built from it.
 template <class Real>
-static ContactResult active_finest(const H2Operator& h2,
+static ContactResult active_level(const H2Operator& h2,
                                    const FourierPreconditioner* fp,
                                    Eigen::Ref<const VecT<Real>> g0,
                                    double p_bar, double lvl_tol, int max_iter,
@@ -628,7 +633,10 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         // their displacement/gap; the finest honours light_result. Exception:
         // the active-set candidate set needs the next-to-finest gap field
         // ((Ns/2)²-sized, ~N/4 — negligible next to the finest solve).
-        const bool keep_gap = np.active_set && (li + 2 == levels.size());
+        // The next level's candidate set is built from this level's gap, so
+        // every level that will be restricted must keep its gap field.
+        const bool keep_gap = np.active_set && !finest &&
+                              (np.active_all_levels || li + 2 == levels.size());
         const bool light = finest ? np.light_result : !keep_gap;
         // only the finest level's trace is meaningful (iterations is also
         // finest-level-only); coarse levels never record history.
@@ -660,7 +668,13 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                                      ? SolveScales::DatumMode::caller
                                      : SolveScales::DatumMode::solver;
 
-        if (finest && np.active_set) {
+        // A level can be restricted once there is a coarser level beneath it
+        // to predict its contact from; the coarsest level always solves in
+        // full.
+        const bool use_active = np.active_set && have_init &&
+                                coarse_gap.size() > 0 &&
+                                (finest || np.active_all_levels);
+        if (use_active) {
             // restricted (active-set) solve on the candidate set built from
             // the coarse contact + gap; p_init/coarse_gap are consumed
             const FourierPreconditioner* fpp = np.precond ? &fp : nullptr;
@@ -669,19 +683,18 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                 // centre inside the cast: rounding a large offset first is
                 // exactly what destroyed the float solution (review §4)
                 Eigen::VectorXf g0f = (glvl.array() - datum).cast<float>();
-                res = active_finest<float>(*h2, fpp, g0f, p_bar, lvl_tol,
+                res = active_level<float>(*h2, fpp, g0f, p_bar, lvl_tol,
                                            max_iter, use_pr, np, n, p_init,
                                            coarse_gap, record_history,
-                                           np.light_result, g_ref, datum, 0.0);
+                                           light, g_ref, datum, 0.0);
             } else {
-                res = active_finest<double>(*h2, fpp, glvl, p_bar, lvl_tol,
+                res = active_level<double>(*h2, fpp, glvl, p_bar, lvl_tol,
                                             max_iter, use_pr, np, n, p_init,
                                             coarse_gap, record_history,
-                                            np.light_result, g_ref, datum,
-                                            datum);
+                                            light, g_ref, datum, datum);
             }
             coarse_gap.resize(0);
-            // active_finest works in level terms and cannot know the caller's
+            // active_level works in level terms and cannot know the caller's
             // original target: `lvl_tol` is the EFFECTIVE level tolerance
             // (clamped to the float floor), while requested_tol must stay the
             // tolerance the caller actually asked for, or two runs of the same
@@ -730,7 +743,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         }
 
         record_stage(std::string(finest ? "finest:" : "coarse:") +
-                         std::to_string(n),
+                         std::to_string(n) + (use_active ? "(active)" : ""),
                      level_float ? "float" : "double", np.q,
                      lopt.requested_tol, lopt.tol, res);
 

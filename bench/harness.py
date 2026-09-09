@@ -98,6 +98,13 @@ VARIANTS = {
                               allow_tolerance_relaxation=True),
     "h2-f32-active":     dict(backend="h2", precision="float",
                               allow_tolerance_relaxation=True, active_set=True),
+    # A11-adjacent: restrict EVERY level with a coarser one beneath it, not
+    # only the finest. Opt-in until the paired A/B clears the promotion gate.
+    "h2-f32-active-all": dict(backend="h2", precision="float",
+                              allow_tolerance_relaxation=True, active_set=True,
+                              active_all_levels=True),
+    "h2-f64-active-all": dict(backend="h2", precision="double",
+                              active_set=True, active_all_levels=True),
     "h2-polish":         dict(backend="h2", precision="float_then_double"),
     "fft-f64":           dict(backend="fft", precision="double"),
     "fft-f32":           dict(backend="fft", precision="float",
@@ -369,7 +376,7 @@ def worker(workload, Ns, variant, reps, tol, light, coarsest, max_iter):
         kwargs["q"] = q
         kwargs["leaf_side"] = ls
     kwargs["precision"] = v["precision"]
-    for k in ("allow_tolerance_relaxation", "active_set", "active_delta",
+    for k in ("allow_tolerance_relaxation", "active_set", "active_all_levels",
               "active_halo", "active_max_rounds"):
         if k in v:
             kwargs[k] = v[k]
