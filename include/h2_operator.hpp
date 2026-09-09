@@ -5,8 +5,10 @@
 #include "uniform_quadtree.hpp"
 
 #include <Eigen/Dense>
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <functional>
 #include <vector>
 
@@ -18,12 +20,53 @@ struct H2Params {
     int near_radius = 1; // direct near field within this many leaf boxes
 };
 
+// A07: complete, itemised storage accounting. The old H2Info reported only
+// couplings + near stencils + a PREDICTED scratch size, which the review
+// measured as understating the real footprint by >=46% (15 365 952 B reported
+// against >=7 072 776 B of omitted tree nodes, CSR offsets, leaf arrays,
+// transfer matrices and float caches). Every field below is counted once;
+// nothing that has not actually been allocated is called resident.
+struct H2Memory {
+    // Immutable coefficient data. `owned` is what the operator itself holds
+    // (the compact near table from make_boussinesq_h2); `borrowed` is a
+    // caller-owned table the operator REQUIRES to exist — not part of the
+    // operator's own footprint, but part of the system's, and invisible in
+    // the old accounting.
+    std::int64_t kernel_owned = 0;
+    std::int64_t kernel_borrowed = 0;
+    // Structure
+    std::int64_t tree = 0;        // quad-tree boxes + level offsets
+    std::int64_t leaves = 0;      // leaf box-id array
+    std::int64_t far_csr = 0;     // far interaction list + row offsets
+    std::int64_t near_csr = 0;    // near interaction list + row offsets
+    // Numeric caches
+    std::int64_t transfers = 0;      // Wleaf + the 4 M2M/L2L matrices
+    std::int64_t couplings = 0;      // unique M2L blocks
+    std::int64_t near_stencils = 0;  // unique near blocks
+    std::int64_t single_caches = 0;  // float copies (0 until built)
+    // Workspace ACTUALLY allocated right now (0 before the first apply)
+    std::int64_t scratch = 0;
+
+    std::int64_t resident = 0;  // sum of the above, excluding kernel_borrowed
+    std::int64_t capacity = 0;  // same, using container capacity()
+    // What the next apply would allocate if it ran now; a prediction, never
+    // added to `resident`.
+    std::int64_t estimated_next_apply_bytes = 0;
+
+    std::int64_t system_resident() const { return resident + kernel_borrowed; }
+};
+
 struct H2Info {
     int N = 0, Ns = 0, nlevels = 0, leaf_side = 0, q = 0, r = 0;
     int n_boxes = 0, n_leaves = 0;
     std::int64_t n_near_interactions = 0, n_far_interactions = 0;
     int n_unique_couplings = 0, n_near_stencils = 0;
     std::int64_t bytes_coupling = 0, bytes_near = 0, bytes_buffers = 0, bytes_total = 0;
+    // Immutable kernel coefficient data the operator OWNS (A06/A07): the
+    // compact near-offset table when built through make_boussinesq_h2, 0 when
+    // the coefficients belong to a caller-owned kernel. Counted once.
+    std::int64_t bytes_kernel = 0;
+    int near_table_extent = 0; // b, the compact table side (0 = not owned)
 };
 
 // Per-box occupancy bitmap over the complete quad-tree: box_occ[b] != 0 iff
@@ -54,6 +97,16 @@ struct H2Mask {
 using FarKernelFn = std::function<double(double, double)>;
 using NearKernelFn = std::function<double(int, int)>;
 
+// Required near-offset extent for an H2 operator (spec A06): the near field
+// of a leaf covers the (near_radius+1) leaf shells around it, so only element
+// offsets with |dx|,|dy| <= (near_radius+1)*leaf_side - 1 are ever requested.
+// A table of b = min(Ns, (near_radius+1)*leaf_side) entries per axis suffices.
+inline int near_table_extent(int Ns, int leaf_side, int near_radius) {
+    const long long span =
+        static_cast<long long>(near_radius + 1) * leaf_side;
+    return static_cast<int>(std::min<long long>(Ns, span));
+}
+
 // Matrix-free black-box FMM (Fong & Darve 2009) operator for the translation-
 // invariant Boussinesq half-space kernel on a uniform Ns x Ns grid. Far field
 // via tensor-product Chebyshev interpolation with cached, translation-invariant
@@ -68,7 +121,24 @@ public:
     H2Operator(int Ns, double h, FarKernelFn far, NearKernelFn near,
                H2Params params);
 
+    // Idempotent for an immutable parameter set: after a successful build,
+    // repeat calls are no-ops. The old behaviour APPENDED to the interaction,
+    // coupling and leaf arrays and left the float caches stale, so a second
+    // build silently produced a different (wrong) operator (spec A19).
     void build();
+    bool is_built() const { return built_; }
+
+    // Record coefficient data the operator owns (set by make_boussinesq_h2).
+    void set_owned_kernel_bytes(std::int64_t bytes, int extent) {
+        info_.bytes_kernel = bytes;
+        info_.near_table_extent = extent;
+        owned_kernel_bytes_ = bytes;
+        owned_extent_ = extent;
+    }
+    // Coefficient data the operator does not own but requires to outlive it.
+    void set_borrowed_kernel_bytes(std::int64_t bytes) {
+        borrowed_kernel_bytes_ = bytes;
+    }
 
     // u = S x, with x and u in natural flat order (global = iy*Ns + ix).
     // Reuses internal multipole/local scratch across calls: concurrent matvec
@@ -142,7 +212,21 @@ public:
         const;
 
     H2Info info() const { return info_; }
+    // Itemised, honest storage accounting (A07). Safe to call before build().
+    H2Memory memory() const;
     void print_statistics() const;
+
+    // Free the lazily-sized multipole/local workspace. The immutable caches
+    // are untouched, so the operator stays usable — the next apply simply
+    // re-allocates. Lets a memory-constrained driver drop the workspace
+    // before materialising full-grid output.
+    void release_scratch() const;
+
+    // Drop the float cache generation (A09 memory policy: a staged solve must
+    // not keep a precision generation it has finished with). The double caches
+    // are the source of truth and are untouched; build_single_caches() can
+    // rebuild them.
+    void release_single_caches() const;
 
     int n_far_interactions() const { return static_cast<int>(info_.n_far_interactions); }
     int n_unique_couplings() const { return info_.n_unique_couplings; }
@@ -190,6 +274,10 @@ private:
     mutable Eigen::MatrixXf Mbuf_f_, Lbuf_f_;
 
     H2Info info_;
+    bool built_ = false;
+    std::int64_t owned_kernel_bytes_ = 0;
+    std::int64_t borrowed_kernel_bytes_ = 0;
+    int owned_extent_ = 0;
 
     double far_kernel(double dx, double dy) const; // g(dx,dy)
 
@@ -664,5 +752,17 @@ void H2Operator::matvec_masked_stream_impl(
         }
     }
 }
+
+// Build a Boussinesq H2 operator WITHOUT materialising the full Ns x Ns Love
+// table (spec A06). Both the nested driver and the explicit solver used to
+// construct a BoussinesqKernel — 8N bytes, 2 GiB at Ns=16384 and 8 GiB at
+// Ns=32768 — and then never touch it again after build(), because the matvec
+// runs entirely off the operator's own caches. Only the compact near table
+// (min(Ns,(near_radius+1)*leaf_side)^2 doubles: 2 KiB at leaf_side=8,
+// near_radius=1) is needed, and the returned operator OWNS it, so no external
+// lifetime contract is imposed. The arithmetic is identical to
+// BoussinesqKernel's, so the result is bit-for-bit the same operator.
+std::unique_ptr<H2Operator> make_boussinesq_h2(int Ns, double L, double E_star,
+                                               H2Params params);
 
 } // namespace hmc

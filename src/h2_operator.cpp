@@ -2,6 +2,9 @@
 
 #include <cmath>
 #include <cstdio>
+#include <limits>
+#include <stdexcept>
+#include <type_traits>
 #include <unordered_map>
 
 namespace hmc {
@@ -17,14 +20,45 @@ H2Operator::H2Operator(const BoussinesqKernel& kernel, H2Params params)
                  [k = &kernel](int dix, int diy) {
                      return k->entry_offset(dix, diy);
                  },
-                 params) {}
+                 params) {
+    // The Ns x Ns Love table stays alive for the operator's benefit but is
+    // owned by the caller: report it, and never mix it into `resident`.
+    borrowed_kernel_bytes_ = 8LL * kernel.size();
+}
+
+// Parameter validation happens BEFORE any allocation or tree construction
+// (spec A19): an invalid grid/leaf/order combination is a programming error,
+// not something to discover halfway through a build.
+static void validate_h2_params(int Ns, double h, const H2Params& p) {
+    auto pow2 = [](int v) { return v > 0 && (v & (v - 1)) == 0; };
+    if (Ns <= 0 || !pow2(Ns))
+        throw std::invalid_argument("H2Operator: Ns must be a positive power of two");
+    if (p.leaf_side <= 0 || !pow2(p.leaf_side))
+        throw std::invalid_argument(
+            "H2Operator: leaf_side must be a positive power of two");
+    if (p.leaf_side > Ns)
+        throw std::invalid_argument("H2Operator: leaf_side > Ns");
+    if (p.q < 2)
+        throw std::invalid_argument("H2Operator: q must be >= 2");
+    if (p.near_radius < 1)
+        throw std::invalid_argument(
+            "H2Operator: near_radius must be >= 1 (the admissibility rule "
+            "assumes the 3x3 leaf neighbourhood is evaluated directly)");
+    if (!(h > 0.0) || !std::isfinite(h))
+        throw std::invalid_argument("H2Operator: element size must be positive");
+    // checked sizes: N and the q2 x nbox scratch must fit the index types used
+    const std::int64_t N = static_cast<std::int64_t>(Ns) * Ns;
+    if (N > static_cast<std::int64_t>(std::numeric_limits<int>::max()))
+        throw std::invalid_argument("H2Operator: Ns*Ns exceeds int range");
+}
 
 H2Operator::H2Operator(int Ns, double h, FarKernelFn far, NearKernelFn near,
                        H2Params params)
     : p_(params), Ns_(Ns), q_(params.q), q2_(params.q * params.q),
       ls_(params.leaf_side), ls2_(params.leaf_side * params.leaf_side), h_(h),
       far_fn_(std::move(far)), near_fn_(std::move(near)),
-      cheb_(params.q), tree_(Ns, params.leaf_side) {}
+      cheb_((validate_h2_params(Ns, h, params), params.q)),
+      tree_(Ns, params.leaf_side) {}
 
 std::vector<double> H2Operator::centers_norm(int side) const {
     // element-center k (k = 0..side-1) normalized into the box geometric extent:
@@ -49,7 +83,115 @@ static inline std::int64_t near_key(int dx, int dy) {
     return (static_cast<std::int64_t>(dx + 64) << 16) ^ static_cast<std::int64_t>(dy + 64);
 }
 
+std::unique_ptr<H2Operator> make_boussinesq_h2(int Ns, double L, double E_star,
+                                               H2Params params) {
+    if (Ns <= 0) throw std::invalid_argument("make_boussinesq_h2: Ns <= 0");
+    if (!(L > 0.0) || !std::isfinite(L))
+        throw std::invalid_argument("make_boussinesq_h2: L must be positive");
+    if (!(E_star > 0.0) || !std::isfinite(E_star))
+        throw std::invalid_argument("make_boussinesq_h2: E_star must be positive");
+    const double h = L / Ns;
+    const double a = 0.5 * h;
+    const double scale = 1.0 / (M_PI * E_star);
+    const int b = near_table_extent(Ns, params.leaf_side, params.near_radius);
+    // Same expression, same order as BoussinesqKernel's table: the compact and
+    // full-table operators must be bit-for-bit identical (gate T13).
+    auto near = std::make_shared<std::vector<double>>(
+        static_cast<std::size_t>(b) * b);
+    for (int dy = 0; dy < b; ++dy)
+        for (int dx = 0; dx < b; ++dx)
+            (*near)[static_cast<std::size_t>(dy) * b + dx] =
+                scale * love_uz(dx * h, dy * h, a, a);
+    auto op = std::make_unique<H2Operator>(
+        Ns, h,
+        [scale, a](double dx, double dy) {
+            return scale * love_uz(dx, dy, a, a);
+        },
+        // The table is captured BY VALUE (shared_ptr): the operator owns its
+        // coefficients, so there is no external lifetime contract as there is
+        // with the kernel-reference constructor.
+        [near, b, Ns](int dix, int diy) {
+            const int dx = std::abs(dix), dy = std::abs(diy);
+            if (dx >= Ns || dy >= Ns) return 0.0; // outside the grid span
+            if (dx >= b || dy >= b)
+                throw std::logic_error(
+                    "make_boussinesq_h2: near-offset request outside the "
+                    "compact table extent — the near field should never ask "
+                    "for it");
+            return (*near)[static_cast<std::size_t>(dy) * b + dx];
+        },
+        params);
+    op->set_owned_kernel_bytes(
+        static_cast<std::int64_t>(near->size()) * sizeof(double), b);
+    return op;
+}
+
+H2Memory H2Operator::memory() const {
+    H2Memory m;
+    m.kernel_owned = owned_kernel_bytes_;
+    m.kernel_borrowed = borrowed_kernel_bytes_;
+    m.tree = static_cast<std::int64_t>(tree_.bytes());
+    m.leaves = static_cast<std::int64_t>(leaves_.capacity() * sizeof(int));
+    m.far_csr = static_cast<std::int64_t>(
+        far_off_.capacity() * sizeof(std::int64_t) +
+        far_.capacity() * sizeof(FarInter));
+    m.near_csr = static_cast<std::int64_t>(
+        near_off_.capacity() * sizeof(std::int64_t) +
+        near_.capacity() * sizeof(NearInter));
+    auto mat_bytes = [](const auto& M) {
+        return static_cast<std::int64_t>(M.size()) *
+               static_cast<std::int64_t>(
+                   sizeof(typename std::decay_t<decltype(M)>::Scalar));
+    };
+    m.transfers = mat_bytes(Wleaf_);
+    for (const auto& R : R_) m.transfers += mat_bytes(R);
+    for (const auto& C : couplings_) m.couplings += mat_bytes(C);
+    for (const auto& A : near_stencils_) m.near_stencils += mat_bytes(A);
+    if (have_single_) {
+        m.single_caches = mat_bytes(Wleaf_f_);
+        for (const auto& R : R_f_) m.single_caches += mat_bytes(R);
+        for (const auto& C : couplings_f_) m.single_caches += mat_bytes(C);
+        for (const auto& A : near_stencils_f_) m.single_caches += mat_bytes(A);
+    }
+    // ONLY what is actually allocated: the M/L workspace is sized lazily on
+    // the first apply of each precision, so before that it is a prediction,
+    // not residency.
+    m.scratch = mat_bytes(Mbuf_) + mat_bytes(Lbuf_) + mat_bytes(Mbuf_f_) +
+                mat_bytes(Lbuf_f_);
+    m.resident = m.kernel_owned + m.tree + m.leaves + m.far_csr + m.near_csr +
+                 m.transfers + m.couplings + m.near_stencils +
+                 m.single_caches + m.scratch;
+    m.capacity = m.resident; // Eigen allocates exactly; vectors use capacity()
+    const std::int64_t nbox =
+        static_cast<std::int64_t>(tree_.boxes().size());
+    if (Mbuf_.size() == 0)
+        m.estimated_next_apply_bytes += 2 * nbox * q2_ * 8;
+    if (have_single_ && Mbuf_f_.size() == 0)
+        m.estimated_next_apply_bytes += 2 * nbox * q2_ * 4;
+    return m;
+}
+
+void H2Operator::release_single_caches() const {
+    Wleaf_f_.resize(0, 0);
+    for (auto& R : R_f_) R.resize(0, 0);
+    couplings_f_.clear();
+    couplings_f_.shrink_to_fit();
+    near_stencils_f_.clear();
+    near_stencils_f_.shrink_to_fit();
+    Mbuf_f_.resize(0, 0);
+    Lbuf_f_.resize(0, 0);
+    have_single_ = false;
+}
+
+void H2Operator::release_scratch() const {
+    Mbuf_.resize(0, 0);
+    Lbuf_.resize(0, 0);
+    Mbuf_f_.resize(0, 0);
+    Lbuf_f_.resize(0, 0);
+}
+
 void H2Operator::build() {
+    if (built_) return; // idempotent for an immutable parameter set
     const auto& boxes = tree_.boxes();
     const int nbox = static_cast<int>(boxes.size());
 
@@ -166,8 +308,18 @@ void H2Operator::build() {
     info_.n_near_stencils = static_cast<int>(near_stencils_.size());
     info_.bytes_coupling = 8LL * info_.n_unique_couplings * q2_ * q2_;
     info_.bytes_near = 8LL * info_.n_near_stencils * ls2_ * ls2_;
-    info_.bytes_buffers = 8LL * 2 * nbox * q2_;
-    info_.bytes_total = info_.bytes_coupling + info_.bytes_near + info_.bytes_buffers;
+    info_.bytes_buffers = 8LL * 2 * nbox * q2_; // predicted, not yet resident
+    info_.bytes_kernel = owned_kernel_bytes_;
+    info_.near_table_extent = owned_extent_;
+    // A07: bytes_total is now the complete itemised figure (tree, CSR lists,
+    // leaves and transfers included) plus the predicted workspace, instead of
+    // couplings + near + workspace alone, which understated it by >=46%.
+    // memory() gives the breakdown and separates predicted from resident.
+    {
+        const H2Memory mem = memory();
+        info_.bytes_total = mem.resident + info_.bytes_buffers;
+    }
+    built_ = true;
 }
 
 Eigen::VectorXd H2Operator::matvec(const Eigen::VectorXd& x) const {
@@ -335,9 +487,24 @@ void H2Operator::print_statistics() const {
                 (long long)s.n_near_interactions, (long long)s.n_far_interactions);
     std::printf("  unique couplings=%d  near stencils=%d\n",
                 s.n_unique_couplings, s.n_near_stencils);
-    std::printf("  mem: coupling=%.2f MiB  near=%.2f MiB  buffers=%.2f MiB  total=%.2f MiB\n",
-                s.bytes_coupling / 1048576.0, s.bytes_near / 1048576.0,
-                s.bytes_buffers / 1048576.0, s.bytes_total / 1048576.0);
+    const H2Memory m = memory();
+    const double MiB = 1048576.0;
+    std::printf("  mem resident %.2f MiB = kernel %.3f + tree %.3f + leaves "
+                "%.3f + far_csr %.3f + near_csr %.3f\n",
+                m.resident / MiB, m.kernel_owned / MiB, m.tree / MiB,
+                m.leaves / MiB, m.far_csr / MiB, m.near_csr / MiB);
+    std::printf("               + transfers %.3f + couplings %.3f + near "
+                "stencils %.3f + float caches %.3f + scratch %.3f\n",
+                m.transfers / MiB, m.couplings / MiB, m.near_stencils / MiB,
+                m.single_caches / MiB, m.scratch / MiB);
+    if (m.kernel_borrowed)
+        std::printf("       borrowed (caller-owned) coefficients %.2f MiB -> "
+                    "system %.2f MiB\n",
+                    m.kernel_borrowed / MiB, m.system_resident() / MiB);
+    if (m.estimated_next_apply_bytes)
+        std::printf("       next apply would allocate %.2f MiB (predicted, "
+                    "not resident)\n",
+                    m.estimated_next_apply_bytes / MiB);
 }
 
 } // namespace hmc

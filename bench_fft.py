@@ -43,6 +43,7 @@ def bench_solve(Ns=4096, p_bar=0.002):
             r = hc.solve_nested(grid_size=Ns, gap=gap, p_nominal=p_bar,
                                 coarsest=64, q=4, leaf_side=16,
                                 backend=backend, single_precision=single,
+                                allow_tolerance_relaxation=single,
                                 light_result=True)
             dt = time.perf_counter() - t0
             print(f"nested Ns={Ns} {backend:3s} "

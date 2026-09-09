@@ -184,8 +184,84 @@ def test_bipotential_reference():
     print("test_bipotential_reference: OK")
 
 
+def test_load_semantics_and_hold():
+    """A15 §10.1: p_bar None/0/>0 are three requests; a normal-only change
+    re-solves the held tangential boundary condition."""
+    Ns, mu = 32, 0.3
+    x = (np.arange(Ns) + 0.5) / Ns - 0.5
+    g0 = (x[:, None] ** 2 + x[None, :] ** 2).ravel()
+
+    fs = hc.FrictionSolver(grid_size=Ns, nu=0.3, model=hc.CoulombFriction(mu))
+    fs.set_gap(g0)
+    assert fs.step(p_bar=0.01, q_bar=(0.001, 0.0)).converged
+    p_loaded = np.asarray(fs.pressure).ravel().copy()
+
+    # p_bar omitted holds the normal load
+    assert fs.step().converged
+    assert np.array_equal(np.asarray(fs.pressure).ravel(), p_loaded)
+
+    # held displacement: a large normal unload relaxes the shear instead of
+    # leaving stale tractions on points that just opened (review §13.1)
+    r = fs.step(p_bar=0.0001, tangential_hold="displacement")
+    p = np.asarray(fs.pressure).ravel()
+    q = np.asarray(fs.q).ravel()
+    qn = np.hypot(q[:Ns * Ns], q[Ns * Ns:])
+    print("hold=displacement:", r.converged, r.tangential_hold_applied,
+          "cone excess %.2e" % (qn - mu * p).max(),
+          "shear on open", int(np.count_nonzero((p == 0) & (qn > 1e-14))))
+    assert r.converged and r.tangential_hold_applied
+    assert (qn - mu * p).max() <= 1e-12
+    assert np.count_nonzero((p == 0) & (qn > 1e-14)) == 0
+
+    # p_bar = 0 is a physical request: complete separation
+    r0 = fs.step(p_bar=0.0)
+    assert r0.converged
+    assert np.abs(np.asarray(fs.pressure)).max() == 0.0
+    assert np.abs(np.asarray(fs.q)).max() == 0.0
+    assert r0.approach == g0.min()          # just-touching convention
+    assert abs(r0.mean_pressure) == 0.0
+
+    # invalid loads raise rather than returning a numerical status
+    for bad in (-0.5, -2.0):
+        try:
+            fs.step(p_bar=bad)
+        except (ValueError, RuntimeError):
+            pass
+        else:
+            raise AssertionError(f"p_bar={bad} should be rejected")
+    try:
+        fs.step(p_bar=0.01, tangential_hold="clip")
+    except (ValueError, RuntimeError):
+        pass
+    else:
+        raise AssertionError("unknown tangential_hold should be rejected")
+    print("test_load_semantics_and_hold: OK")
+
+
+def test_held_force_infeasible_is_transactional():
+    Ns, mu = 32, 0.3
+    x = (np.arange(Ns) + 0.5) / Ns - 0.5
+    g0 = (x[:, None] ** 2 + x[None, :] ** 2).ravel()
+    fs = hc.FrictionSolver(grid_size=Ns, nu=0.3, model=hc.CoulombFriction(mu))
+    fs.set_gap(g0)
+    assert fs.step(p_bar=0.01, q_bar=(0.001, 0.0)).converged
+    before = (np.asarray(fs.pressure).copy(), np.asarray(fs.q).copy(),
+              np.asarray(fs.u_t).copy(), np.asarray(fs.delta_t).copy())
+    r = fs.step(p_bar=0.0001, tangential_hold="force")
+    print("hold=force infeasible:", r.converged, "|", r.status_reason)
+    assert not r.converged
+    assert r.status_reason
+    after = (np.asarray(fs.pressure), np.asarray(fs.q), np.asarray(fs.u_t),
+             np.asarray(fs.delta_t))
+    for a, b in zip(before, after):
+        assert np.array_equal(a, b), "state mutated by a refused step"
+    print("test_held_force_infeasible_is_transactional: OK")
+
+
 if __name__ == "__main__":
     test_models()
+    test_load_semantics_and_hold()
+    test_held_force_infeasible_is_transactional()
     test_solver_two_step()
     test_callback_exception_transactional()
     test_model_none_rejected()

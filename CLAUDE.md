@@ -60,6 +60,36 @@ plans (not worth it for single solves).
 
 ---
 
+## Benchmarks
+
+`bench/harness.py` + `bench/analyze.py` implement the validation plan §8
+measurement protocol; see `bench/README.md`. Full provenance per row
+(revision — dirty *tracked* sources are refused — compiler/flags, **FFT
+engine via ldd**, CPU, affinity, threads, surface hash, every solver argument,
+status/tolerances/scope, independently recomputed errors, per-stage and
+per-phase data, solver byte accounting, fresh-process peak RSS, pressure
+hash), paired **ABBA** ordering with medians + bootstrap CI on the paired
+difference, a resumable JSONL ledger (`data/bench_ledger.jsonl`), and a
+**preflight memory budget** that constructs the operator at two small grids
+and fits `a + b·N` to its A07 accounting (H2 storage is *not* ∝ N — near
+stencils are 4.5 MiB fixed at ℓ=16). `analyze.py` disqualifies rows whose
+`(status, validation_scope, requested_tol, effective_tol)` differ **before**
+comparing any timing.
+
+```bash
+python bench/harness.py preflight --ns 16384 --variant h2-f32-active
+python bench/harness.py run --workload rough-H0.8 --ns 1024     --variants h2-f64,h2-f64-active --reps 5
+python bench/analyze.py --pair h2-f64,h2-f64-active --metric wall_cold_s
+# Long jobs must run OUTSIDE the agent sandbox: each sandboxed shell gets its
+# own PID namespace and everything in it dies when the call ends (nohup,
+# disown and setsid do not help - verified with a bare `sleep 900`).
+OMP_NUM_THREADS=20 OPENBLAS_NUM_THREADS=1 setsid nohup \
+    python bench/harness.py run ... > data/bench_16384.log 2>&1 < /dev/null & disown
+# A killed job leaves NO ledger row; a job that fails inside the harness leaves
+# an oom/timeout/error row. That difference is the diagnostic. Also: `ps` from
+# inside the sandbox cannot see a host job - check the log mtime and the ledger.
+```
+
 ## Run Tests
 
 ```bash
@@ -88,6 +118,26 @@ where `R±± = sqrt((x±a)²+(y±a)²)`.
 
 Self-term: `S_ii = 4h·ln(1+√2) / (π E*)`.
 
+**Stable evaluation (2026-09, A05).** The printed corner-logarithm form
+cancels catastrophically at signed/large offsets (relative error 1.9e-7 at
+(16384,16384)h, ~1 at (−1e6,0)h) and returns **NaN at a cell corner**.
+`love_uz` now (i) folds parity first — `love_uz(±x,±y)` is bitwise equal —
+(ii) uses `ln(t+√(t²+c²)) = ln|c| + asinh(t/|c|)` so the divergent `ln|c|`
+cancels analytically and the `t→0` limits are removable, (iii) evaluates the
+asinh *difference* without cancellation (`asinh_diff(u,v,du)`, conjugate form
+when `u,v` share a sign, with the exactly known `du = 2a` or `2b`), and
+(iv) switches past `r = 1500·max(a,b)` to the multipole expansion
+`A/r + (A/6r⁵)[a²(3x²−r²) + b²(3y²−r²)]` (= `(h²/r)[1+h²/(24r²)]` for a
+square — which is *why* a bare point kernel is not an exact far substitute).
+Worst relative error over the 472-point 80-digit fixture: **3.5e-14** (r/h up
+to 1e6). The same treatment applies to Cerruti: `cerruti_uxx` is written as
+`(1−ν)·Love + ν·ylog` (no cancellation on the axis), `ylog` has its own
+expansion, and `cerruti_uxy` is rationalised into a product of positive
+factors with no subtraction at all. Oracle: `tests/generate_kernel_reference.py`
+(explicit developer command, mpmath ≥80 digits, cross-checked against
+independent singularity-aware quadrature to 1e-69/1e-53) → immutable fixtures
+in `tests/data/`; gate `test_kernel_stability` (T10–T12).
+
 Translation invariance: `S_ij` depends only on `|ix-jx|, |iy-jy|` → Ns×Ns lookup table, O(1) per entry.
 
 ### H-Matrix
@@ -102,6 +152,26 @@ Translation invariance: `S_ij` depends only on `|ix-jx|, |iy-jy|` → Ns×Ns loo
 
 ### H2/FMM operator (`backend="h2"`) — preferred for large Ns
 Matrix-free black-box FMM (Chebyshev interpolation, Fong & Darve 2009). **No blocks stored**: shares bases per cluster and couplings per interaction, all cached by `(level, relative offset)` via translation invariance. O(N) memory, O(N) matvec.
+- **Memory accounting (2026-09, A07)**: `H2Operator::memory()` itemises every
+  allocation, counted once — kernel (owned vs **borrowed**), tree, leaves, far
+  CSR, near CSR, transfers, couplings, near stencils, float caches, and the
+  workspace *actually* held. Nothing lazily sized counts as resident;
+  `estimated_next_apply_bytes` predicts it, and `release_scratch()` /
+  `release_single_caches()` free the workspace and the float generation. The old
+  report (couplings + near + predicted buffers) understated the footprint by
+  **≥46%**. What it hid, at Ns=1024/ℓ=8/q=6: **far CSR 8.17 MiB (58% of
+  resident)**, tree 1.00 MiB — against couplings 2.37 MiB, the item the old
+  report treated as the main cost. Resident 14.05 MiB + 8.00 MiB borrowed Love
+  table (`system_resident()` = 22.05 MiB) + 12.00 MiB predicted first-apply
+  scratch. *The far interaction list, not the couplings, dominates H² storage* —
+  a concrete A11 target the old accounting could not reveal. `FFTInfo` gains the
+  matching `bytes_kernel_borrowed`/`estimated_next_apply_bytes`; `ContactResult`
+  gains `memory` (cg_state, best_iterate, contact_mask, output_arrays, peak —
+  the solver's own buffers, explicitly *not* process RSS) and per-phase
+  `timings` (total/matvec/precond/build/coarse/verification/output; the nested
+  driver attributes operator construction and the coarse solves, measured at 17%
+  of wall time at Ns=256). All exposed to Python.
+- **Compact construction (2026-09, A06)**: `make_boussinesq_h2(Ns, L, E*, params)` builds the operator **without** the Ns² Love table. Only offsets with `|dx|,|dy| ≤ (near_radius+1)·leaf_side − 1` are ever requested, so a `b = min(Ns,(r+1)ℓ)` table suffices (2 KiB at ℓ=8, r=1) and the operator *owns* it (no external lifetime contract). Bit-for-bit identical to the full-table operator over 48 configurations (`test_contracts` T13). Used by `solve_contact_nested` (h2 levels) and `ContactSolver(backend="h2")`; the FFT backend still builds the full table because it transforms it. Measured build: Ns=1024 q=4 48.7→14.3 ms (3.4×), Ns=2048 q=4 200.8→52.4 ms (3.8×); storage −8N bytes (2 GiB at Ns=16384, 8 GiB at 32768). `H2Info` gains `bytes_kernel` and `near_table_extent`.
 - **Tree**: `UniformQuadTree` — balanced quad-tree to square leaves of side `h2_leaf_side` (default 8); stores index *ranges*, no index lists. `Ns`, `leaf_side` must be powers of two.
 - **Far field**: tensor-product Chebyshev interpolation, order `q` (default 4; r=q² nodes). Passes `P2M → M2M → M2L → L2L → L2P`. Coupling `K[a,b]=g(ξ_a−ξ_b)` cached by `(level,dx,dy)`; M2M/L2L are 4 cached q²×q² matrices (scale-invariant).
 - **Near field**: exact Love stencils for leaves within `near_radius` (default 1, the 3×3 neighborhood), cached by relative leaf offset. Uses the same `love_uz` kernel as the far field (consistent; far error is interpolation-only).
@@ -121,7 +191,87 @@ Exact zero-padded (Hockney) circular convolution of the pressure with the Love e
 - **M5 done**: `friction_model.hpp` (Tresca/Coulomb/CallbackModel — callback output sanitized: s ≥ 0, s = 0 where p ≤ 0, NaN→0, size-checked) + `friction_driver.{hpp,cpp}` (`FrictionDriver::step`, TRANSACTIONAL: normal PK solve → damped fixed-point threshold loop (velocity-dependent laws, warm-chained passes) → incremental tangential solve with `u_hist = −C qⁿ`, K carry-over, g_floor → state commit only on convergence + dissipation `D = h²Σq·Δw ≥ 0`). `solve_tangential` extended (all optional, M4-default-compatible): `u_hist`, `g_floor`, `K_io`, `delta_init`; zero-target-with-history = full unload preserves locked-in shear; differential 3-solve probes at the operating point when history present. Gates in `test_driver`: two-step C-J, path independence, **Mindlin unloading discrete-exact superposition**, velocity smoke.
 - **M6 done**: `bipotential.{hpp,cpp}` — de Saxcé–Feng bipotential Uzawa reference solver (`solve_bipotential`, displacement-controlled; predictor `τ_t = q + ρw`, `τ_n = p − ρ(g + μ|w|)` with the paper→codebase sign map derived in the header; analytic Coulomb-cone projection eq. (105) ≡ Tamaas `Kato::enforcePressureCoulomb`, + frozen-threshold cylinder for Tresca/generic; ρ from power iteration). Cross-checks in `test_uzawa`: agrees with the production staggered path to 5.8e-8 (p) / 4.3e-6 (q) rel-L2 at Ns=32 Coulomb, and passes a direct KKT self-check at ~1e-10. The Tresca cross-check gap (7.3e-3) is the PRODUCTION side's floor on the uniform-threshold all-slip case, not the Uzawa's.
 - **M7 done**: pybind11 bindings — `FrictionSolver` (keyword-arg `step(p_bar=/q_bar=/delta_t=/dt=/T=)`, GIL released around the solve), `CoulombFriction/TrescaFriction/UserFriction` (the last wraps a GIL-safe Python callable), `FrictionStepResult`, and `solve_bipotential`. `example_friction.py` + `tests/test_friction_py.py`. Python names follow spec §8 (C++ internals keep `FrictionDriver/…Model`).
+- **A15 done (2026-09)**: normal-load semantics, held tangential BCs and final local KKT.
+  `FrictionStepSpec` carries `has_p_bar`: **unset holds** the current normal load,
+  `p_bar = 0` is **complete unloading** (p = q = u_t = 0, approach = min(g₀) as the
+  documented just-touching convention, accumulated slip and the controlled rigid
+  shift preserved, traction-dependent warm state cleared so recontact cannot
+  resurrect stale tractions), `p_bar > 0` solves for that load, negatives are
+  rejected. Python: `step(p_bar=None)` (default) / `p_bar=0`. Legacy: `-1` still
+  means hold; `p_bar = 0` without `has_p_bar` now raises instead of silently
+  skipping. A **normal-only** step re-solves the incremental tangential problem
+  under the boundary condition named by `tangential_hold` (`"displacement"`,
+  default, or `"force"`) — before this, unloading p̄ 0.01→0.0001 at Ns=32 left 76
+  OPEN points carrying shear with excess |q|−μp = 0.02362; now 0 and 1.1e-19. An
+  infeasible held force fails transactionally with `status_reason`. The
+  displacement-residual floor no longer adds |q̄| (a traction) to |u_t| (a
+  displacement). **Final KKT**: `check_tangential_kkt` recomputes cone
+  feasibility, stick/slip residuals, the force balance and the projection
+  residual `R_ρ = q − Π_{|q|≤s}[q − ρ(Cq + u_hist − EΔδ)]` on the RETURNED q
+  (after the terminal force correction), with ρ = max(s)/max|C(s,0)| — a fixed
+  operator property, invariant under rescaling s, never shrunk to flatter a
+  residual. `converged` requires it at `kkt_tol` (default **1e-2**, the measured
+  floor of the hardest supported regime: uniform-threshold gross slip bottoms out
+  at ~1.0e-2; force control 1e-3..1e-4; partial slip 7.7e-7). Stall is no longer
+  success. The |k| tangential preconditioner is **dropped on the first stall**
+  (it mismatches the strongly clamped near-gross-slip metric: 1.8e-2 vs 8.5e-5 on
+  the same problem) and the solve restarts from the original iterate.
 - **Theory doc**: `doc/theory/friction.tex` (novice-accessible, worked examples; shares `references.bib`) — Cerruti kernels + element integrals + symbol, friction laws, incremental QP ⇔ KKT ⇔ stick–slip, vector projected CG (two-metric projection, 2×2 |k| preconditioner, outer Newton force control), driver/history/dissipation, bipotential Uzawa, Cattaneo–Mindlin / Mindlin / Ciavarella–Jäger benchmarks. Compile like pcg.tex (`pdflatex` + `bibtex` once).
+
+### Certified termination and honest statuses (2026-09, spec A01–A04)
+
+The old stopping rule was the Polonsky–Keer complementarity metric
+`e = Σ p|g| / (P g_scale)` alone. It says **nothing** about a negative gap where
+the pressure is zero, so a one-point warm start "converged" in zero iterations
+with pressure relative error 2.24. Success now requires, all recomputed on the
+**returned** pressure from a **fresh** operator application:
+
+- **Frank–Wolfe certificate** `G = Σ_i p_i (v_i − min_j v_j)`, `v = Sp + g₀`
+  (non-negative summand form), reported as `fw_gap` and normalised
+  `fw_error = G/(P g_ref)`. For SPD `S` and feasible `p`,
+  `0 ≤ f(p) − f(p*) ≤ G` and `‖p−p*‖²_S ≤ 2G` (gated in `test_certification`).
+- **`penetration_error` = max(0, −min gap)/g_ref** at the reported approach.
+- **`load_error` = |Σp − P|/P** ≤ 1e-12 (double) / 5e-7 (float), accumulated in
+  double.
+
+`ContactResult.status` ∈ {`converged`, `stagnated`, `max_iterations`,
+`nonpositive_curvature`, `nonfinite`, `verification_failed`, `resource_limit`};
+`converged` is exactly `status == converged`. **Stagnation is a failure**, and
+the best checked iterate is returned (`returned_best`). Other new fields:
+`pk_error` (the legacy metric, still reported and still what `error_history`
+records), `requested_tol`/`effective_tol`, `p_ref`/`g_ref`, `validation_scope`,
+`operator_error_kind` (`unavailable` is `None`, never 0), `matvec_count`,
+`verification_matvec_count`, `precond_count`, `identification_steps`.
+Solver policy now lives in `SolveOptions`/`SolveScales`
+(`solve_contact_opt(...)`); the old positional `solve_contact` still works.
+
+**Scale-invariant activation.** The overlap step reused the *preconditioned*
+line-search τ, so multiplying `M⁻¹` by 1e-3 turned a 22-iteration solve into a
+false success with error 0.196. Under `M⁻¹→cM⁻¹` the direction scales by `c`,
+so `τ→τ/c` and `τ·g` does not cancel. The activation step now uses
+`τ_ov = num²/(den·‖g‖²_A)`, invariant by construction, equal to the PK step on
+a restarted direction. Conjugacy also restarts on **any** support change
+(removals as well as additions). Measured: c ∈ [1e-6, 1e6] all give 23
+iterations and identical pressure (rel ≤ 1.4e-15).
+
+**Feasible identification step.** When the restricted direction is unusable
+(|A| < 2, or lost positive curvature) the solver takes a
+simplex-projected gradient step `p⁺ = Π_{p≥0, Σp=P}(p − s·g)` with Armijo
+backtracking on the actual objective (`project_load_simplex`, Michelot
+threshold iteration; a sorting projector is the test oracle). It is
+preconditioner-free, so activation is scale invariant, and it is what repairs
+the singleton warm start (3 iterations to the cold solution, rel 1.5e-16).
+
+**Gap datum (A04).** `SolveScales::DatumMode` — `automatic` (solver picks
+`c = mid(min,max)` and subtracts it *inside the evaluation loop*, so the
+caller's array is still read in place: no extra N-buffer, zero-copy
+preserved), `solver` (subtract a supplied datum), `caller` (already removed,
+fused into a float cast). The datum is restored into `approach` (+c) and
+`objective` (+cP); displacement and gap are unchanged. `solve_contact_nested`
+derives **one** datum and **one** `g_ref = max(range(g₀), p̄L/E*)` for the whole
+hierarchy. Before this, a 1e6 gap offset made the float nested solve "converge"
+in 1 iteration with pressure relative error 1.08; now the offset changes
+nothing but the approach (14 it, rel 3.0e-6 at every offset).
 
 ### Polonsky–Keer (1999) PCG
 Projected CG for the QP `min ½p'Sp + p'g₀  s.t. p≥0, mean(p)=p_bar`.
@@ -130,13 +280,34 @@ Default β formula: **Polak-Ribière+** (`use_pr=true`); Fletcher-Reeves availab
 - **Spectral preconditioner** (`precond="fourier"`, `fourier_precond.hpp`): `M⁻¹` with symbol `∝|q|` (inverse of `Ŝ∝1/|q|`) applied by FFT to the contact-masked residual, mean-zeroed, DC zeroed. Only the CG direction/β change (M-inner product); exact line search untouched; `precond="none"` follows the original algorithm exactly (identical solution; since the 2026-07 OpenMP reductions the floating-point summation order differs, so no longer bit-for-bit). ~1.7–2.9× fewer iterations (more at larger Ns).
 - **Warm start** (`p_init=`): start PCG from a given pressure (renormalised to the load).
 - **Nested-grid (cascadic/FMG) continuation** — single C++ entry point `hc.solve_nested(grid_size, gap, p_nominal, coarsest=64, q=6, ...)` (`nested_solve.hpp`): builds the coarse→fine hierarchy and per-level H2 operators internally, restricts the gap (2×2 average), and warm-starts each level by injecting the prolonged coarse pressure (sharp contact boundary; injection beats bilinear). `grid_size` must be `coarsest·2^k`. Combined with the preconditioner → up to 4× fewer iterations at Ns=1024 (180→45), full solve cheaper than one cold solve. Prototypes in `experiments/`; design in `doc/specs/2026-06-30-spectral-preconditioner-design.md`.
+- **Precision policy (2026-09, A09)** — `hc.solve_nested(..., precision=...)`:
+  `"double"` (default), `"float"` (== `single_precision=True`), or
+  `"float_then_double"`. **Behaviour change:** float cannot drive the
+  certificate below ~2e-7, so a *float-only* solve asked for a tighter
+  tolerance now returns `status="stagnated"`, `status_reason="precision_limit"`
+  instead of a relaxed success; pass `allow_tolerance_relaxation=True` to accept
+  the documented floor (`float_floor=2e-6` by default), and `requested_tol` /
+  `effective_tol` record both numbers either way. `"float_then_double"`
+  identifies the contact in float at the floor, releases the float cache
+  generation, then **polishes in double** with the same fixed operator,
+  warm-started, to the requested tolerance — a fresh solve, so no conjugacy or
+  recurrence state crosses the switch. Measured at Ns=256 (fft, p̄=0.02,
+  requested 1e-8, vs a double tol=1e-12 reference): double 31 it / rel 8.0e-9 /
+  0.074 s; float 23 it / rel 5.0e-6 (stagnated); **float_then_double 31 it
+  (23 float + 8 double) / rel 2.1e-8 / 0.056 s** — 240× more accurate than
+  float *and* faster than pure double. It is **not** a memory substitute: the
+  polish carries the double working set, so the large-grid recipe stays on
+  `float_only`. Combining it with `active_set=True` is rejected (the O(N_c)
+  polish route is a follow-up). `result.stage_stats` lists every stage
+  (name, precision, q, requested/effective tol, iterations, matvecs, seconds,
+  status, final certificate).
 - **Single precision** (`hc.solve_nested(..., single_precision=True)`): runs each level's H2 matvec + PCG (and the |q| preconditioner's FFT) in `float`. `solve_contact` is templated (`solve_contact_impl<Real>`, float/double); `H2Operator::matvec_single`/`build_single_caches` hold float cache copies; `FourierPreconditioner::apply_single` uses a float FFT (symbol stored as float). Float's arithmetic floor is ~1e-6, so the finest tol is clamped to 2e-6 (solution matches double to rel-L2 ~2e-5, ΔArea ~4e-6). **Keep the preconditioner ON with single precision** — the float solve stalls (and returns a *wrong* answer) without it. Default `False`. Since the 2026-07 perf pass all CG scalar reductions (dots, sums, means, line-search num/den) accumulate in **double** even when Real=float, and the line-search denominator keeps the centred `(r−rmean)·t` form (the expanded `Σrt − rmean·Σt` form cancels catastrophically in float): the float solve now converges in ~the same iteration count as double (e.g. Ns=2048 fixed-band rough: 21 it, 3.4 s vs 214 stalled it, 52 s before) instead of grinding at the noise floor.
 - **Light result** (`hc.solve_nested(..., light_result=True)`): skip the `displacement`/`gap` result arrays (2 of the 3 double N-sized outputs); `pressure` + all scalars still filled. Same flag on `solve_contact(..., light=)`. Through the Python bindings, `result.displacement`/`result.gap` are `None` when light.
-- **Stagnation guard** (`solve_contact_impl`): if the complementarity error plateaus for 200 iterations (float noise floor), stop and report `converged` instead of spinning to `max_iter`. With the double accumulators (2026-07) the float path normally reaches its clamped tol directly, so this is now a safety net rather than the usual float exit path.
+- **Stagnation guard** (`solve_contact_impl`): if the merit (max of `fw_error`, `penetration_error`) plateaus for 200 iterations, the solver first spends up to three guaranteed-descent identification steps; if those do not help it stops with `status = stagnated` (**not** converged — 2026-09, A01) and returns the best checked iterate. With the double accumulators (2026-07) the float path normally reaches its clamped tol directly, so this is a safety net rather than the usual float exit path.
 - **Preallocated solve buffers (2026-07)**: the hot loop is allocation-free in steady state. `H2Operator` owns its multipole/local scratch (`Mbuf_`/`Lbuf_`, q²×nbox, lazily sized per precision — the old per-matvec `vector<VectorXd> M,L` was ~2·nbox small mallocs per apply) and exposes `matvec_into(x, y)`; `FourierPreconditioner` owns its grid/spectrum scratch and exposes `apply_into(g, contact, z)`; `solve_contact_impl` takes into-style functors (`MatVecIntoT`/`PrecondIntoT`) and reuses `u`/`r`/`z` across iterations (public `solve_contact` adapts the old by-value functors). One `H2Operator`/`FourierPreconditioner` must not be applied from two threads concurrently.
-- **mallopt in `solve_contact_nested`** (`M_MMAP_THRESHOLD`/`M_TRIM_THRESHOLD` = 128 KB): kept as a belt-and-braces guard, but with the preallocated buffers the per-iteration large-allocation traffic (and the mmap/munmap page-fault churn it caused) is gone from the steady-state loop.
+- **Allocator policy is opt-in (2026-09, A19)**: `solve_contact_nested` and the `HMatrix` constructor used to call `mallopt()` themselves, changing the *whole host process*'s malloc behaviour from inside a library call. That is now `hmc::configure_allocator()` / `aspher.configure_allocator()` (`include/runtime_policy.hpp`, `M_MMAP_THRESHOLD`/`M_TRIM_THRESHOLD` = 128 KB by default), which an application or benchmark calls once at start-up. With the preallocated buffers the per-iteration large-allocation traffic is gone from the steady-state loop anyway; call it for very large H-matrix builds or Ns ≥ 8192 nested runs.
 - **Zero-copy gap path (2026-07)**: `solve_contact_nested` and `solve_contact_impl` take `g0` as `Eigen::Ref<const ...>`; `py_solve_nested` passes an `Eigen::Map` view of the numpy buffer straight through (the finest level solves on it directly, only coarse restrictions ~N/3 are materialised). Plus `res.pressure = std::move(p)` when `Real=double` (the end-of-solve copy was the peak-RSS moment). Together −2 N-sized double arrays at peak on the double path: measured 2272→2017 MB at Ns=4096, −4.3 GiB at Ns=16384. Combined with the consuming warm start (next bullet) this made **h2-double fit at Ns=16384** (fresh-reboot retest 2026-07-10, see Validated Numbers). Beware: a caller passing a non-C-contiguous or non-float64 array still gets a forcecast temporary (correct, just not zero-copy).
-- **Active-set solve (2026-07-10, `active_set=True`)**: `hc.solve_nested(..., active_set=True, active_delta=0.05, active_halo=2, active_max_rounds=5)` — h2 backend only, needs Ns > coarsest. The finest level runs **restricted Polonsky–Keer on a candidate set** C = dilate(prolonged coarse contact) ∪ {coarse gap < δ·gap_scale}, through a **masked H2 matvec** (`H2Mask` per-box occupancy bitmaps; P2M/M2M on src boxes, M2L skips non-src sources in the CSR walk, L2L/L2P/near on tgt only; **bit-for-bit** identical to the unmasked matvec on target leaves — skipped terms are exact zeros, kept order unchanged; measured cost 1.8–2.4% of a full matvec at cand/N≈1e-2, 0.9% at Ns=16384). All CG state is **O(N_c) compressed** (slot-blocked vectors over occupied leaves, ~2–4 N_c; `matvec_masked_compressed_into`, `FourierPreconditioner::apply_into_indexed` — the FFT grid itself stays full-size); verification is one **streamed** masked-source/full-target matvec per round (per-leaf ls² tiles, no N-sized u) + gap scan; violations (gap < −tol·scale outside C) are dilated into C and the solve resumes warm-started; after `active_max_rounds` a **full-solve fallback** runs (`result.active_fallback`; its warm start seeds the violating points with p̄ — the PK error metric is blind to p=0∧g<0, an unseeded penetrating warm start "converges" instantly wrong). Keep δ generous: a tight δ can pass verification with subtly wrong boundary pressures (prototype Q2, `experiments/active_set_results.md`). The |q| preconditioner **stays on** (restriction does not improve conditioning). Equivalence: ΔArea 0, pressure rel-L2 ~1e-14 (f64) vs the standard nested solve, 1 clean round on rough surfaces; `test_active` covers masked/compressed/streamed exactness + driver equivalence + the fallback regression. `result.active_rounds`/`.active_fallback` report the driver outcome. Spec: `doc/specs/2026-07-10-active-set-solver-design.md`.
+- **Active-set solve (2026-07-10, `active_set=True`)**: `hc.solve_nested(..., active_set=True, active_delta=0.05, active_halo=2, active_max_rounds=5)` — h2 backend only, needs Ns > coarsest. The finest level runs **restricted Polonsky–Keer on a candidate set** C = dilate(prolonged coarse contact) ∪ {coarse gap < δ·gap_scale}, through a **masked H2 matvec** (`H2Mask` per-box occupancy bitmaps; P2M/M2M on src boxes, M2L skips non-src sources in the CSR walk, L2L/L2P/near on tgt only; **bit-for-bit** identical to the unmasked matvec on target leaves — skipped terms are exact zeros, kept order unchanged; measured cost 1.8–2.4% of a full matvec at cand/N≈1e-2, 0.9% at Ns=16384). All CG state is **O(N_c) compressed** (slot-blocked vectors over occupied leaves, ~2–4 N_c; `matvec_masked_compressed_into`, `FourierPreconditioner::apply_into_indexed` — the FFT grid itself stays full-size); verification is one **streamed** masked-source/full-target matvec per round (per-leaf ls² tiles, no N-sized u) that visits **every** leaf and yields the *global* minimum gradient, turning the restricted certificate into a global one via `G_global = G_restricted + P(vmin_local − vmin_global)` (a sum of two non-negative terms — 2026-09, A03). The level budget is split: the restricted solve targets `tol/2` and the outside-C penetration threshold is `tol/2·g_ref`, so the two contributions provably sum to at most `tol`. Acceptance needs **all** of: the restricted solve reached `converged`, no outside violations, and the global `fw_error`/`penetration_error` within tolerance — an empty outside-violation list alone is not a certificate; otherwise the result is `verification_failed` (reason `global_check`). Violations are dilated into C and the solve resumes warm-started; after `active_max_rounds` a **full-solve fallback** runs (`result.active_fallback`). The old p̄ seeding of violating points is gone: it existed only because the PK metric was blind to p=0∧g<0. Keep δ generous: a tight δ can pass verification with subtly wrong boundary pressures (prototype Q2, `experiments/active_set_results.md`). The |q| preconditioner **stays on** (restriction does not improve conditioning). Equivalence: ΔArea 0, pressure rel-L2 ~1e-14 (f64) vs the standard nested solve, 1 clean round on rough surfaces; `test_active` covers masked/compressed/streamed exactness + driver equivalence + the fallback regression. `result.active_rounds`/`.active_fallback` report the driver outcome. Spec: `doc/specs/2026-07-10-active-set-solver-design.md`.
 - **Consuming warm start (2026-07)**: `solve_contact_impl`'s `p_init` is now a non-const pointer that is **CONSUMED** (moved into the pressure iterate at init; caller may only reassign/destroy it afterwards) — the prolonged warm start no longer sits idle beside its own copy for the whole finest nested solve. The nested float path also frees the double `p_init` right after casting to `p0f`. Public `solve_contact` keeps its non-consuming const-pointer contract by copying (no peak cost — the copy becomes the iterate). Measured at Ns=4096 nested light: double 2017→1887 MB (−1 N-double), float 1584→1387 MB (−1 N-double −1 N-float) → at Ns=16384: −2.1 GiB double, −3.2 GiB float on top of the zero-copy gap savings.
 
 **Large-grid memory recipe** (memory-bound nodes, e.g. Ns=16384, N≈2.7×10⁸ on 32 GiB): `hc.solve_nested(Ns, gap, p_bar, coarsest=64, q=4, leaf_side=16, precond=True, single_precision=True, light_result=True)` → solve ≈ 100 B/DOF ≈ 27 GiB. Since the 2026-07 zero-copy gap + consuming-warm-start pass, **double precision also fits** at Ns=16384 with the same recipe minus `single_precision` (fresh-reboot retest: 38 it / 1168 s, peak below the 24.3 GiB surface-generation transient; float is still ~3× faster at 25 it / 396 s, same contact area 4.6×10⁻⁴). On the Python side the surface generation (meshgrid + complex FFT temporaries) is often the real hog — build it in **float32 via broadcasting** (not `np.meshgrid`), `del` temporaries, and `ctypes.CDLL("libc.so.6").malloc_trim(0)` before the solve. See `example_rough_contact.py` (its `Ns==16384` branch). The FFT preconditioner (`fourier_precond.cpp`) stores only the kx ∈ [0, Ns/2] half spectrum with the Ns² round-trip scale folded into the symbol; scratch (one real Ns×Ns + one complex (Ns/2+1)×Ns buffer, ≈2 N reals) is object-owned and reused across iterations, and the engine is pocketfft (default, BSD) or FFTW3 plans (`-DASPHER_USE_FFTW=ON`). The mask/scatter/gather passes stay OpenMP. **Run 16384 alone** — the killer is co-tenancy (any other heavy process OOMs it).
@@ -241,6 +412,42 @@ Fix: use plain `\begin{enumerate}` and `\begin{itemize}` without optional argume
 | Bipotential Uzawa Tresca (frozen cylinder) | 623 sweeps; rel p 5.7e-7; rel q 7.3e-3 (production-side floor) |
 | Cerruti closed forms vs 64² GL quadrature (6 sampled offsets) | rel err < 1e-9 (test_cerruti) |
 | Cerruti table DFT vs continuum symbol (Ns=128) | axis modes ~12-16% (truncation-bound, love calib 12.4%); diagonal modes 0.6-1.2%, xy <=0.9% |
+| **A01–A04/A15/A19 (2026-09) — certification** | |
+| Preconditioner scale sweep c=1e-6..1e6 (Ns=64 wavy, review probe) | 23 it and identical pressure at every c (rel ≤ 1.4e-15); was 208 it / false success / rel 2.13 at c=1e-3 |
+| Singleton warm start (Ns=8 parabolic, p̄=0.01, all load at a corner) | repaired in 3 it to the cold solution (rel 1.5e-16); was "converged" at it 0 with rel 2.24, penetration 0.46 |
+| Gap offset 0 / 1e3 / 1e6 (Ns=128 rough, fft, p̄=0.02) | float 14 it, rel 3.02e-6 at every offset; double 18 it, rel 3.1e-8; approach shifts by exactly the offset (was rel 1.08 at 1e6) |
+| Hertz Ns=64 dense tol=1e-10 after A01/A02 (none/fourier) | 23 / 17 it (was 24 / 16) |
+| Units/geometry scaling a,b ∈ [1e-3,1e3] (T08) | pressure ∝ b, displacement ∝ a to 2.1e-14; contact topology identical |
+| Active-set expansion with a truncated candidate set (Ns=256, δ=0, halo=0) | certifies globally in 2 rounds, no fallback, rel-L2 2.0e-7 vs the standard nested solve |
+| Restricted certificate is local (half-domain C, Ns=32) | restricted `converged` at fw 2.8e-11 while the global check sees fw 9.9e-2, pen 9.9e-2 |
+| Friction normal unload p̄ 0.01→0.0001 (Ns=32, μ=0.3, held displacement) | cone excess 1.1e-19, 0 shear-carrying open points (was 0.02362 / 76 points) |
+| Held force on the same unload | correctly infeasible, fails transactionally with the full state snapshot unchanged |
+| Tangential local KKT (force control Ns=32, 40% of gross slip) | cone 8.9e-17, proj 7.7e-7, force 1.8e-20; a load-preserving ±d perturbation keeps force 1.8e-20 but proj jumps to 1.9e-2 and is rejected |
+| Tangential preconditioner drop on stall (A15 relaxation) | proj 1.8e-2 → 8.5e-5 |
+| **A05/A06 (2026-09) — kernels and memory** | |
+| Love kernel vs 80-digit fixture (472 pts, r/h up to 1e6) | worst rel 3.5e-14 (old form: 1.9e-7 at 16384h diagonal, ~1 at 1e6h) |
+| Love self term vs 4h ln(1+√2) | rel 1.3e-16; cell corner now finite (was NaN) |
+| Love far-branch switch (r=1500·max(a,b)) branch disagreement | 3e-14 … 4e-13 |
+| Cerruti brackets vs 80-digit fixture (58 pts) | ylog 2.9e-13, xy 1.7e-16 of the local normal-kernel scale |
+| Fixture oracle cross-check (closed form vs adaptive quadrature) | 1.2e-69 (Love), 1.3e-53 (Cerruti) |
+| Compact vs full-table H2 matvec (48 configs, f64+f32) | bit-for-bit identical |
+| H2 build, full table → compact (Ns=1024/2048, q=4) | 48.7→14.3 ms (3.4×), 200.8→52.4 ms (3.8×); table 8/32 MiB → 2 KiB |
+| **A07/A09 (2026-09) — measurement and staged precision** | |
+| H2 resident memory, itemised (Ns=1024, ℓ=8, q=6) | far CSR 8.17 + couplings 2.37 + near CSR 2.13 + tree 1.00 + near stencils 0.28 + transfers 0.04 = 14.05 MiB (old report: 14.65 MiB "total", omitting ≥6.74 MiB) |
+| Borrowed vs owned coefficients at Ns=1024 | compact owns 2 KiB; kernel-constructed borrows 8 MiB (`system_resident` 22.05 MiB) |
+| Nested build share of wall time (Ns=256, h2 q=6) | 17% (build 0.036 s of 0.215 s total) |
+| Float achievable certificate (Ns=256 rough, fft) | 2e-7 converges (102 it); tighter stalls at 1.88e-7; pressure error vs double saturates at ~5e-6 either way |
+| Precision policy at Ns=256, requested 1e-8 (vs double tol=1e-12) | double 31 it / rel 8.0e-9 / 0.074 s; float 23 it / rel 5.0e-6 / **stagnated**; float_then_double 23+8 it / rel **2.1e-8** / 0.056 s |
+| float_then_double polish gain (T17 fixture, Ns=64) | pressure rel vs double 2.03e-5 → **1.76e-9** for 4 extra double iterations |
+| Harness paired A/B, active-set vs standard (rough-H0.8, 5 paired samples, corrected solver) | wall −57.8% CI[−61.7,−55.4] at Ns=512; −69.4% CI[−71.3,−64.6] at Ns=1024; peak RSS −13.5% / −29.3%; contact-area spread exactly 0 |
+| Preflight prediction vs measured RSS at Ns=16384 | 8.29/14.82/8.99/21.82 GiB predicted vs 9.12/15.99/9.31/refused measured — **−3…−9%** on the corrected solver (older records gave −20…−25%) |
+| **Ns=16384 rebaseline vs the corrected solver (2026-09-09, rev 982ef0c, rfgen study surface, 1 rep)** | see `doc/bench/2026-09-09-ns16384-rebaseline.md` |
+| h2-f32-active / h2-f64-active / h2-f32 std | 124.7 s 9.12 GiB 47 it / 314.6 s 9.31 GiB 72 it / 647.0 s 15.99 GiB 43 it; **area 4.45e-4 in all three** (2 precisions × 2 algorithms) |
+| h2-f64 standard at Ns=16384 | **refused by preflight** (27.3 GiB with headroom vs 24.5 available); marginal — the 2026-07-10 record has it fitting at a measured 24.30 GiB peak |
+| **Phase split at Ns=16384** (coarse / finest precond / finest matvec) | active f32 50% / 41% / **4%**; active f64 45% / 47% / **6%**; standard f32 11% / 8% / **78%** |
+| Active-set vs standard, float, same session | 5.19× faster (647.0→124.7 s), 1.75× less memory (15.99→9.12 GiB), identical area |
+| Single precision on the ACTIVE path | 9.12 vs 9.31 GiB = **2% memory**, but 2.5× time. The `single_precision`-as-memory-lever advice holds for the STANDARD path only |
+| Certified stopping cost (std f32, same surface, vs the 2026-07-10 record) | 43 it / 647 s vs 25 it / 396 s — the price of certifying penetration + the FW gap instead of Σp\|g\| alone; the active path more than absorbs it (124.7 s certified vs 396 s uncertified) |
 
 ---
 
@@ -302,7 +509,20 @@ info2 = solver.hmatrix_info()
 layout = solver.block_layout()  # (n_blocks, 5) array: row_begin, row_size, col_begin, col_size, is_dense
 ```
 
-`ContactResult` fields: `pressure`, `displacement`, `gap`, `approach`, `objective`, `error`, `iterations`, `converged`, `contact_fraction`, `mean_pressure`, `error_history` (opt-in), `active_rounds`/`active_fallback` (active-set driver outcome; 0/False on the standard path).
+`ContactResult` fields: `pressure`, `displacement`, `gap`, `approach`, `objective`, `error`, `iterations`, `converged`, `contact_area`, `mean_pressure`, `error_history` (opt-in), `active_rounds`/`active_fallback` (active-set driver outcome; 0/False on the standard path), plus the 2026-09 certification fields: `status`/`status_reason`, `pk_error`, `fw_gap`/`fw_error`, `load_error`, `pressure_violation`, `penetration_error`, `requested_tol`/`effective_tol`, `p_ref`/`g_ref`, `validation_scope`, `operator_error_kind`/`operator_error` (`None` when unavailable), `objective_error_bound`, `matvec_count`/`verification_matvec_count`/`precond_count`, `identification_steps`, `returned_best`.
+
+```python
+res = solver.solve(gap0, p_nominal=0.05)
+assert res.status == "converged"          # == res.converged; stagnation is a FAILURE
+res.fw_error, res.penetration_error       # the certified quantities, <= res.effective_tol
+res.load_error                            # feasibility, <= 1e-12 double / 5e-7 float
+```
+
+**Behaviour change (2026-09):** the meaning of success is stricter. Old scripts
+remain callable, but a case formerly accepted at a noise floor can now return
+`stagnated` (and `converged == False`). `error` remains the legacy PK
+diagnostic; `error < tol` is no longer sufficient — inspect `fw_error`,
+`penetration_error` and `load_error`.
 
 ### Runnable example: rough-surface contact (H2 backend)
 
@@ -334,6 +554,9 @@ fs.step(p_bar=0.05)                  # normal load step
 r = fs.step(q_bar=(0.01, 0.0), dt=1.0)          # tangential force (total)
 #   fs.step(delta_t=(1e-4, 0.0), dt=1.0)        # or displacement control
 #   fs.step(q_bar=(...), dt=1.0, T=Tfield)      # + temperature field
+#   fs.step()                                    # p_bar=None: hold the load
+#   fs.step(p_bar=0.02, tangential_hold="force") # normal change, held force
+#   fs.step(p_bar=0.0)                           # COMPLETE unloading
 print(r.n_stick, r.n_slip, r.q_mean, r.dissipation)   # partial-slip split
 qx, qy = np.asarray(r.qx), np.asarray(r.qy)            # shear tractions (Ns,Ns)
 ```
@@ -341,7 +564,10 @@ qx, qy = np.asarray(r.qx), np.asarray(r.qy)            # shear tractions (Ns,Ns)
 `FrictionStepResult`: `qx/qy/ux/uy/slip_x/slip_y/state` (grids, `None` on a
 normal-only step), `q_mean/delta_t` (2-vectors), `dissipation`, `n_stick/
 n_slip`, `converged`, `normal_converged`, `mean_pressure/contact_area/
-approach`, `normal_iters/tangential_iters/threshold_iters`. State is carried
+approach`, `normal_iters/tangential_iters/threshold_iters`, and the A15 local-KKT
+diagnostics `cone_violation/proj_residual/stick_residual/slip_residual/
+force_error/kkt_tol` plus `status_reason` and `tangential_hold_applied`.
+State is carried
 across steps (accessors `fs.pressure/.q/.u_t/.w_acc/.delta_t`); a
 non-converged step leaves it unchanged. `hc.solve_bipotential(...)` is the
 de Saxcé–Feng reference cross-check (slow; not for production).
@@ -354,6 +580,15 @@ de Saxcé–Feng reference cross-check (slow; not for production).
 - **Larger grids (Ns > 512)**: ✅ largely solved by the `backend="h2"` operator — O(N) memory (5.3 MiB at Ns=512), so Ns=1024+ is now cheap. (H-matrix path still memory-bound; see below.)
 - ~~Active-set solver (masked H2 + restricted PK)~~ ✅ done (2026-07-10, `feat/active-set`): all three milestones of `doc/plans/2026-07-10-active-set-solver.md` — masked H2 matvec (gate PASSED: 1.8–2.4% of full at cand/N≈1e-2, 0.9% at 16384), restricted PK driver on the nested cascade (`active_set=True`), O(N_c) compressed state + streamed verification. Measured Ns=4096 f64: 173→46.5 s (3.7×), solve RSS 1593→841 MB; Ns=16384 f32 same-surface A/B: 1445→308 s (4.7×), 18.3→10.9 GiB; Ns=16384 f64 runs in 12.5 GiB (tol 1e-8) where standard double OOMs; exact equivalence with the standard solve (ΔArea 0, rel-L2 ~1e-14). See the PCG section bullet + spec. **Remaining**: official fresh-reboot Ns=16384 double A/B on the rfgen study surface (user protocol; use `bench_backend_precision_study.py --backend h2 --precision double --ns 16384 --active-set`); Ns=32768 float attempt (M4 stretch).
 - **H2 follow-ups**: rectangular grids (nx≠ny); leaf/q auto-tuning; PCG convergence + timing sweep of H2 at Ns≥1024.
+- **Accuracy/efficiency roadmap (spec `doc/specs/2026-09-08-accuracy-efficiency-improvements.md`, plan `doc/plans/2026-09-08-accuracy-efficiency-validation.md`, review `doc/review_20260908.md`)**:
+  - ✅ **D1 correctness release done (2026-09-08, branch `feat/accuracy-efficiency`)** — A01 (certificates + honest statuses), A02 (scale-invariant activation + feasible identification step), A03 (global candidate verification), A04 (gap datum), A15 (friction load/hold semantics + final local KKT), A19-protective (validation, build idempotence, opt-in allocator policy). New gates: `test_certification`, `test_precision`, `test_contracts`, `tests/contact_oracle.hpp` (independent dense-QP oracle), `tests/test_certification_py.py`, plus T06/T24/T25/T26 in the existing groups.
+  - ✅ **A06 + A05 done (2026-09-08)**: compact near-offset H2 construction (bit-for-bit, 3–4× faster build, −8N bytes) and stable Love/Cerruti evaluation (worst 3.5e-14 against an 80-digit fixture, corners finite), with the offline oracle `tests/generate_kernel_reference.py` and the gate `test_kernel_stability`.
+  - ✅ **A07 + A09 done (2026-09-08/09)**: itemised memory accounting and phase timing (the old H2 report understated by ≥46%; the far interaction list turns out to dominate), and the staged precision policy delivering `float_then_double` plus the honest float tolerance contract. Gates T17/T23 in `test_contracts`.
+  - **D2 remaining**: A14 ACA storage protections (parked — the H-matrix backend is superseded by H2/FFT).
+  - ⚠️ **Measured 2026-09-09 at Ns=16384 — the D3 order is wrong.** On the active-set path (the one to run at this size) the H² matvec is **4–6%** of wall time; the full-grid |q| preconditioner is **41–47%** and the coarse cascade **45–50%**. A08 and A10 both optimise the matvec, i.e. that 4–6% — below the 10% the promotion rule demands of a new default. **A13** (sparse preconditioner + coarse space, parked in D4) targets 41–47%, and the coarse-level tolerance schedule (`coarse_tol=1e-4` uniformly over nine levels) is in no package at all and needs no new algorithm. See `doc/bench/2026-09-09-ns16384-rebaseline.md`; B04 (candidate-density sweep) would show whether a dilute or smaller-Ns workload weights it differently.
+  - **Evidence already on record before building anything**: `experiments/review_20260908_baseline.md` maps every review probe to what fixed it. Three D3 items have *negative* pre-existing evidence — the tensor M2M/L2L transfer is **slower** at production q (0.65×/0.61× at q=4/6, only 1.20× at q=8), M2L SVD compression has a flop ratio **worse than dense** at q=4 (1.175), and the displacement recurrence saved 18% of matvecs but only 4% of wall time with its precondition holding just 8 of 22 iterations. Measure before implementing.
+  - **D3 (measured optimisation)**: A08 displacement recurrence, A10 M2L compression/batching, A11 occupied traversal + screening (its safe-screening bound needs `fw_gap`, which A01 now provides), A17 vector H². A09's remaining half — staged **q** and operator-error propagation `G_S ≤ G̃ + 2Pε_u` — is still open.
+  - **D4/D5 (research)**: A12 two-phase simplex/reduced-CG, A13 sparse preconditioner, A16 semismooth Newton for friction (the path to lowering the 1e-2 tangential KKT default), A18 observables + Galerkin/periodic/multigrid.
 - ~~FFT preconditioner speed~~ ✅ done (2026-07): half-spectrum transforms on pocketfft (default, BSD) or FFTW3 plans (opt-in, GPL; ~16%/~5% faster double/float end-to-end at Ns=4096), object-owned scratch/plans. The FFT is now a small share of the iteration.
 - ~~FFT-convolution matvec backend (`backend="fft"`)~~ ✅ done (2026-07): exact zero-padded Love-kernel convolution per `doc/specs/2026-07-09-fft-convolution-backend-design.md`, plumbed into `ContactSolver` and `solve_nested`. **Measured outcome**: exactness is the headline (matches dense to ~1e-15 double / ~1.4e-7 float — no interpolation, no Gibbs); performance is modestly better than H2 at Ns ≤ 2048 (~1.5–1.6× matvec), ≈parity at Ns=4096 (measured under desktop load) — the padded transforms are bandwidth-bound, so the spec's flop-count 2–3× estimate did not materialise; H2 remains preferred for very large Ns.
 - **FFTW-engine pruned transforms (many-plan decomposition)** — the pocketfft path skips structurally-zero forward lines and unread inverse lines in the operator's padded transforms; the FFTW path still runs full 2-D plans there.

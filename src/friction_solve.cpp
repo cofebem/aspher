@@ -55,6 +55,7 @@ solve_disp(const TanMatVecInto& C, const Eigen::VectorXd& s,
     t.setZero();
     g_prev.setZero();
     Eigen::VectorXd q_best = q;
+    const Eigen::VectorXd q_start = q; // post-clamp initial iterate
     double err_best = 1e300;
 
     TangentialResult res;
@@ -62,6 +63,16 @@ solve_disp(const TanMatVecInto& C, const Eigen::VectorXd& s,
     double best_err = 1e300;
     int stall = 0;
     const int stall_limit = 200;
+    // The |k| tangential preconditioner is a large win in partial slip
+    // (271 -> 126 iterations at Ns=64) but its metric mismatches the
+    // strongly clamped near-gross-slip regime, where the iteration stalls
+    // one to three orders of magnitude above the reachable residual
+    // (measured on the A15 held-displacement relaxation: proj residual
+    // 1.2e-2 preconditioned vs 2.5e-5 unpreconditioned on the same
+    // problem). On the first stall, drop the preconditioner and continue
+    // from the best iterate instead of giving up.
+    bool use_precond = static_cast<bool>(precond);
+    bool dropped_precond = false;
 
     // two-metric projection of the direction source z (see header comment)
     auto strip_bound_radial = [&]() {
@@ -117,13 +128,39 @@ solve_disp(const TanMatVecInto& C, const Eigen::VectorXd& s,
         }
         if (res.error < tol) {
             res.converged = true;
+            res.status = SolveStatus::converged;
             break;
         }
         if (res.error < best_err * (1.0 - 1e-4)) {
             best_err = res.error;
             stall = 0;
-        } else if (++stall >= stall_limit) {
-            res.converged = true;
+        } else if (++stall >= (dropped_precond ? 5 * stall_limit : stall_limit)) {
+            // the unpreconditioned restart gets a generous window: it resumes
+            // from a drifted iterate and the near-gross-slip angular problem
+            // converges slowly but steadily (measured 1.8e-2 -> 3.4e-4)
+            if (use_precond && !dropped_precond) {
+                use_precond = false;
+                dropped_precond = true;
+                // restart from the ORIGINAL iterate, not from the drifted
+                // preconditioned best: resuming from the drift converged an
+                // order of magnitude worse on the measured case (1.3e-3 vs
+                // 3.4e-4). q_best/err_best keep tracking across both phases,
+                // so the returned state is the better of the two.
+                q = q_start;
+                stall = 0;
+                best_err = 1e300;
+                delta_conj = 0.0;     // restart conjugacy in the new metric
+                G_old = 1.0;
+                t.setZero();
+                g_prev.setZero();
+                continue;
+            }
+            // A15 §10.2: no stall-success exception. The best iterate is
+            // still returned, but the caller learns the metric floor was hit
+            // rather than the tolerance met; the final KKT check decides.
+            res.status = SolveStatus::stagnated;
+            res.status_reason = dropped_precond ? "stall (unpreconditioned)"
+                                                : "stall";
             break;
         }
 
@@ -135,7 +172,7 @@ solve_disp(const TanMatVecInto& C, const Eigen::VectorXd& s,
         double num = 0.0, den = 0.0;
         for (int attempt = 0;; ++attempt) {
             if (attempt == 0) {
-                if (precond) {
+                if (use_precond) {
                     precond(g, active, /*remove_mean=*/false, z);
                 } else {
 #pragma omp parallel for schedule(static)
@@ -261,6 +298,77 @@ solve_disp(const TanMatVecInto& C, const Eigen::VectorXd& s,
     return res;
 }
 
+// ── final local KKT check on a candidate tangential state (A15 §10.2) ──────
+// Everything is recomputed from scratch on res.q: cone feasibility, stick and
+// slip residuals, the fixed-threshold projection residual
+//   R_rho = q - Pi_{|q|<=s}[q - rho (C q + u_hist - E delta)]
+// and the force balance. rho is dimensionally a traction per displacement and
+// is fixed by the operator's own compliance scale (rho = max(s) / max|C(s,0)|),
+// NOT by any preconditioner scaling and never shrunk to make a residual look
+// small.
+void check_tangential_kkt(const TanMatVecInto& C, const Eigen::VectorXd& s,
+                          const Eigen::Vector2d& delta_t, bool force_control,
+                          const Eigen::Vector2d& target,
+                          const Eigen::VectorXd* u_hist,
+                          TangentialResult& res) {
+    const int N = static_cast<int>(s.size());
+    if (static_cast<int>(res.q.size()) != 2 * N)
+        throw std::invalid_argument("check_tangential_kkt: q size");
+    Eigen::VectorXd qs = Eigen::VectorXd::Zero(2 * N), us(2 * N);
+    qs.head(N) = s;
+    C(qs, us);
+    const double w_ref = std::max(us.head(N).cwiseAbs().maxCoeff(), 1e-300);
+    const double s_ref = std::max(s.maxCoeff(), 1e-300);
+    const double rho = s_ref / w_ref;
+    Eigen::VectorXd u(2 * N);
+    C(res.q, u);
+
+    double cone = 0.0, stick = 0.0, slip = 0.0, proj = 0.0;
+    double qsx = 0.0, qsy = 0.0;
+#pragma omp parallel for schedule(static) reduction(max : cone, stick, slip, proj)     reduction(+ : qsx, qsy)
+    for (int i = 0; i < N; ++i) {
+        const double qx = res.q(i), qy = res.q(N + i);
+        qsx += qx;
+        qsy += qy;
+        const double si = s(i);
+        const double qn = std::hypot(qx, qy);
+        if (si <= 0.0) { // open: q must be exactly zero
+            cone = std::max(cone, qn / s_ref);
+            continue;
+        }
+        cone = std::max(cone, (qn - si) / s_ref);
+        const double hx = u_hist ? (*u_hist)(i) : 0.0;
+        const double hy = u_hist ? (*u_hist)(N + i) : 0.0;
+        const double gx = u(i) + hx - delta_t(0);
+        const double gy = u(N + i) + hy - delta_t(1);
+        // projection residual (dimensionally a traction)
+        const double zx = qx - rho * gx, zy = qy - rho * gy;
+        const double zn = std::hypot(zx, zy);
+        const double f = (zn > si && zn > 0.0) ? si / zn : 1.0;
+        proj = std::max(proj, std::hypot(qx - f * zx, qy - f * zy) / s_ref);
+        // slip velocity w = -g
+        const double wx = -gx, wy = -gy;
+        if (interior_point(qx, qy, si)) {
+            stick = std::max(stick, std::hypot(wx, wy) / w_ref);
+        } else {
+            const double qhx = qx / qn, qhy = qy / qn;
+            const double wpar = wx * qhx + wy * qhy;
+            const double wperp = std::hypot(wx - wpar * qhx, wy - wpar * qhy);
+            slip = std::max(slip, (wperp + std::max(0.0, -wpar)) / w_ref);
+        }
+    }
+    res.cone_violation = std::max(0.0, cone);
+    res.stick_residual = stick;
+    res.slip_residual = slip;
+    res.proj_residual = proj;
+    res.rho = rho;
+    res.s_ref = s_ref;
+    res.w_ref = w_ref;
+    const Eigen::Vector2d qm(qsx / N, qsy / N);
+    res.force_error =
+        force_control ? (qm - target).norm() / s_ref : 0.0;
+}
+
 // ── public entry: displacement control directly; force control by an outer
 // multiplier (Newton/Broyden) iteration on the rigid shift ─────────────────
 TangentialResult solve_tangential(const TanMatVecInto& C,
@@ -273,7 +381,8 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
                                   const Eigen::VectorXd* u_hist,
                                   double g_floor,
                                   Eigen::Matrix2d* K_io,
-                                  const Eigen::Vector2d* delta_init) {
+                                  const Eigen::Vector2d* delta_init,
+                                  double kkt_tol) {
     const int N = static_cast<int>(s.size());
     if (N == 0) throw std::invalid_argument("solve_tangential: empty s");
     if (s.minCoeff() < 0.0)
@@ -289,9 +398,54 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
     if (nA == 0)
         throw std::invalid_argument("solve_tangential: s == 0 everywhere");
 
-    if (!force_control)
-        return solve_disp(C, s, active, Stotal, target, tol, max_iter,
-                          use_pr, precond, q_init, u_hist, g_floor);
+    // Final acceptance (A15 §10.2): local KKT recomputed on the RETURNED
+    // state after every correction. The iteration metric alone — and, under
+    // force control, an exact total force — cannot establish local
+    // equilibrium, and the stall exit is not success.
+    // Default local-KKT acceptance. This is NOT derived from `tol` (the
+    // iteration metric and the projection residual have different
+    // normalisations); it is the tangential solver's measured floor on the
+    // hardest supported regime — near-gross-slip with rotating directions,
+    // where the uniform-threshold Tresca reference sits at 7.3e-3 (test_uzawa)
+    // and force control at ~1e-3..1e-4. Partial-slip problems land three to
+    // five orders below it. Callers who need a stricter contract pass
+    // kkt_tol explicitly and get an honest failure when it is not met;
+    // lowering the DEFAULT needs the A16 semismooth-Newton branch, not a
+    // looser residual.
+    const double kt = (kkt_tol > 0.0) ? kkt_tol : 1e-2;
+    auto finish = [&](TangentialResult& r, const Eigen::Vector2d& delta_used) {
+        check_tangential_kkt(C, s, delta_used, force_control, target, u_hist, r);
+        const bool kkt_ok = r.cone_violation <= 1e-9 &&
+                            r.proj_residual <= kt &&
+                            r.force_error <= kt && std::isfinite(r.proj_residual);
+        if (!kkt_ok) {
+            if (r.status == SolveStatus::converged)
+                r.status = SolveStatus::verification_failed;
+            r.status_reason = r.status_reason.empty() ? "local_kkt" : r.status_reason;
+        }
+        r.converged = kkt_ok && (r.status == SolveStatus::converged ||
+                                 r.status == SolveStatus::stagnated);
+        r.kkt_tol = kt;
+        if (r.converged) {
+            r.status = SolveStatus::converged;
+            r.status_reason.clear();
+            // Visibility, not a failure: a state that passes but sits within a
+            // decade of its own acceptance threshold is riding the solver's
+            // floor, and the caller should read proj_residual rather than
+            // trust `converged` alone. Scaling the notice to kkt_tol keeps it
+            // meaningful when the caller tightens the contract.
+            if (r.proj_residual > 0.1 * kt)
+                r.status_reason = "local_kkt_near_tolerance";
+        }
+    };
+
+    if (!force_control) {
+        TangentialResult r = solve_disp(C, s, active, Stotal, target, tol,
+                                        max_iter, use_pr, precond, q_init,
+                                        u_hist, g_floor);
+        finish(r, target);
+        return r;
+    }
 
     // ── force control ──
     // δ_t is the Lagrange multiplier of mean(q) = q̄: solve F(δ) = 0 with
@@ -320,7 +474,8 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
     if (target.norm() == 0.0 && !u_hist && !q_init) { // trivial: q = 0, δ = 0
         res = solve_disp(C, s, active, Stotal, Eigen::Vector2d::Zero(),
                          tol, 1, use_pr, precond, nullptr, u_hist, g_floor);
-        res.converged = true;
+        res.status = SolveStatus::converged;
+        finish(res, Eigen::Vector2d::Zero());
         return res;
     }
 
@@ -517,11 +672,17 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
         res.n_slip = nsl;
         res.n_open = nop;
     }
-    // res.error still describes the pre-correction iterate (the KKT-optimal one); the correction's KKT perturbation is O((N/ni)·F_best).
+    // res.error still describes the pre-correction iterate; the local KKT
+    // fields below are recomputed on the corrected q, which is what the
+    // acceptance decision uses.
     res.delta_t = delta_best;
-    res.converged = best_converged && F_best <= 1e-3 * target_scale &&
-                    (res.q_mean - target).norm() <= 1e-10 * target_scale;
     res.iterations = total_it;
+    res.status = (best_converged && F_best <= 1e-3 * target_scale)
+                     ? SolveStatus::converged
+                     : SolveStatus::stagnated;
+    if (res.status != SolveStatus::converged)
+        res.status_reason = "outer force iteration";
+    finish(res, delta_best);
     if (K_io) *K_io = K;
     return res;
 }

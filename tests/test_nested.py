@@ -35,19 +35,48 @@ def test_solve_nested():
         assert relL2 < 1e-4, relL2
         assert nest.iterations <= ref.iterations
 
-        # single precision + light result: converges and matches to float accuracy
+        # A09 precision policy. Float cannot drive the certificate to the
+        # default 1e-8, so a float-only solve that is ASKED for it now reports
+        # an honest `stagnated`/`precision_limit` instead of a relaxed
+        # success. This is the documented behaviour change.
         sp = hc.solve_nested(grid_size=Ns, gap=g0, p_nominal=P_BAR, coarsest=64,
                              q=6, single_precision=True, light_result=True)
-        d_area_sp = abs(sp.contact_area - ref.contact_area)
-        relL2_sp = (np.linalg.norm(np.asarray(sp.pressure) - np.asarray(ref.pressure))
+        print(f"Ns={Ns}: float-only asked for {sp.requested_tol:.0e} -> "
+              f"{sp.status}/{sp.status_reason} at {sp.effective_tol:.0e}")
+        assert not sp.converged
+        assert sp.status == "stagnated" and sp.status_reason == "precision_limit"
+        assert sp.requested_tol < sp.effective_tol
+
+        # ... and succeeds when the caller explicitly accepts the float floor
+        spr = hc.solve_nested(grid_size=Ns, gap=g0, p_nominal=P_BAR, coarsest=64,
+                              q=6, single_precision=True, light_result=True,
+                              allow_tolerance_relaxation=True)
+        d_area_sp = abs(spr.contact_area - ref.contact_area)
+        relL2_sp = (np.linalg.norm(np.asarray(spr.pressure) - np.asarray(ref.pressure))
                     / np.linalg.norm(np.asarray(ref.pressure)))
-        print(f"Ns={Ns}: single+light={sp.iterations} it, conv={sp.converged}, "
+        print(f"Ns={Ns}: float+relaxed={spr.iterations} it, conv={spr.converged}, "
               f"dArea={d_area_sp:.2e}, relL2={relL2_sp:.1e}, "
-              f"disp_none={sp.displacement is None}")
-        assert sp.converged           # reaches the float floor via stagnation guard
+              f"disp_none={spr.displacement is None}")
+        assert spr.converged
         assert d_area_sp < 2e-3, d_area_sp
         assert relL2_sp < 1e-3, relL2_sp
-        assert sp.displacement is None  # light_result: displacement not stored
+        assert spr.displacement is None  # light_result: displacement not stored
+
+        # float_then_double: identify in float, polish in double. Meets the
+        # requested tolerance AND is markedly more accurate than float alone.
+        ftd = hc.solve_nested(grid_size=Ns, gap=g0, p_nominal=P_BAR, coarsest=64,
+                              q=6, precision="float_then_double")
+        relL2_ftd = (np.linalg.norm(np.asarray(ftd.pressure) - np.asarray(ref.pressure))
+                     / np.linalg.norm(np.asarray(ref.pressure)))
+        names = [st["name"] for st in ftd.stage_stats]
+        print(f"Ns={Ns}: float_then_double={ftd.iterations} it, "
+              f"relL2={relL2_ftd:.1e}, stages={names[-2:]}")
+        assert ftd.converged and ftd.status == "converged"
+        assert ftd.fw_error <= ftd.requested_tol
+        assert relL2_ftd < relL2_sp   # strictly better than the float floor
+        assert names[-1].startswith("polish:")
+        assert ftd.stage_stats[-2]["precision"] == "float"
+        assert ftd.stage_stats[-1]["precision"] == "double"
 
         # opt-in convergence history: off by default, populated on request
         assert nest.error_history.size == 0

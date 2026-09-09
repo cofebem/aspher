@@ -62,6 +62,7 @@ def contact_mask(Ns):
     t0 = time.perf_counter()
     r = hc.solve_nested(grid_size=Ns, gap=gap, p_nominal=0.002, coarsest=64,
                         q=4, leaf_side=16, single_precision=True,
+                        allow_tolerance_relaxation=True,
                         light_result=True)
     m = np.asarray(r.pressure) > 0
     print(f"  solve Ns={Ns}: {time.perf_counter()-t0:.1f} s, "

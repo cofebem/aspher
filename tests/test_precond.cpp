@@ -64,8 +64,11 @@ int main() {
         out = (S * v.cast<double>()).cast<float>();
     };
     Eigen::VectorXf g0f = g0.cast<float>();
-    auto r3 = hmc::solve_contact_impl<float>(opf, g0f, float(p_bar), 5e-6f, 5000,
-                                             true, hmc::PrecondIntoT<float>{},
+    hmc::SolveOptions fopt;
+    fopt.tol = 5e-6;
+    fopt.max_iter = 5000;
+    auto r3 = hmc::solve_contact_impl<float>(opf, g0f, float(p_bar), fopt,
+                                             hmc::PrecondIntoT<float>{},
                                              nullptr);
     CHECK(r3.converged);
     const double relpf = (r3.pressure - r0.pressure).norm() / r0.pressure.norm();

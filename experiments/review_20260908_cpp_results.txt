@@ -1,0 +1,9 @@
+threads=4
+table_free ns=1024 table=0.049794 build=0.026241 compact_build=0.025073 rel=0.000e+00 equal=1 table_bytes=8388608 compact_bytes=2048
+h2_memory reported=15365952 omitted_metadata_lower_bound=7072776
+transfer q=4 dense=0.000926 tensor=0.001416 speedup=0.654 rel=1.853e-16
+transfer q=6 dense=0.003520 tensor=0.005782 speedup=0.609 rel=2.479e-16
+transfer q=8 dense=0.008434 tensor=0.007020 speedup=1.202 rel=3.113e-16
+precond_scale factor=1e+00 it=22 converged=1 error=2.715e-11 fw=1.126e-10 pressure_rel=0.000e+00
+precond_scale factor=1e-03 it=208 converged=1 error=1.961e-01 fw=4.452e-01 pressure_rel=2.133e+00
+precond_scale factor=1e+03 it=22 converged=1 error=2.715e-11 fw=1.128e-10 pressure_rel=2.460e-12

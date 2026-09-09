@@ -86,7 +86,13 @@ static int test_hertz_solve() {
     std::printf("Hertz dense: %d it, Ac/A %.6f | fft: %d it, Ac/A %.6f\n",
                 rd.iterations, rd.contact_fraction, rf.iterations,
                 rf.contact_fraction);
-    CHECK(rd.iterations == rf.iterations);
+    // The two operators agree to ~1e-15, but the stopping iterate depends on
+    // OpenMP reduction order, so the counts can differ by one near the
+    // tolerance crossing; equality is not a property of the algorithm
+    // (validation plan §7: exact iteration counts are never an acceptance
+    // criterion). The discriminating checks are the contact set and the
+    // pressure difference below.
+    CHECK(std::abs(rd.iterations - rf.iterations) <= 1);
     CHECK(rd.contact_fraction == rf.contact_fraction);
     // PCG stops when the complementarity error crosses tol, so two operators
     // identical to machine roundoff still yield stopping iterates that agree

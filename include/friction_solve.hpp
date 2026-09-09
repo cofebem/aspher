@@ -1,8 +1,11 @@
 #pragma once
 
+#include "contact_solver.hpp" // SolveStatus
+
 #include <Eigen/Dense>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace hmc {
@@ -18,6 +21,24 @@ struct TangentialResult {
     bool converged = false;
     int n_stick = 0, n_slip = 0, n_open = 0;
     std::vector<std::uint8_t> state; // 0 open (s == 0), 1 stick, 2 slip
+
+    // ── A15 §10.2: local KKT diagnostics recomputed on the RETURNED q, after
+    // every threshold update and after the terminal exact-load correction.
+    // A tiny total-force residual cannot establish local equilibrium, and the
+    // old res.error described the pre-correction iterate.
+    SolveStatus status = SolveStatus::max_iterations;
+    // Why a solve failed — or, on success, "local_kkt_near_tolerance" when
+    // proj_residual is within a decade of kkt_tol (the state is accepted but
+    // is riding the solver's floor; read proj_residual).
+    std::string status_reason;
+    double cone_violation = 0.0;  // max(0, |q_i| - s_i) / s_ref
+    double stick_residual = 0.0;  // max |w_i| over stick / w_ref
+    double slip_residual = 0.0;   // max(|w_perp|, (-w.qhat)+) over slip / w_ref
+    double proj_residual = 0.0;   // ||q - proj[q - rho g]||_inf / s_ref
+    double force_error = 0.0;     // |q_mean - q_bar| / s_ref (force control)
+    double rho = 0.0;             // traction/displacement scale used above
+    double s_ref = 0.0, w_ref = 0.0;
+    double kkt_tol = 0.0;         // acceptance threshold actually applied
 };
 
 using TanMatVecInto =
@@ -73,6 +94,18 @@ TangentialResult solve_tangential(const TanMatVecInto& C,
                                   const Eigen::VectorXd* u_hist = nullptr,
                                   double g_floor = 0.0,
                                   Eigen::Matrix2d* K_io = nullptr,
-                                  const Eigen::Vector2d* delta_init = nullptr);
+                                  const Eigen::Vector2d* delta_init = nullptr,
+                                  double kkt_tol = 0.0);
+
+// Recompute every local KKT quantity of a candidate tangential state from
+// scratch (two operator applies: one for the displacement scale, one for
+// u = C q). Exposed so tests and drivers can check a state they did not
+// produce. Fills the diagnostic fields of `res` and leaves `status`/
+// `converged` untouched.
+void check_tangential_kkt(const TanMatVecInto& C, const Eigen::VectorXd& s,
+                          const Eigen::Vector2d& delta_t, bool force_control,
+                          const Eigen::Vector2d& target,
+                          const Eigen::VectorXd* u_hist,
+                          TangentialResult& res);
 
 } // namespace hmc

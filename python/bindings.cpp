@@ -15,6 +15,7 @@
 #include "h2_operator.hpp"
 #include "hmatrix.hpp"
 #include "nested_solve.hpp"
+#include "runtime_policy.hpp"
 #include "tangential_operator.hpp"
 
 #include <cstring>
@@ -115,23 +116,39 @@ public:
                     double aca_tol, int leaf_size, bool use_hmatrix,
                     bool use_acagp, double central_fraction, double inline_svd_tol,
                     std::string backend, int q, int near_radius, int h2_leaf_side)
-        : kernel_(grid_size, domain_size, E_star) {
+        : Ns_(grid_size) {
+        if (grid_size <= 0)
+            throw std::invalid_argument("grid_size must be positive");
+        if (!(domain_size > 0.0))
+            throw std::invalid_argument("domain_size must be positive");
+        if (!(E_star > 0.0))
+            throw std::invalid_argument("E_star must be positive");
         if (backend.empty()) backend = use_hmatrix ? "hmatrix" : "dense";
         backend_ = backend;
+        // A06: only the backends that actually consume the Ns x Ns Love table
+        // build it. The H2 operator never touches it after build(), so it goes
+        // through the compact near-offset path (8*N bytes saved).
         if (backend_ == "h2") {
-            h2_ = std::make_unique<hmc::H2Operator>(
-                kernel_, hmc::H2Params{h2_leaf_side, q, near_radius});
+            h2_ = hmc::make_boussinesq_h2(
+                grid_size, domain_size, E_star,
+                hmc::H2Params{h2_leaf_side, q, near_radius});
             h2_->build();
         } else if (backend_ == "fft") {
-            fft_ = std::make_unique<hmc::FFTOperator>(kernel_);
+            kernel_ = std::make_unique<hmc::BoussinesqKernel>(grid_size,
+                                                              domain_size, E_star);
+            fft_ = std::make_unique<hmc::FFTOperator>(*kernel_);
             fft_->build();
         } else if (backend_ == "hmatrix") {
+            kernel_ = std::make_unique<hmc::BoussinesqKernel>(grid_size,
+                                                              domain_size, E_star);
             tree_ = std::make_unique<hmc::ClusterTree>(grid_size, leaf_size);
             hmat_ = std::make_unique<hmc::HMatrix>(
-                kernel_, *tree_, eta, aca_tol, use_acagp, central_fraction,
+                *kernel_, *tree_, eta, aca_tol, use_acagp, central_fraction,
                 inline_svd_tol);
         } else if (backend_ == "dense") {
-            dense_ = kernel_.assemble_dense();
+            kernel_ = std::make_unique<hmc::BoussinesqKernel>(grid_size,
+                                                              domain_size, E_star);
+            dense_ = kernel_->assemble_dense();
         } else {
             throw std::invalid_argument("unknown backend: " + backend_ +
                                         " (expected dense, hmatrix, h2, or fft)");
@@ -148,13 +165,13 @@ public:
     py::array_t<double>
     matvec(const py::array_t<double, py::array::c_style | py::array::forcecast>& p)
         const {
-        Eigen::VectorXd v = to_vector(p, kernel_.size());
+        Eigen::VectorXd v = to_vector(p, (Ns_ * Ns_));
         Eigen::VectorXd u;
         {
             py::gil_scoped_release release;
             u = apply(v);
         }
-        py::array_t<double> out(kernel_.size());
+        py::array_t<double> out((Ns_ * Ns_));
         std::memcpy(out.mutable_data(), u.data(), sizeof(double) * u.size());
         return out;
     }
@@ -164,12 +181,12 @@ public:
                    double p_nominal, double tol, int max_iter,
                    bool use_pr, const std::string& precond,
                    const py::object& p_init) const {
-        Eigen::VectorXd g0 = to_vector(gap, kernel_.size());
+        Eigen::VectorXd g0 = to_vector(gap, (Ns_ * Ns_));
 
         hmc::Precond pc;
         if (precond == "fourier") {
             auto fp = std::make_shared<hmc::FourierPreconditioner>(
-                kernel_.grid_size());
+                Ns_);
             pc = [fp](const Eigen::VectorXd& g,
                       const std::vector<std::uint8_t>& contact) {
                 return fp->apply(g, contact);
@@ -183,12 +200,12 @@ public:
         if (!p_init.is_none()) {
             p0 = to_vector(p_init.cast<py::array_t<double, py::array::c_style |
                                                           py::array::forcecast>>(),
-                           kernel_.size());
+                           (Ns_ * Ns_));
             p0ptr = &p0;
         }
 
         PyResult out;
-        out.Ns = kernel_.grid_size();
+        out.Ns = Ns_;
         {
             py::gil_scoped_release release;
             auto op = [this](const Eigen::VectorXd& v) { return apply(v); };
@@ -242,6 +259,26 @@ public:
             d["n_leaves"] = s.n_leaves;
             d["nlevels"] = s.nlevels;
             d["bytes"] = s.bytes_total;
+            // A07: itemised, honest accounting. `bytes` above is the legacy
+            // summary; these separate what is really allocated from what is
+            // merely predicted, and owned coefficients from borrowed ones.
+            const auto mem = h2_->memory();
+            d["mem_kernel_owned"] = static_cast<long long>(mem.kernel_owned);
+            d["mem_kernel_borrowed"] = static_cast<long long>(mem.kernel_borrowed);
+            d["mem_tree"] = static_cast<long long>(mem.tree);
+            d["mem_leaves"] = static_cast<long long>(mem.leaves);
+            d["mem_far_csr"] = static_cast<long long>(mem.far_csr);
+            d["mem_near_csr"] = static_cast<long long>(mem.near_csr);
+            d["mem_transfers"] = static_cast<long long>(mem.transfers);
+            d["mem_couplings"] = static_cast<long long>(mem.couplings);
+            d["mem_near_stencils"] = static_cast<long long>(mem.near_stencils);
+            d["mem_single_caches"] = static_cast<long long>(mem.single_caches);
+            d["mem_scratch"] = static_cast<long long>(mem.scratch);
+            d["mem_resident"] = static_cast<long long>(mem.resident);
+            d["mem_system_resident"] = static_cast<long long>(mem.system_resident());
+            d["mem_estimated_next_apply"] =
+                static_cast<long long>(mem.estimated_next_apply_bytes);
+            d["near_table_extent"] = s.near_table_extent;
             d["bytes_coupling"] = static_cast<long long>(s.bytes_coupling);
             d["bytes_near"] = static_cast<long long>(s.bytes_near);
             d["bytes_buffers"] = static_cast<long long>(s.bytes_buffers);
@@ -264,9 +301,9 @@ public:
         }
         if (backend_ != "hmatrix") {
             d["dense"] = true;
-            d["bytes"] = 8LL * kernel_.size() * kernel_.size();
-            py::print("dense influence matrix,", kernel_.size(), "x",
-                      kernel_.size());
+            d["bytes"] = 8LL * Ns_ * Ns_ * Ns_ * Ns_;
+            py::print("dense influence matrix,", (Ns_ * Ns_), "x",
+                      (Ns_ * Ns_));
             return d;
         }
         const auto s = hmat_->info();
@@ -282,7 +319,8 @@ public:
     }
 
 private:
-    hmc::BoussinesqKernel kernel_;
+    int Ns_ = 0;
+    std::unique_ptr<hmc::BoussinesqKernel> kernel_; // only for fft/hmatrix/dense
     std::string backend_;
     std::unique_ptr<hmc::ClusterTree> tree_;
     std::unique_ptr<hmc::HMatrix> hmat_;
@@ -298,7 +336,8 @@ PyResult py_solve_nested(
     const py::array_t<double, py::array::c_style | py::array::forcecast>& gap,
     double p_nominal, double domain_size, double E_star, int coarsest, int q,
     int leaf_side, bool precond, double tol, double coarse_tol, int max_iter,
-    bool use_pr, bool single_precision, bool light_result,
+    bool use_pr, bool single_precision, const std::string& precision,
+    double float_floor, bool allow_tolerance_relaxation, bool light_result,
     const std::string& backend, bool record_error_history, bool active_set,
     double active_delta, int active_halo, int active_max_rounds) {
     const py::ssize_t expected =
@@ -312,9 +351,26 @@ PyResult py_solve_nested(
     // alive across the GIL-released call; forcecast only materialises a
     // temporary when the input is not already a C-contiguous float64 array.
     Eigen::Map<const Eigen::VectorXd> g0(gap.data(), expected);
-    hmc::NestedParams np{coarsest, q, leaf_side, precond, coarse_tol,
-                         single_precision, light_result, backend,
-                         record_error_history};
+    hmc::NestedParams np;
+    np.coarsest = coarsest;
+    np.q = q;
+    np.leaf_side = leaf_side;
+    np.precond = precond;
+    np.coarse_tol = coarse_tol;
+    np.single_precision = single_precision;
+    if (precision == "double") np.precision = hmc::NestedParams::Precision::double_only;
+    else if (precision == "float") np.precision = hmc::NestedParams::Precision::float_only;
+    else if (precision == "float_then_double")
+        np.precision = hmc::NestedParams::Precision::float_then_double;
+    else if (!precision.empty())
+        throw std::invalid_argument(
+            "precision must be 'double', 'float', 'float_then_double' or '' "
+            "(defer to single_precision)");
+    np.float_floor = float_floor;
+    np.allow_tolerance_relaxation = allow_tolerance_relaxation;
+    np.light_result = light_result;
+    np.backend = backend;
+    np.record_error_history = record_error_history;
     np.active_set = active_set;
     np.active_delta = active_delta;
     np.active_halo = active_halo;
@@ -356,18 +412,50 @@ public:
     }
     void reset() { drv_->reset(); }
 
-    // Keyword-arg step: exactly one of p_bar / (q_bar or delta_t) drives the
-    // tangential problem; p_bar>0 (also) runs the normal solve.
-    PyStepResult step(double p_bar, const py::object& q_bar,
-                      const py::object& delta_t, double dt,
+    // Keyword-arg step. Normal control (spec A15 §10.1):
+    //   p_bar=None -> hold the current normal load (no normal solve)
+    //   p_bar=0    -> COMPLETE normal unloading (separation)
+    //   p_bar>0    -> solve for that mean pressure
+    //   p_bar<0    -> invalid, except the documented legacy -1 sentinel
+    // A tangential solve runs when q_bar or delta_t is given; on a
+    // normal-only step the tangential boundary condition named by
+    // tangential_hold is re-solved under the new thresholds.
+    PyStepResult step(const py::object& p_bar, const py::object& q_bar,
+                      const py::object& delta_t,
+                      const std::string& tangential_hold, double dt,
                       const py::object& T, double tol_normal,
-                      double tol_tangential, int max_iter,
+                      double tol_tangential, double tol_kkt, int max_iter,
                       int max_threshold_iter, double threshold_rtol) {
         hmc::FrictionStepSpec spec;
-        spec.p_bar = p_bar;
+        if (p_bar.is_none()) {
+            spec.has_p_bar = false;
+            spec.p_bar = -1.0;
+        } else {
+            const double pb = p_bar.cast<double>();
+            if (pb == -1.0) { // documented legacy sentinel
+                spec.has_p_bar = false;
+                spec.p_bar = -1.0;
+            } else if (pb < 0.0) {
+                throw std::invalid_argument(
+                    "FrictionSolver.step: p_bar must be >= 0 (0 = complete "
+                    "normal unloading) or None to hold the current load");
+            } else {
+                spec.has_p_bar = true;
+                spec.p_bar = pb;
+            }
+        }
+        if (tangential_hold == "displacement")
+            spec.tangential_hold = hmc::TangentialHold::displacement;
+        else if (tangential_hold == "force")
+            spec.tangential_hold = hmc::TangentialHold::force;
+        else
+            throw std::invalid_argument(
+                "FrictionSolver.step: tangential_hold must be 'displacement' "
+                "or 'force'");
         spec.dt = dt;
         spec.tol_normal = tol_normal;
         spec.tol_tangential = tol_tangential;
+        spec.tol_kkt = tol_kkt;
         spec.max_iter = max_iter;
         spec.max_threshold_iter = max_threshold_iter;
         spec.threshold_rtol = threshold_rtol;
@@ -404,6 +492,8 @@ public:
             // step and is restored here (GIL held again on scope exit).
             py::gil_scoped_release release;
             out.r = drv_->step(spec);
+            // a held tangential relaxation also produces fresh displacements
+            if (out.r.tangential_hold_applied) out.tangential = true;
             if (out.tangential && out.r.converged) {
                 out.u_t = drv_->u_t();
                 out.delta_total = drv_->delta_t();
@@ -535,12 +625,128 @@ PYBIND11_MODULE(aspher, m) {
         .def_property_readonly(
             "active_fallback",
             [](const PyResult& s) { return s.r.active_fallback; })
+        // ── independently recomputed termination diagnostics (spec A01) ────
+        .def_property_readonly(
+            "status",
+            [](const PyResult& s) { return std::string(hmc::to_string(s.r.status)); },
+            "Termination state: 'converged', 'stagnated', 'max_iterations', "
+            "'nonpositive_curvature', 'nonfinite', 'verification_failed' or "
+            "'resource_limit'. `converged` is exactly status == 'converged'.")
+        .def_property_readonly(
+            "status_reason", [](const PyResult& s) { return s.r.status_reason; })
+        .def_property_readonly("pk_error",
+                               [](const PyResult& s) { return s.r.pk_error; })
+        .def_property_readonly("fw_gap",
+                               [](const PyResult& s) { return s.r.fw_gap; },
+                               "Frank-Wolfe certificate G = sum_i p_i (v_i - min v); "
+                               "0 <= f(p) - f(p*) <= G for the exact SPD operator.")
+        .def_property_readonly("fw_error",
+                               [](const PyResult& s) { return s.r.fw_error; },
+                               "G / (P g_ref): the normalised certificate the "
+                               "stopping rule tests.")
+        .def_property_readonly("load_error",
+                               [](const PyResult& s) { return s.r.load_error; })
+        .def_property_readonly(
+            "pressure_violation",
+            [](const PyResult& s) { return s.r.pressure_violation; })
+        .def_property_readonly(
+            "penetration_error",
+            [](const PyResult& s) { return s.r.penetration_error; })
+        .def_property_readonly("requested_tol",
+                               [](const PyResult& s) { return s.r.requested_tol; })
+        .def_property_readonly("effective_tol",
+                               [](const PyResult& s) { return s.r.effective_tol; })
+        .def_property_readonly("p_ref", [](const PyResult& s) { return s.r.p_ref; })
+        .def_property_readonly("g_ref", [](const PyResult& s) { return s.r.g_ref; })
+        .def_property_readonly(
+            "validation_scope",
+            [](const PyResult& s) { return s.r.validation_scope; })
+        .def_property_readonly(
+            "operator_error_kind",
+            [](const PyResult& s) { return s.r.operator_error_kind; })
+        .def_property_readonly(
+            "operator_error",
+            [](const PyResult& s) -> py::object {
+                if (!s.r.operator_error_valid) return py::none();
+                return py::float_(s.r.operator_error);
+            })
+        .def_property_readonly(
+            "objective_error_bound",
+            [](const PyResult& s) -> py::object {
+                if (!s.r.objective_error_bound_valid) return py::none();
+                return py::float_(s.r.objective_error_bound);
+            })
+        .def_property_readonly("matvec_count",
+                               [](const PyResult& s) { return s.r.matvec_count; })
+        .def_property_readonly(
+            "verification_matvec_count",
+            [](const PyResult& s) { return s.r.verification_matvec_count; })
+        .def_property_readonly("precond_count",
+                               [](const PyResult& s) { return s.r.precond_count; })
+        .def_property_readonly(
+            "identification_steps",
+            [](const PyResult& s) { return s.r.identification_steps; })
+        .def_property_readonly("returned_best",
+                               [](const PyResult& s) { return s.r.returned_best; })
+        .def_property_readonly(
+            "stage_stats",
+            [](const PyResult& s) {
+                py::list out;
+                for (const auto& st : s.r.stage_stats) {
+                    py::dict d;
+                    d["name"] = st.name;
+                    d["precision"] = st.precision;
+                    d["q"] = st.q;
+                    d["requested_tol"] = st.requested_tol;
+                    d["effective_tol"] = st.effective_tol;
+                    d["iterations"] = st.iterations;
+                    d["matvec_count"] = st.matvec_count;
+                    d["seconds"] = st.seconds;
+                    d["status"] = std::string(hmc::to_string(st.status));
+                    d["fw_error"] = st.fw_error;
+                    d["penetration_error"] = st.penetration_error;
+                    out.append(d);
+                }
+                return out;
+            },
+            "One entry per solve stage (each coarse level, the finest solve, "
+            "and the double polish when precision='float_then_double').")
+        // ── A07: library-side allocation accounting and phase timing ───────
+        .def_property_readonly(
+            "memory",
+            [](const PyResult& s) {
+                py::dict d;
+                d["cg_state"] = s.r.memory.cg_state;
+                d["best_iterate"] = s.r.memory.best_iterate;
+                d["contact_mask"] = s.r.memory.contact_mask;
+                d["output_arrays"] = s.r.memory.output_arrays;
+                d["peak"] = s.r.memory.peak;
+                return d;
+            },
+            "Bytes the SOLVER allocated (not process RSS, which also carries "
+            "the caller's gap array, the operator and the Python heap).")
+        .def_property_readonly(
+            "timings",
+            [](const PyResult& s) {
+                py::dict d;
+                d["total"] = s.r.time_total;
+                d["matvec"] = s.r.time_matvec;
+                d["precond"] = s.r.time_precond;
+                d["build"] = s.r.time_build;
+                d["coarse"] = s.r.time_coarse;
+                d["verification"] = s.r.time_verification;
+                d["output"] = s.r.time_output;
+                return d;
+            },
+            "Seconds per phase. For a nested solve `total` covers operator "
+            "construction, the coarse solves, the finest solve, verification "
+            "and output materialisation.")
         .def("__repr__", [](const PyResult& s) {
             std::ostringstream os;
-            os << "<ContactResult: " << (s.r.converged ? "converged" : "NOT converged")
-               << " in " << s.r.iterations << " iters, error " << s.r.error
-               << ", contact area " << s.r.contact_fraction << ", mean p "
-               << s.r.mean_pressure << ">";
+            os << "<ContactResult: " << hmc::to_string(s.r.status) << " in "
+               << s.r.iterations << " iters, fw_error " << s.r.fw_error
+               << ", penetration " << s.r.penetration_error << ", contact area "
+               << s.r.contact_fraction << ", mean p " << s.r.mean_pressure << ">";
             return os.str();
         });
 
@@ -578,7 +784,10 @@ PYBIND11_MODULE(aspher, m) {
           py::arg("leaf_side") = 8, py::arg("precond") = true,
           py::arg("tol") = 1e-8, py::arg("coarse_tol") = 1e-4,
           py::arg("max_iter") = 20000, py::arg("use_pr") = true,
-          py::arg("single_precision") = false, py::arg("light_result") = false,
+          py::arg("single_precision") = false, py::arg("precision") = "",
+          py::arg("float_floor") = 2e-6,
+          py::arg("allow_tolerance_relaxation") = false,
+          py::arg("light_result") = false,
           py::arg("backend") = "h2", py::arg("record_error_history") = false,
           py::arg("active_set") = false, py::arg("active_delta") = 0.05,
           py::arg("active_halo") = 2, py::arg("active_max_rounds") = 5,
@@ -587,6 +796,13 @@ PYBIND11_MODULE(aspher, m) {
           "each level with the prolonged coarse pressure. grid_size must equal "
           "coarsest * 2^k. Returns a ContactResult. backend='h2' (O(N) memory) "
           "or 'fft' (exact convolution, fastest at Ns<=8192). "
+          "precision='double' (default) | 'float' (== single_precision=True; "
+          "cannot reach a tolerance below float_floor, and now reports "
+          "'stagnated'/'precision_limit' rather than a relaxed success unless "
+          "allow_tolerance_relaxation=True) | 'float_then_double' (identify "
+          "the contact in float at float_floor, then polish in double to the "
+          "requested tol — accuracy, not memory: the polish carries the "
+          "double working set). result.stage_stats reports every stage. "
           "record_error_history=True fills .error_history with the finest "
           "level's per-iteration complementarity error (off by default). "
           "active_set=True (h2 only) solves the finest level restricted to a "
@@ -594,6 +810,18 @@ PYBIND11_MODULE(aspher, m) {
           "active_delta*scale) through the masked H2 matvec, with per-round "
           "full-grid verification and a full-solve fallback after "
           "active_max_rounds (see .active_rounds/.active_fallback).");
+
+    m.def("configure_allocator", &hmc::configure_allocator,
+          py::arg("mmap_threshold_bytes") = 128 * 1024,
+          py::arg("trim_threshold_bytes") = 128 * 1024,
+          "Opt-in PROCESS-WIDE glibc allocator policy (returns False where "
+          "unsupported). Large solves free multi-megabyte buffers every "
+          "iteration; forcing them through mmap returns them to the OS "
+          "immediately instead of growing the arena. ASPHER never calls this "
+          "itself — the solver used to change the host process's policy from "
+          "inside a library call. Call it once at start-up if you measure "
+          "that it helps (large H-matrix builds and very large nested "
+          "solves).");
 
     py::class_<PyBipotResult>(m, "BipotentialResult")
         .def_property_readonly(
@@ -737,6 +965,40 @@ PYBIND11_MODULE(aspher, m) {
                 return a;
             })
         .def_property_readonly(
+            "cone_violation",
+            [](const PyStepResult& s) { return s.r.tangential.cone_violation; },
+            "max(0, |q_i| - s_i) / max(s): cone feasibility of the RETURNED "
+            "tractions.")
+        .def_property_readonly(
+            "proj_residual",
+            [](const PyStepResult& s) { return s.r.tangential.proj_residual; },
+            "||q - proj[q - rho (Cq + u_hist - E dd)]||_inf / max(s), the "
+            "fixed-threshold projection residual recomputed on the returned "
+            "tractions after the terminal force correction.")
+        .def_property_readonly(
+            "stick_residual",
+            [](const PyStepResult& s) { return s.r.tangential.stick_residual; })
+        .def_property_readonly(
+            "slip_residual",
+            [](const PyStepResult& s) { return s.r.tangential.slip_residual; })
+        .def_property_readonly(
+            "force_error",
+            [](const PyStepResult& s) { return s.r.tangential.force_error; })
+        .def_property_readonly(
+            "kkt_tol",
+            [](const PyStepResult& s) { return s.r.tangential.kkt_tol; },
+            "Local-KKT acceptance threshold actually applied to this step.")
+        .def_property_readonly(
+            "status_reason",
+            [](const PyStepResult& s) { return s.r.status_reason; },
+            "Empty on success; otherwise why the step was refused (the "
+            "driver state is unchanged in that case).")
+        .def_property_readonly(
+            "tangential_hold_applied",
+            [](const PyStepResult& s) { return s.r.tangential_hold_applied; },
+            "True when a normal-only step re-solved the tangential problem "
+            "under the held boundary condition (new friction thresholds).")
+        .def_property_readonly(
             "delta_t", [](const PyStepResult& s) -> py::object {
                 if (!s.have_disp) return py::none();
                 py::array_t<double> a(2);
@@ -759,19 +1021,29 @@ PYBIND11_MODULE(aspher, m) {
         .def("set_gap", &PyFrictionSolver::set_gap, py::arg("gap"),
              "Set the initial gap field (flat (N,) or (Ns,Ns)); resets history.")
         .def("step", &PyFrictionSolver::step, py::kw_only(),
-             py::arg("p_bar") = -1.0, py::arg("q_bar") = py::none(),
-             py::arg("delta_t") = py::none(), py::arg("dt") = 1.0,
+             py::arg("p_bar") = py::none(), py::arg("q_bar") = py::none(),
+             py::arg("delta_t") = py::none(),
+             py::arg("tangential_hold") = "displacement", py::arg("dt") = 1.0,
              py::arg("T") = py::none(), py::arg("tol_normal") = 1e-8,
-             py::arg("tol_tangential") = 1e-5, py::arg("max_iter") = 20000,
+             py::arg("tol_tangential") = 1e-5, py::arg("tol_kkt") = 0.0, py::arg("max_iter") = 20000,
              py::arg("max_threshold_iter") = 20,
              py::arg("threshold_rtol") = 1e-3,
-             "One quasi-static load step. p_bar>0 runs the normal solve; a "
-             "tangential solve runs if q_bar (force control, (qx,qy)) or "
-             "delta_t (displacement control, rigid shift) is given (exactly "
-             "one). Targets are TOTAL loads/shifts. Returns FrictionStepResult. "
-             "On a non-converged step the driver state is rolled back, so ux/uy/"
-             "delta_t are None; qx/qy/slip_x/slip_y/state expose the failed "
-             "candidate for inspection.")
+             "One quasi-static load step.\n"
+             "Normal control: p_bar=None holds the current normal load, "
+             "p_bar=0 is COMPLETE normal unloading (separation: p=q=u_t=0, "
+             "approach = min(gap), accumulated slip and the controlled rigid "
+             "shift preserved), p_bar>0 solves for that mean pressure; "
+             "p_bar<0 is invalid (the legacy -1 sentinel still means 'hold').\n"
+             "Tangential control: give q_bar (force, (qx,qy)) or delta_t "
+             "(displacement, rigid shift) — exactly one; targets are TOTAL "
+             "loads/shifts. On a normal-only step the boundary condition named "
+             "by tangential_hold ('displacement', the default, or 'force') is "
+             "re-solved under the new friction thresholds, so shear cannot "
+             "survive on points that just opened; an infeasible held force "
+             "fails transactionally (see result.status_reason).\n"
+             "Returns FrictionStepResult. On a non-converged step the driver "
+             "state is rolled back, so ux/uy/delta_t are None; qx/qy/slip_x/"
+             "slip_y/state expose the failed candidate for inspection.")
         .def("reset", &PyFrictionSolver::reset, "Clear all history.")
         .def_property_readonly("pressure", &PyFrictionSolver::pressure)
         .def_property_readonly("q", &PyFrictionSolver::q)

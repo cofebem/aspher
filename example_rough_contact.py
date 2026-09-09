@@ -89,10 +89,21 @@ for inc, p in enumerate(pressures[1:]):
     #  - light_result      : skip displacement/gap arrays; pressure still filled.
     #  - precond stays ON  : the float solve stalls without the |q| preconditioner,
     #                        and the restriction does not improve conditioning.
+    #  - allow_tolerance_relaxation: float cannot drive the certificate below
+    #                        ~2e-7, so asking for the default 1e-8 in float is
+    #                        a request that CANNOT be met and now reports
+    #                        `stagnated`/`precision_limit`. Here we are using
+    #                        float for its memory, so accept its documented
+    #                        floor explicitly; result.effective_tol records it.
+    #                        For accuracy instead, use
+    #                        precision="float_then_double" (identify in float,
+    #                        polish in double) — that meets 1e-8, but carries
+    #                        the double working set, so it is not the choice
+    #                        for a memory-bound run.
     res = hc.solve_nested(grid_size=Ns, gap=-surface, p_nominal=p,
                           coarsest=64, q=q, leaf_side=leaf_side, precond=True,
-                          single_precision=True, light_result=True,
-                          active_set=True)
+                          single_precision=True, allow_tolerance_relaxation=True,
+                          light_result=True, active_set=True)
     print("CPU time = ", time.time() - start," seconds")
     print(f"active_rounds={res.active_rounds}  active_fallback={res.active_fallback}")
 
