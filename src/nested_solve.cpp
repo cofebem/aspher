@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <limits>
+#include <optional>
 #include <string>
 #include <memory>
 #include <stdexcept>
@@ -639,25 +640,44 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             };
         }
 
-        FourierPreconditioner fp(n);
         // one FFT on a min(n,512) grid per level; the radius is clamped so a
-        // small coarse level cannot ask for a stencil wider than itself
-        const int r_lvl = std::min(np.precond_radius, std::max(1, n / 4));
-        StencilPreconditioner sp(n, r_lvl);
+        // small coarse level cannot ask for a stencil wider than itself, and
+        // never past leaf_side -- a precondition apply_into_blocked enforces
+        // at apply time but must be validated up front (spec Global
+        // Constraints: R <= leaf_side is asserted, never assumed, not
+        // discovered mid-solve inside a GIL-released CG loop).
+        const int r_lvl = std::min(
+            {np.precond_radius, std::max(1, n / 4), np.leaf_side});
         const bool use_stencil =
             np.precond &&
             np.precond_engine == NestedParams::PrecondEngine::stencil;
+        // Construct only the engine that will actually be used this level.
+        // FourierPreconditioner's constructor EAGERLY allocates its
+        // half-spectrum symbol table ((Ns/2+1)*Ns floats, ~512 MiB at
+        // Ns=16384) -- building it unconditionally on every level defeated
+        // the stencil default's entire point ("no grid allocation") for the
+        // ~5.5% of active-f32 peak RSS it cost while sitting completely
+        // unread. Likewise the stencil is skipped entirely when
+        // np.precond is false, so a caller asking for no preconditioner at
+        // all is never charged StencilPreconditioner's own validation
+        // (radius >= 1).
+        std::optional<FourierPreconditioner> fp_opt;
+        std::optional<StencilPreconditioner> sp_opt;
+        if (use_stencil) sp_opt.emplace(n, r_lvl);
+        else if (np.precond) fp_opt.emplace(n);
+        FourierPreconditioner* fp_ptr = fp_opt ? &*fp_opt : nullptr;
+        StencilPreconditioner* sp_ptr = sp_opt ? &*sp_opt : nullptr;
         t_build += std::chrono::duration<double>(
                        std::chrono::steady_clock::now() - t_lvl_build).count();
         PrecondIntoT<double> pc;
-        if (use_stencil)
-            pc = [&sp](const Eigen::VectorXd& g,
-                       const std::vector<std::uint8_t>& contact,
-                       Eigen::VectorXd& z) { sp.apply_into(g, contact, z); };
-        else if (np.precond)
-            pc = [&fp](const Eigen::VectorXd& g,
-                       const std::vector<std::uint8_t>& contact,
-                       Eigen::VectorXd& z) { fp.apply_into(g, contact, z); };
+        if (sp_ptr)
+            pc = [sp_ptr](const Eigen::VectorXd& g,
+                          const std::vector<std::uint8_t>& contact,
+                          Eigen::VectorXd& z) { sp_ptr->apply_into(g, contact, z); };
+        else if (fp_ptr)
+            pc = [fp_ptr](const Eigen::VectorXd& g,
+                          const std::vector<std::uint8_t>& contact,
+                          Eigen::VectorXd& z) { fp_ptr->apply_into(g, contact, z); };
 
         const bool finest = (li + 1 == levels.size());
         // finest level reads the caller-owned g0 directly; coarse levels own
@@ -740,9 +760,8 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         if (use_active) {
             // restricted (active-set) solve on the candidate set built from
             // the coarse contact + gap; p_init/coarse_gap are consumed
-            const StencilPreconditioner* spp = use_stencil ? &sp : nullptr;
-            const FourierPreconditioner* fpp =
-                (np.precond && !use_stencil) ? &fp : nullptr;
+            const StencilPreconditioner* spp = sp_ptr;
+            const FourierPreconditioner* fpp = fp_ptr;
             if (level_float) {
                 h2->build_single_caches();
                 // centre inside the cast: rounding a large offset first is
@@ -792,17 +811,17 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                 };
             }
             PrecondIntoT<float> pcf;
-            if (use_stencil)
-                pcf = [&sp](const Eigen::VectorXf& g,
-                            const std::vector<std::uint8_t>& contact,
-                            Eigen::VectorXf& z) {
-                    sp.apply_single_into(g, contact, z);
+            if (sp_ptr)
+                pcf = [sp_ptr](const Eigen::VectorXf& g,
+                              const std::vector<std::uint8_t>& contact,
+                              Eigen::VectorXf& z) {
+                    sp_ptr->apply_single_into(g, contact, z);
                 };
-            else if (np.precond)
-                pcf = [&fp](const Eigen::VectorXf& g,
-                            const std::vector<std::uint8_t>& contact,
-                            Eigen::VectorXf& z) {
-                    fp.apply_single_into(g, contact, z);
+            else if (fp_ptr)
+                pcf = [fp_ptr](const Eigen::VectorXf& g,
+                              const std::vector<std::uint8_t>& contact,
+                              Eigen::VectorXf& z) {
+                    fp_ptr->apply_single_into(g, contact, z);
                 };
             Eigen::VectorXf g0f = (glvl.array() - datum).cast<float>();
             // free the coarse double gap once cast to float (the finest-level

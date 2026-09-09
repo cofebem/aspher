@@ -794,7 +794,11 @@ PYBIND11_MODULE(aspher, m) {
              py::arg("precond") = "none", py::arg("p_init") = py::none(),
              "Solve the normal contact problem. use_pr=True (default) uses "
              "Polak-Ribiere+ beta. precond='fourier' enables the |q| spectral "
-             "preconditioner; p_init is an optional warm-start pressure field.")
+             "preconditioner, applied as a 13-tap real-space stencil on the "
+             "contact set (the default engine, O(taps*N_c), no grid "
+             "allocation); precond='fourier-fft' selects the historical "
+             "full-grid FFT transform of the same operator instead; "
+             "p_init is an optional warm-start pressure field.")
         .def("block_layout", &PyContactSolver::block_layout,
              "Return (N_blocks, 5) array [row_begin, row_size, col_begin, col_size, is_dense]")
         .def("recompress", &PyContactSolver::recompress, py::arg("svd_tol"),
