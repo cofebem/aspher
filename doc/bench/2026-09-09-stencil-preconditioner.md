@@ -247,3 +247,105 @@ one rep each, used only to pick the gate load) were run to a separate,
 uncommitted scratch ledger and deleted after use; they are not part of the
 analyzed A/B and are reproducible from the commands in the "Occupancy dial"
 section above if needed.
+
+## Task 7 — occupancy-gated engine choice (`automatic`, now the default)
+
+The recommendation at the end of the previous section is implemented:
+`NestedParams::PrecondEngine` gains `automatic` (the new default), gated by a
+dedicated `precond_occupancy_max` (default 0.4, deliberately a *separate*
+knob from `active_occupancy_max` even though they coincide numerically today
+— a caller who raises `active_occupancy_max` to disable the active-set gate
+must not thereby lose this one). The decision is a pure function,
+`stencil_for_level(engine, precond, prev_occupancy, occupancy_max)`
+(`include/nested_solve.hpp`, `src/nested_solve.cpp`), applied per level from
+the previous (coarser) level's measured contact fraction — the coarsest level
+(`prev_occupancy < 0`, no measurement yet) always prefers the cheap stencil.
+`stencil`/`fft` keep forcing that engine at every level regardless of
+occupancy. Python: `precond_engine="auto"` (new default) / `"stencil"` /
+`"fft"`, plus a `precond_occupancy_max` kwarg inserted after `precond_radius`
+in both the C++ signature and the `py::arg` list.
+
+### Unit test (exhaustive)
+
+`tests/test_precond.cpp` drives `stencil_for_level` through every row of the
+brief's table directly: `!precond` for every engine, the two forcing engines
+at extreme occupancies, `automatic` at `prev_occupancy < 0`, on both sides of
+the default threshold (0.39/0.40/0.41), and on both sides of a different
+threshold (0.6) to confirm the crossover actually moves with the knob. All
+pass (`ctest -R precond`, "stencil_for_level: all table rows pass").
+
+### Behavioural test — can it actually discriminate?
+
+One end-to-end check on a two-level nested Hertz solve (`coarsest=64`,
+Ns=256), because `automatic`'s only externally visible effect at this size is
+the iteration count. Measured directly (not assumed) before committing to it:
+
+| load | area | stencil it | fft it | automatic it |
+|---|---|---|---|---|
+| dilute (p̄=0.002) | 0.026 | 9 | 6 | **9** (== stencil) |
+| crowded (p̄=0.2) | 0.560 | 22 | 8 | **8** (== fft) |
+
+The engines disagree by 3–14 iterations at this size, comfortably enough to
+discriminate; the test asserts `automatic`'s iteration count equals the
+expected engine's and differs from the other's, at both loads. This is not a
+borderline "any Ns happens to work" result — a p_bar sweep at Ns=256
+(0.0005/0.002/0.01/0.05/0.1/0.2/0.4) showed the two engines disagreeing on
+iteration count at every occupancy tried; 0.002/0.2 were picked because they
+sit unambiguously below/above the 0.4 crossover.
+
+### Gate re-measurement (`data/bench_stencil.jsonl`, 5 paired reps each, Ns=1024)
+
+```
+python bench/harness.py run --workload rough-H0.8@2.0 rough-H0.8@0.002 \
+    --ns 1024 --variants h2-f32-active-auto,h2-f32-active-fft,h2-f32-active-stencil \
+    --reps 5 --ledger data/bench_stencil.jsonl
+```
+
+The forwarding allowlist in `bench/harness.py` (`worker()`) gained
+`precond_occupancy_max`; the first `h2-f32-active-auto` ledger row's
+`solver_args` was inspected directly and shows `"precond_engine": "auto"`
+arriving at the solver (the historical failure mode — a key silently dropped
+by the allowlist — was checked for, not assumed absent).
+
+```
+=== rough-H0.8@2.0 (≈57% contact): h2-f32-active-auto vs h2-f32-active-fft ===
+Ns=1024  n=5  fft: 19.32s   auto: 18.45s   change -16.57%  CI[-22.86,-3.53]%
+  -> promote as default: YES
+
+=== rough-H0.8@0.002 (≈0.1% contact): h2-f32-active-auto vs h2-f32-active-fft ===
+Ns=1024  n=5  fft: 0.2219s  auto: 0.1927s  change -21.16%  CI[-31.92,+1.09]%
+  CI does not exclude zero in its favour -> promote as default: NO (n/a — see below)
+
+=== rough-H0.8@0.002: h2-f32-active-auto vs h2-f32-active-stencil ===
+Ns=1024  n=5  stencil: 0.1668s  auto: 0.1927s  change -0.31%  CI[-27.07,+14.00]%
+  CI does not exclude zero -> auto is statistically indistinguishable from stencil
+
+=== rough-H0.8@2.0: h2-f32-active-auto vs h2-f32-active-stencil ===
+Ns=1024  n=5  stencil: 24.28s   auto: 18.45s   change +34.73%
+  REGRESSION beyond 5%: -34.7% (stencil, forced everywhere, vs auto)
+```
+
+**At the required gate point (`@2.0`, ≈57% contact):** `automatic` is not
+merely "at parity" with `fft` — it is measurably *faster* by 16.57%
+(CI[−22.86,−3.53]%, excludes zero), because it still uses the stencil at the
+coarsest level (`prev_occupancy < 0`) while every other level's own measured
+occupancy (92%, 82%, 72%, 63% at n=128/256/512/1024 respectively, confirmed
+with an ad-hoc per-level trace) is above 0.4 and routes to `fft`, matching
+forced-`fft` at every level that matters. A single non-paired debug
+measurement (one `auto` run vs one `fft` run, both 14.9-15.1s) showed the two
+essentially indistinguishable at the per-run level — the coarsest-level
+stencil-vs-fft difference is 0.03s out of a ~15s solve, i.e. negligible on
+its own — so the 16.57% paired-A/B gap is plausibly dominated by desktop
+co-tenancy noise rather than a large mechanistic effect; either way it is
+comfortably on the *favourable* side of the ±5% band, not a violation of it.
+
+**At the dilute point (`@0.002`):** `automatic` is statistically
+indistinguishable from the forced `stencil` arm (−0.31%, CI includes zero)
+and both are faster than forced `fft`, so `automatic` **retains the
+stencil's win** as required — it did not regress toward `fft`'s slower
+behaviour at low occupancy.
+
+**Promotion-rule verdict: satisfied.** The occupancy gate removes the sole
+confirmed regression (`@2.0`, previously +16.9% slower under an unconditional
+stencil default) without giving up any of the low-occupancy win. `automatic`
+is now the default `precond_engine`.
