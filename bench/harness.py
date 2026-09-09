@@ -475,15 +475,6 @@ def run(args):
         if v not in VARIANTS:
             sys.exit(f"unknown variant {v}; known: {', '.join(VARIANTS)}")
     for Ns in args.ns:
-        if Ns > args.manual_above:
-            est = preflight(Ns, variants[0], headroom=args.headroom,
-                            light=not args.full_result)
-            if not est["fits"] and not args.force_memory:
-                print(f"SKIP Ns={Ns}: does not fit (need "
-                      f"{est['peak_bytes'] * args.headroom / 2**30:.1f} GiB, "
-                      f"have {est['available_bytes'] / 2**30:.1f} GiB). "
-                      "Free memory or pass --force-memory.", flush=True)
-                continue
         reps = 1 if Ns > args.manual_above else args.reps
         for rep, variant in paired_order(variants, reps):
             key = (args.workload, Ns, variant, rep)
@@ -491,6 +482,30 @@ def run(args):
                 print(f"skip  {args.workload} Ns={Ns:6d} {variant:16s} "
                       f"rep={rep} (recorded)", flush=True)
                 continue
+            # Preflight PER VARIANT, and immediately before the case runs.
+            # Doing it once per Ns against the first variant lets a heavier
+            # arm through on a lighter arm's budget, and doing it up front
+            # uses a memory reading that the earlier cases have since
+            # invalidated. A refusal is recorded as a result, not skipped
+            # silently: "this configuration does not fit here" is a finding.
+            if Ns > args.manual_above:
+                est = preflight(Ns, variant, headroom=args.headroom,
+                                light=not args.full_result, verbose=False)
+                if not est["fits"] and not args.force_memory:
+                    need = est["peak_bytes"] * args.headroom
+                    print(f"SKIP  {args.workload} Ns={Ns:6d} {variant:16s}: "
+                          f"needs {need / 2**30:.1f} GiB, "
+                          f"{est['available_bytes'] / 2**30:.1f} GiB available",
+                          flush=True)
+                    with open(ledger, "a") as f:
+                        f.write(json.dumps({
+                            "workload": args.workload, "Ns": Ns,
+                            "variant": variant, "rep": rep,
+                            "run_status": "skipped_preflight",
+                            "preflight": est, "provenance": prov,
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        }) + "\n")
+                    continue
             print(f"run   {args.workload} Ns={Ns:6d} {variant:16s} rep={rep}",
                   flush=True)
             cmd = [sys.executable, os.path.abspath(__file__), "worker",
