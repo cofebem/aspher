@@ -116,16 +116,41 @@ def compare(rows, a, b, metric, workload, target, lower_is_better=True):
         if n < 5:
             print(f"            (only {n} paired samples; the plan asks for "
                   ">=5 — treat the interval as indicative)")
-        verdicts.append(favourable and meets)
-        if not favourable:
-            print("            CI does not exclude zero in its favour")
-        elif not meets:
-            print(f"            improvement {100 * gain:.1f}% below the "
-                  f"{100 * target:.0f}% target for a new default")
+        # Three outcomes, not two. "Too few samples to have an interval" is
+        # not the same as "the interval says no" — the plan explicitly allows
+        # expensive jobs to run fewer samples with a stated uncertainty
+        # limitation, and large grids are single-rep by design. Conflating
+        # them would report a favourable single-rep result as evidence
+        # against the change.
+        if n < 5:
+            verdicts.append(None)
+            print(f"            INSUFFICIENT SAMPLES for a confidence "
+                  f"interval ({n} < 5): direction is "
+                  f"{'favourable' if gain > 0 else 'unfavourable'} at "
+                  f"{100 * gain:+.1f}%, indicative only")
+        else:
+            verdicts.append(favourable and meets)
+            if not favourable:
+                print("            CI does not exclude zero in its favour")
+            elif not meets:
+                print(f"            improvement {100 * gain:.1f}% below the "
+                      f"{100 * target:.0f}% target for a new default")
         if gain < -0.05:
             print(f"            REGRESSION beyond 5%: {100 * gain:.1f}%")
-    print(f"  -> promote as default: "
-          f"{'YES' if verdicts and all(verdicts) else 'NO'}")
+    decided = [v for v in verdicts if v is not None]
+    if not verdicts:
+        verdict = "NO DATA"
+    elif any(v is False for v in verdicts):
+        verdict = "NO"
+    elif not decided:
+        verdict = "INSUFFICIENT EVIDENCE (direction favourable, needs >=5 " \
+                  "paired samples)"
+    elif all(decided):
+        verdict = ("YES" if len(decided) == len(verdicts)
+                   else "YES on the sized cases; the rest are indicative")
+    else:
+        verdict = "NO"
+    print(f"  -> promote as default: {verdict}")
     return verdicts
 
 
