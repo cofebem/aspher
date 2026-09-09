@@ -98,21 +98,34 @@ solver-side buffer set (CG state, best iterate, mask, outputs), the caller's
 gap, the coarse restrictions, the prolonged warm start, and the Python surface
 generation transient — which at large Ns is the real peak.
 
+The surface term is **measured, not assumed**. It was written as `3 × 8N`
+(24 B/DOF) on the reasoning that generation holds a few grid-sized temporaries;
+the real figure for `rfgen` is **36.5 B/DOF**, because `numpy.fft.rfftn` and
+`irfftn` transform one axis at a time and allocate a fresh complex array per
+axis, so two full half-spectra are live at once on each of the two passes.
+That 50% shortfall was the single largest error in the budget — at Ns ≥ 8192
+the surface is the biggest item in it, and at Ns=16384 it *is* the peak: the
+generator alone reaches 9.115 GiB, and a whole float active-set case was
+recorded at 9.116 GiB. `SURFACE_BYTES_PER_DOF` now carries one measured
+constant per workload kind.
+
 Validated against the Ns=16384 measurements on record:
 
-| variant | predicted | measured RSS |
-|---|---|---|
-| `h2-f32-active` | 8.29 GiB | 10.9 GiB |
-| `h2-f32` | 14.82 GiB | 18.3 GiB |
-| `h2-f64-active` | 8.99 GiB | 12.5 GiB |
-| `h2-f64` | 21.82 GiB | OOM on a 31 GiB machine |
+| variant | measured RSS | predicted (3×8N) | predicted (measured) |
+|---|---|---|---|
+| `h2-f32-active` | 10.9 GiB | 8.29 GiB | **11.12 GiB** |
+| `h2-f32` | 18.3 GiB | 14.82 GiB | **16.82 GiB** |
+| `h2-f64-active` | 12.5 GiB | 8.99 GiB | **12.99 GiB** |
+| `h2-f64` | OOM on a 31 GiB machine | 21.82 GiB | **25.82 GiB** |
 
-The model sits 20–25% under measured RSS because it counts the library's
-buffers and not the Python heap or allocator slack. The default `1.25`
-headroom is exactly that gap, made explicit and adjustable instead of padded
-invisibly into one number. For the active-set variants the estimate uses the
-certified O(N_c) state and *separately* reports what the full-solve fallback
-would need, since that path can still fire.
+The old model was uniformly 20–25% *under* measured RSS, and the default
+`1.25` headroom was that bias made explicit — which meant the gate had no
+actual margin. The corrected model sits within ±8%, and over-predicts on the
+two active-set variants, so `1.25` is now headroom for the Python heap and
+allocator slack rather than a fudge factor for a known error. For the
+active-set variants the estimate uses the certified O(N_c) state and
+*separately* reports what the full-solve fallback would need, since that path
+can still fire.
 
 ## Promotion rule
 

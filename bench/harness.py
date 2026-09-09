@@ -268,8 +268,38 @@ def build_gap(workload, Ns):
     return gap, digest
 
 
+# The Python surface-generation transient, MEASURED (peak RUSAGE_SELF in a
+# fresh process) rather than guessed. It was modelled as 3×8N = 24 B/DOF and
+# is really 36.5: numpy's rfftn/irfftn transform one axis at a time and
+# allocate a fresh complex array per axis, so two full half-spectra are live
+# at once on each of the two passes. At Ns >= 8192 this term is the largest
+# single item in the budget, and at Ns=16384 it IS the measured peak RSS of a
+# float active-set run (9.115 GiB to generate; 9.116 GiB for the whole case).
+#
+#   generator      Ns=8192   Ns=16384   asymptotic B/DOF
+#   rfgen 0.2.2      37.3      36.5           36.5
+#
+# Analytic workloads build one Ns x Ns temporary beside the gap.
+SURFACE_BYTES_PER_DOF = {
+    "selfaffine": 36.5,
+    "hertz": 16.0,
+    "flat_patch": 24.0,
+}
+
+
+def _surface_kind(workload):
+    """Workload kind for the surface term; the costliest one when unknown."""
+    if workload is None:
+        return "selfaffine"
+    try:
+        return resolve_workload(workload)[1]["kind"]
+    except Exception:
+        return "selfaffine"
+
+
 # ── preflight ───────────────────────────────────────────────────────────────
-def estimate_bytes(Ns, variant, light=True, coarsest=64):
+def estimate_bytes(Ns, variant, light=True, coarsest=64,
+                   workload=None):
     """Predicted peak for one case, from measured structure rather than a rule
     of thumb.
 
@@ -330,20 +360,26 @@ def estimate_bytes(Ns, variant, light=True, coarsest=64):
         cg = 0.10 * full_cg
     else:
         cg = full_cg
+    # The |q| preconditioner keeps ONE real grid plus one complex half-spectrum,
+    # both full size whatever the candidate set does — it is applied by FFT on
+    # the whole grid even on the restricted path. Omitting it under-predicted
+    # by 8 GiB at Ns=32768.
+    precond = (N + 2.0 * (Ns // 2 + 1) * Ns) * real
     pressure = 8.0 * N            # returned pressure (double)
     gap = 8.0 * N                 # caller-owned gap
     coarse = 8.0 * N / 3.0        # restricted coarse levels, geometric sum
     warm = 8.0 * N                # prolonged warm start at the finest level
-    surface = 3.0 * 8.0 * N       # generation transient (meshgrid + FFT temps)
+    surface = SURFACE_BYTES_PER_DOF[_surface_kind(workload)] * N
 
-    solve = op_bytes + cg + pressure + gap + coarse + warm
-    fallback = op_bytes + full_cg + pressure + gap + coarse + warm
+    solve = op_bytes + cg + precond + pressure + gap + coarse + warm
+    fallback = op_bytes + full_cg + precond + pressure + gap + coarse + warm
     return {
         "operator_bytes": op_bytes,
         "operator_bytes_per_dof": op_per_dof,
         "operator_bytes_fixed": op_fixed,
         "cg_bytes": cg,
         "cg_bytes_full": full_cg,
+        "precond_bytes": precond,
         "output_bytes": pressure,
         "gap_bytes": gap,
         "coarse_bytes": coarse,
@@ -357,16 +393,17 @@ def estimate_bytes(Ns, variant, light=True, coarsest=64):
     }
 
 
-def preflight(Ns, variant, headroom=1.25, light=True, verbose=True):
-    est = estimate_bytes(Ns, variant, light=light)
+def preflight(Ns, variant, headroom=1.25, light=True, verbose=True,
+              workload=None):
+    est = estimate_bytes(Ns, variant, light=light, workload=workload)
     avail = mem_available_bytes()
     need = est["peak_bytes"] * headroom
     ok = avail > need
     if verbose:
         g = 2.0 ** 30
         print(f"preflight Ns={Ns} variant={variant}")
-        for k in ("operator_bytes", "cg_bytes", "gap_bytes", "coarse_bytes",
-                  "warm_start_bytes", "output_bytes",
+        for k in ("operator_bytes", "cg_bytes", "precond_bytes", "gap_bytes",
+                  "coarse_bytes", "warm_start_bytes", "output_bytes",
                   "surface_transient_bytes"):
             print(f"    {k:26s} {est[k] / g:8.2f} GiB")
         if est["fallback_peak_bytes"] > est["peak_bytes"]:
@@ -535,7 +572,8 @@ def run(args):
                 # silently: "this configuration does not fit here" is a finding.
                 if Ns > args.manual_above:
                     est = preflight(Ns, variant, headroom=args.headroom,
-                                    light=not args.full_result, verbose=False)
+                                    light=not args.full_result,
+                                    verbose=False, workload=wl_spec)
                     if not est["fits"] and not args.force_memory:
                         need = est["peak_bytes"] * args.headroom
                         print(f"SKIP  {wl_spec} Ns={Ns:6d} {variant:16s}: "
@@ -599,6 +637,8 @@ def main():
     pf = sub.add_parser("preflight")
     pf.add_argument("--ns", type=int, required=True)
     pf.add_argument("--variant", default="h2-f32-active")
+    pf.add_argument("--workload", default="rough-H0.8",
+                    help="the surface term depends on the workload kind")
     pf.add_argument("--headroom", type=float, default=1.25)
     pf.add_argument("--full-result", action="store_true")
 
@@ -645,7 +685,7 @@ def main():
         print("\nprovenance: " + json.dumps(provenance(), indent=2))
     elif a.cmd == "preflight":
         est = preflight(a.ns, a.variant, headroom=a.headroom,
-                        light=not a.full_result)
+                        light=not a.full_result, workload=a.workload)
         sys.exit(0 if est["fits"] else 1)
     elif a.cmd == "run":
         run(a)
