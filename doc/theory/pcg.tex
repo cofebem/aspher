@@ -906,40 +906,58 @@ $6.9\times10^{-4}$ for the untruncated symbol — the stencil is a much milder,
 better-conditioned reweighting of the residual than the exact operator it
 approximates.
 
-\paragraph{Measured iteration counts.}
+\paragraph{Measured iteration counts (corrected 2026-09-10).}
 Table~\ref{tab:stencil} reports median PCG iteration counts on the h2
 active-set path, rough self-affine ($H=0.8$) surfaces, at low occupancy
-($\sim 0.1\%$ contact). The result is stronger than the design intended:
-the truncated stencil is not merely a cheaper application of the same
-$|\mathbf k|$ operator, it \emph{converges the iteration faster} than the
-exact full-grid FFT application of the same symbol, and the gap widens with
-$N_s$. The most telling comparison is $N_s=1024$: the full-grid FFT
-preconditioner (22 it) barely improves on no preconditioner at all (23 it),
-while the truncated stencil (13 it) does markedly better — consistent with
-the flatter truncated symbol reported above, and suggesting that the
-long-range spectral content the exact $|\mathbf k|$ operator computes so
-expensively is largely irrelevant once contact is dilute. This is reported as
-a measured finding on one surface family (self-affine rough-$H0.8$, seeded),
-not yet as a proven general property of the operator.
+($\sim 0.1\%$ contact). A first measurement pass reported the truncated
+stencil converging in \emph{fewer} iterations than the exact full-grid FFT
+application of the same symbol — an artefact of a runtime safety valve (the
+``cost gate'', \S\ref{sec:impl-stencil}'s companion note in
+\texttt{doc/bench/2026-09-09-stencil-preconditioner.md} carries the full
+post-mortem) that, on this restricted active-set path, silently disabled the
+FFT arm after its first application and left it running the remaining
+iterations \emph{unpreconditioned}. With that gate disabled by default the
+honest comparison is the opposite of what was first reported: the exact
+full-grid FFT application is the \emph{stronger} preconditioner per
+iteration, and the truncated stencil costs roughly 10--30\% more iterations,
+the gap widening with $N_s$. The stencil nonetheless wins decisively on wall
+time (final columns), because one full-grid FFT application costs one to two
+orders of magnitude more than the truncated real-space sum on the restricted
+candidate set — the win is a cost-per-application story, not a
+conditioning story.
 
 \begin{table}[ht]
 \centering
-\caption{PCG iteration counts, exact full-grid FFT $|\mathbf k|$
-         preconditioner vs.\ the truncated 13-tap stencil ($R=2$), h2
-         active-set nested solve, rough $H{=}0.8$ surfaces, low occupancy.}
+\caption{PCG iteration counts and wall time, exact full-grid FFT
+         $|\mathbf k|$ preconditioner vs.\ the truncated 13-tap stencil
+         ($R=2$), h2 active-set nested solve, rough $H{=}0.8$ surfaces, low
+         occupancy ($\sim$0.1\%). 5 reps at $N_s\le4096$, 1 rep at
+         $N_s=16384$; cost gate disabled (the 2026-09-10 default).}
 \label{tab:stencil}
-\begin{tabular}{@{}lrrr@{}}
+\begin{tabular}{@{}lrrrrr@{}}
 \toprule
-Case & FFT (full $|\mathbf k|$) & Stencil ($R{=}2$) & None \\
+Case & FFT it & Stencil it & None it & FFT / Stencil wall (s) & Stencil speedup \\
 \midrule
-$N_s{=}1024$, float32 & 22 & \textbf{13} & 23 \\
-$N_s{=}4096$, float32 & 62 & \textbf{25} & 69 \\
-$N_s{=}16384$, float32 & 208 & \textbf{61} & --- \\
-$N_s{=}4096$, float64 & 79 & \textbf{33} & --- \\
-$N_s{=}16384$, float64 & 272 & \textbf{94} & --- \\
+$N_s{=}1024$, float32  & \textbf{11} & 13 & 23 & 0.231 / 0.180 & 1.28$\times$ \\
+$N_s{=}4096$, float32  & \textbf{19} & 25 & 69 & 2.037 / 0.912 & 2.23$\times$ \\
+$N_s{=}16384$, float32 & \textbf{47} & 61 & --- & 64.88 / 11.63 & 5.58$\times$ \\
+$N_s{=}1024$, float64  & \textbf{15} & 17 & --- & 0.310 / 0.222 & 1.40$\times$ \\
+$N_s{=}4096$, float64  & \textbf{25} & 33 & --- & 3.365 / 1.045 & 3.22$\times$ \\
+$N_s{=}16384$, float64 & \textbf{72} & 94 & --- & 178.15 / 30.48 & 5.84$\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+The correct comparison against \emph{no} preconditioner (``None'' column) is
+also the honest one: at $N_s=1024$/$4096$ float32 the stencil beats no
+preconditioner by 18\%/21\% on wall time even though it needs fewer
+iterations than the unpreconditioned run (13 vs.\ 23, 25 vs.\ 69) — the
+truncated stencil is cheap enough that even a modest iteration reduction
+pays for itself. The full-grid FFT arm, by contrast, is \emph{slower than no
+preconditioner at all} on this restricted path at $N_s=4096$ float32 (2.037~s
+vs.\ 1.160~s) despite needing far fewer iterations (19 vs.\ 69): its
+per-application cost is high enough, relative to a masked matvec that is
+only 1--2\% of a full one, to erase the entire benefit of preconditioning.
 
 \paragraph{A regime where truncation costs iterations, and the resulting gate.}
 The exactness argument above concerns the arithmetic of restricting a fixed

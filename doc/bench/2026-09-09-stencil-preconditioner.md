@@ -1,5 +1,28 @@
 # Stencil vs FFT preconditioner engine — measured outcome
 
+> **CORRECTION (2026-09-10, final whole-branch review, F1-F3).** The
+> low-occupancy A/B below (default `rough-H0.8` workload, the section
+> "Paired A/B, fixed default load") was run under a runtime "cost gate"
+> (`SolveOptions::precond_cost_gate`, default `1.5`) that took one wall-clock
+> timing sample after the first preconditioner apply and, on this restricted
+> active-set path (masked matvec = 1-2% of a full matvec), fired on **every**
+> `fft`-arm run — silently disabling the FFT preconditioner after iteration 1
+> and leaving the remaining iterations unpreconditioned. Every `*-active-fft`
+> row at the dilute default workload has `precond_count == 1` while
+> `*-active-stencil` rows show `precond_count == iterations`; nothing in the
+> original analysis compared the two, so the corruption went unnoticed. The
+> resulting headline claim — **"the stencil is a better preconditioner, not
+> merely a cheaper one"** — is retracted: it described an artefact. The gate
+> now defaults OFF, `precond_dropped`/`precond_count` are checked by
+> `bench/analyze.py`'s contract guard, and the low-occupancy A/B has been
+> re-run with the gate genuinely disabled; see "Paired A/B" and "Why the
+> first measurement was wrong" below for the corrected numbers and the
+> honest finding. The high-occupancy point (`rough-H0.8@2.0`, ≈57% contact)
+> and the `automatic`-engine gate re-measurement further down were **not**
+> affected — at that occupancy the active-set restriction is off, the matvec
+> is the full O(N) H2 apply, and `precond_count == iterations` holds in the
+> original rows too (verified directly); those sections are unchanged.
+
 Companion to `doc/specs/2026-09-09-stencil-preconditioner-design.md`. Ledger:
 `data/bench_stencil.jsonl` (all rows below; revision `3125c07`, not dirty). All
 rows are `status=converged` at matching `effective_tol` within each pair
