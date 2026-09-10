@@ -96,3 +96,53 @@ The band-limited build (P2) aborted the *nested/active* path with
 single-level path only converged slowly on the same symbol. Trigger was a
 deliberately degenerate preconditioner, so it may be unreachable in practice.
 Recorded as an open item in the spec.
+
+## Step 5 follow-up (task 2, 2026-09-09) — time-boxed to 30 minutes
+
+Attempted a cheap repro before considering a debug rebuild, per the task's
+instruction not to build one if a cheaper path presents itself.
+
+- The throwaway `HMC_PRECOND_KCUT`/`HMC_PRECOND_RTRUNC` instrumentation used
+  to produce the band-limited symbol in P2/P3 no longer exists anywhere in
+  the tree (`grep` for both symbols across `.cpp`/`.hpp` is empty) — it was
+  scratch code in a build that was never committed. Reproducing exactly as
+  written means reintroducing it.
+- The current default build is `Release` (`-O3 -DNDEBUG`); the brief's
+  suggested `RelWithDebInfo` config in this repo's `CMakeCache.txt` *also*
+  carries `-DNDEBUG` (`CMAKE_CXX_FLAGS_RELWITHDEBINFO = -O2 -g -DNDEBUG`), so
+  Eigen's `eigen_assert` (a plain `assert`) would compile out there too —
+  that configuration would not have caught the crash either. A genuine
+  repro needs a `Debug`-type build (no `-DNDEBUG`) of at least `aspher_core`
+  plus a driver; the Python module itself is not required (`test_active` and
+  friends link only `aspher_core`, not the pybind target), which is cheaper
+  than the brief's own suggested config.
+- Given the 30-minute box, built no new binaries; instead read the
+  nested/active round-expansion path in `src/nested_solve.cpp` (~lines
+  260-330) that runs only on the *nested/active* path and not on the
+  single-level path — matching the observation that only the former crashed.
+  One spot stood out as worth a closer look in a follow-up session: after a
+  round adds violations to `cmask` and rebuilds the mask,
+  ```cpp
+  H2Mask old_mask = std::move(mask);
+  mask = h2.build_mask(cmask);
+  ...
+  for (int s = 0; s < nold; ++s) {
+      const int sn = mask.leaf_slot[old_mask.slot_leaf[s]];
+      pnew.segment(static_cast<std::ptrdiff_t>(sn) * ls2, ls2) =
+          psrc->segment(static_cast<std::ptrdiff_t>(s) * ls2, ls2);
+  }
+  ```
+  relies on every leaf occupied under `old_mask` still being occupied under
+  the new `mask` (true since `cmask` only ever grows) AND on `leaf_slot`
+  using a leaf-id convention that is stable across the two `build_mask`
+  calls. I did not find a counterexample and did not confirm a bug — this is
+  a candidate location for someone continuing the trace, not a diagnosis.
+  If `sn` were ever `-1` (leaf not found), `.segment(-1 * ls2, ls2)` on a
+  `Eigen::Matrix<Real, -1, 1>` would be exactly the failure signature seen
+  in P2 (out-of-range index on a `Matrix<float,-1,1>`).
+- Outcome: **not reproducible in the 30-minute box.** No fix applied, no
+  code changed for this step. The open item in the spec stays open. A real
+  follow-up should (a) restore a minimal `HMC_PRECOND_KCUT`-style hook behind
+  an `#ifdef` kept in a scratch branch rather than thrown away, (b) build only
+  `aspher_core` + a tiny driver in `Debug`, and (c) single-step the round
+  above under gdb watching `sn`.

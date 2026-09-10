@@ -122,6 +122,28 @@ VARIANTS = {
                                 active_set=True, active_all_levels=True,
                                 active_delta=0.0, active_halo=0,
                                 active_max_rounds=8),
+    # Stencil vs the historical full-grid transform
+    # (doc/specs/2026-09-09-stencil-preconditioner-design.md). Both arms name
+    # the engine explicitly: the default flipped, so a bare "h2-f32-active"
+    # row means different things before and after that commit.
+    "h2-f32-active-stencil": dict(backend="h2", precision="float",
+                                  allow_tolerance_relaxation=True,
+                                  active_set=True, precond_engine="stencil"),
+    "h2-f32-active-fft":     dict(backend="h2", precision="float",
+                                  allow_tolerance_relaxation=True,
+                                  active_set=True, precond_engine="fft"),
+    # Task 7: occupancy-gated engine choice (default). Picks stencil/fft per
+    # level from the previous level's measured contact fraction.
+    "h2-f32-active-auto":    dict(backend="h2", precision="float",
+                                  allow_tolerance_relaxation=True,
+                                  active_set=True, precond_engine="auto"),
+    "h2-f32-active-nopc":    dict(backend="h2", precision="float",
+                                  allow_tolerance_relaxation=True,
+                                  active_set=True, precond=False),
+    "h2-f64-active-stencil": dict(backend="h2", precision="double",
+                                  active_set=True, precond_engine="stencil"),
+    "h2-f64-active-fft":     dict(backend="h2", precision="double",
+                                  active_set=True, precond_engine="fft"),
     "h2-polish":         dict(backend="h2", precision="float_then_double"),
     "fft-f64":           dict(backend="fft", precision="double"),
     "fft-f32":           dict(backend="fft", precision="float",
@@ -478,7 +500,7 @@ def worker(workload, Ns, variant, reps, tol, light, coarsest, max_iter):
     for k in ("allow_tolerance_relaxation", "active_set", "active_all_levels",
               "active_halo", "active_max_rounds", "active_delta",
               "active_occupancy_max", "precond", "precond_engine",
-              "precond_radius"):
+              "precond_radius", "precond_occupancy_max"):
         if k in v:
             kwargs[k] = v[k]
 
@@ -514,6 +536,11 @@ def worker(workload, Ns, variant, reps, tol, light, coarsest, max_iter):
         "matvec_count": int(res.matvec_count),
         "verification_matvec_count": int(res.verification_matvec_count),
         "precond_count": int(res.precond_count),
+        # F1: whether the cost gate fired and dropped the preconditioner
+        # mid-solve. Was in the ledger's blast radius all along (it changes
+        # precond_count) but nothing compared it -- a pair differing here is
+        # not an apples-to-apples timing comparison (see analyze.py).
+        "precond_dropped": bool(res.precond_dropped),
         "identification_steps": int(res.identification_steps),
         "requested_tol": res.requested_tol, "effective_tol": res.effective_tol,
         "validation_scope": res.validation_scope,

@@ -69,6 +69,7 @@ add_library(aspher_core STATIC
   src/uniform_quadtree.cpp
   src/h2_operator.cpp
   src/fourier_precond.cpp
+  src/stencil_precond.cpp
   src/fft_operator.cpp
   src/nested_solve.cpp
   src/runtime_policy.cpp
@@ -99,7 +100,7 @@ endif()
 
 if(NOT SKBUILD)
   enable_testing()
-  foreach(t kernel hmatrix contact h2 precond fft active cerruti tangential friction driver uzawa certification precision contracts kernel_stability)
+  foreach(t kernel hmatrix contact h2 precond stencil fft active cerruti tangential friction driver uzawa certification precision contracts kernel_stability)
     add_executable(test_${t} tests/test_${t}.cpp)
     target_link_libraries(test_${t} PRIVATE aspher_core)
     target_compile_options(test_${t} PRIVATE -Wall -Wextra)

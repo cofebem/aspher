@@ -3,12 +3,14 @@
 #include "boussinesq_kernel.hpp"
 #include "fft_operator.hpp"
 #include "fourier_precond.hpp"
+#include "stencil_precond.hpp"
 #include "h2_operator.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <limits>
+#include <optional>
 #include <string>
 #include <memory>
 #include <stdexcept>
@@ -20,6 +22,20 @@
 #include <limits>
 
 namespace hmc {
+
+bool stencil_for_level(NestedParams::PrecondEngine engine, bool precond,
+                       double prev_occupancy, double occupancy_max) {
+    if (!precond) return false;
+    switch (engine) {
+        case NestedParams::PrecondEngine::stencil:
+            return true;
+        case NestedParams::PrecondEngine::fft:
+            return false;
+        case NestedParams::PrecondEngine::automatic:
+        default:
+            return prev_occupancy < 0.0 || prev_occupancy < occupancy_max;
+    }
+}
 
 // 2x2 block-average restriction: fine (Ns x Ns) -> coarse (Ns/2 x Ns/2).
 static Eigen::VectorXd restrict_field(Eigen::Ref<const Eigen::VectorXd> f,
@@ -100,6 +116,7 @@ static void dilate_mask(std::vector<std::uint8_t>& m, int Ns, int r) {
 template <class Real>
 static ContactResult active_level(const H2Operator& h2,
                                    const FourierPreconditioner* fp,
+                                   const StencilPreconditioner* sp,
                                    Eigen::Ref<const VecT<Real>> g0,
                                    double p_bar, double lvl_tol, int max_iter,
                                    bool use_pr, const NestedParams& np, int Ns,
@@ -170,13 +187,25 @@ static ContactResult active_level(const H2Operator& h2,
     p_init_d.resize(0);
 
     PrecondIntoT<Real> pc;
-    if (fp) {
-        pc = [fp, &gi](const Vec& g, const std::vector<std::uint8_t>& contact,
-                       Vec& z) {
-            if constexpr (is_double) fp->apply_into_indexed(g, contact, gi, z);
-            else fp->apply_single_into_indexed(g, contact, gi, z);
-        };
-    }
+    auto rebuild_pc = [&] {
+        if (sp) {
+            // O(N_c): no grid-sized allocation, so nothing to release later
+            StencilBlockLayout layout = h2.block_layout(mask);
+            pc = [sp, layout = std::move(layout)](
+                     const Vec& g, const std::vector<std::uint8_t>& contact,
+                     Vec& z) {
+                if constexpr (is_double) sp->apply_into_blocked(g, contact, layout, z);
+                else sp->apply_single_into_blocked(g, contact, layout, z);
+            };
+        } else if (fp) {
+            pc = [fp, &gi](const Vec& g, const std::vector<std::uint8_t>& contact,
+                           Vec& z) {
+                if constexpr (is_double) fp->apply_into_indexed(g, contact, gi, z);
+                else fp->apply_single_into_indexed(g, contact, gi, z);
+            };
+        }
+    };
+    rebuild_pc();
 
     ContactResult res;
     std::vector<double> hist;
@@ -216,6 +245,7 @@ static ContactResult active_level(const H2Operator& h2,
         aopt.scales.g_ref = g_ref;
         aopt.scales.datum_mode = SolveScales::DatumMode::caller;
         aopt.scales.datum = datum;
+        aopt.precond_cost_gate = np.precond_cost_gate;
         RestrictedCertificate cert;
         res = solve_contact_active_impl<Real>(mv, g0c, static_cast<Real>(p_bar),
                                               aopt, pc, cidx, &p0, &cert);
@@ -318,6 +348,7 @@ static ContactResult active_level(const H2Operator& h2,
         gi = h2.slot_grid_indices(mask);
         S = static_cast<std::ptrdiff_t>(gi.size());
         gather_level();
+        rebuild_pc();
 
         Vec pnew = Vec::Zero(S);
         const int nold = old_mask.nslots();
@@ -342,19 +373,57 @@ static ContactResult active_level(const H2Operator& h2,
             else h2.matvec_single_into(x, y);
         };
         PrecondIntoT<Real> pcf;
-        if (fp) {
+        if (sp) {
+            pcf = [sp](const Vec& g, const std::vector<std::uint8_t>& contact,
+                       Vec& z) {
+                if constexpr (is_double) sp->apply_into(g, contact, z);
+                else sp->apply_single_into(g, contact, z);
+            };
+        } else if (fp) {
             pcf = [fp](const Vec& g, const std::vector<std::uint8_t>& contact,
                        Vec& z) {
                 if constexpr (is_double) fp->apply_into(g, contact, z);
                 else fp->apply_single_into(g, contact, z);
             };
         }
-        // scatter the last restricted solution (p0: the loop only exits
-        // uncertified through the violations branch, which reassigns p0 on
-        // the CURRENT slot layout) to the full grid.
+        // Scatter the last restricted solution to the full grid. Neither p0
+        // NOR res.pressure is unconditionally safe here — the loop has TWO
+        // uncertified exits and each leaves a DIFFERENT one of the two
+        // stale/invalid relative to the current (S, gi) layout:
+        //   (a) the round-budget exhausted right after the violations branch
+        //       dilated C and rebuilt (S, gi, p0) for a round that never
+        //       ran: p0 = std::move(pnew) is valid and already sized to the
+        //       CURRENT S (a legitimate warm start: old slots copied, new
+        //       ones zero); but `res` is still the PREVIOUS, smaller round's
+        //       result, so res.pressure has the previous (smaller) S.
+        //   (b) the `nviol.load() == 0` break, taken when the restricted
+        //       solve did not converge but there is nothing outside C left
+        //       to expand into: no rebuild happened after that solve, so
+        //       res.pressure IS sized to the current S — but p0 was
+        //       CONSUMED by solve_contact_active_impl for that same call
+        //       (moved into the iterate, then `p_init->resize(0)`'d), so
+        //       p0(k) would dereference a freed, zero-sized buffer.
+        // p0.size() == S exactly distinguishes the two: true only on path
+        // (a) (path (b) leaves p0 resized to 0). Use whichever of the two is
+        // actually sized S.
         Vec pf = Vec::Zero(N);
+        if (p0.size() == S) {
+            // path (a): p0 is the valid, current-layout warm start.
 #pragma omp parallel for schedule(static)
-        for (std::ptrdiff_t k = 0; k < S; ++k) pf(gi[k]) = p0(k);
+            for (std::ptrdiff_t k = 0; k < S; ++k) pf(gi[k]) = p0(k);
+        } else {
+            // path (b): res.pressure is the valid, current-layout solution.
+            Vec prf;
+            const Vec* psrcf;
+            if constexpr (is_double) {
+                psrcf = &res.pressure;
+            } else {
+                prf = res.pressure.template cast<Real>();
+                psrcf = &prf;
+            }
+#pragma omp parallel for schedule(static)
+            for (std::ptrdiff_t k = 0; k < S; ++k) pf(gi[k]) = (*psrcf)(k);
+        }
         p0.resize(0);
         // No violation seeding: the old code had to put pressure on the
         // penetrating points because the Σ p|g| metric was blind to
@@ -375,6 +444,7 @@ static ContactResult active_level(const H2Operator& h2,
                                      ? SolveScales::DatumMode::solver
                                      : SolveScales::DatumMode::caller;
         fopt.scales.datum = datum;
+        fopt.precond_cost_gate = np.precond_cost_gate;
         res = solve_contact_impl<Real>(mvf, g0, static_cast<Real>(p_bar), fopt,
                                        pcf, &pf);
         it_total += res.iterations;
@@ -507,6 +577,9 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             throw std::invalid_argument(
                 "solve_contact_nested: active_occupancy_max must be > 0");
     }
+    if (!(np.precond_occupancy_max > 0.0))
+        throw std::invalid_argument(
+            "solve_contact_nested: precond_occupancy_max must be > 0");
 
     // ── A09: resolve the precision policy (legacy flag folds into it) ─────
     NestedParams::Precision policy = np.precision;
@@ -588,6 +661,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         st.status = r.status;
         st.fw_error = r.fw_error;
         st.penetration_error = r.penetration_error;
+        st.precond_dropped = r.precond_dropped;
         stages.push_back(std::move(st));
     };
 
@@ -618,14 +692,44 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             };
         }
 
-        FourierPreconditioner fp(n);
+        // one FFT on a min(n,512) grid per level; the radius is clamped so a
+        // small coarse level cannot ask for a stencil wider than itself, and
+        // never past leaf_side -- a precondition apply_into_blocked enforces
+        // at apply time but must be validated up front (spec Global
+        // Constraints: R <= leaf_side is asserted, never assumed, not
+        // discovered mid-solve inside a GIL-released CG loop).
+        const int r_lvl = std::min(
+            {np.precond_radius, std::max(1, n / 4), np.leaf_side});
+        const bool use_stencil = stencil_for_level(
+            np.precond_engine, np.precond, prev_occupancy,
+            np.precond_occupancy_max);
+        // Construct only the engine that will actually be used this level.
+        // FourierPreconditioner's constructor EAGERLY allocates its
+        // half-spectrum symbol table ((Ns/2+1)*Ns floats, ~512 MiB at
+        // Ns=16384) -- building it unconditionally on every level defeated
+        // the stencil default's entire point ("no grid allocation") for the
+        // ~5.5% of active-f32 peak RSS it cost while sitting completely
+        // unread. Likewise the stencil is skipped entirely when
+        // np.precond is false, so a caller asking for no preconditioner at
+        // all is never charged StencilPreconditioner's own validation
+        // (radius >= 1).
+        std::optional<FourierPreconditioner> fp_opt;
+        std::optional<StencilPreconditioner> sp_opt;
+        if (use_stencil) sp_opt.emplace(n, r_lvl);
+        else if (np.precond) fp_opt.emplace(n);
+        FourierPreconditioner* fp_ptr = fp_opt ? &*fp_opt : nullptr;
+        StencilPreconditioner* sp_ptr = sp_opt ? &*sp_opt : nullptr;
         t_build += std::chrono::duration<double>(
                        std::chrono::steady_clock::now() - t_lvl_build).count();
         PrecondIntoT<double> pc;
-        if (np.precond)
-            pc = [&fp](const Eigen::VectorXd& g,
-                       const std::vector<std::uint8_t>& contact,
-                       Eigen::VectorXd& z) { fp.apply_into(g, contact, z); };
+        if (sp_ptr)
+            pc = [sp_ptr](const Eigen::VectorXd& g,
+                          const std::vector<std::uint8_t>& contact,
+                          Eigen::VectorXd& z) { sp_ptr->apply_into(g, contact, z); };
+        else if (fp_ptr)
+            pc = [fp_ptr](const Eigen::VectorXd& g,
+                          const std::vector<std::uint8_t>& contact,
+                          Eigen::VectorXd& z) { fp_ptr->apply_into(g, contact, z); };
 
         const bool finest = (li + 1 == levels.size());
         // finest level reads the caller-owned g0 directly; coarse levels own
@@ -691,6 +795,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         lopt.scales.datum_mode = level_float
                                      ? SolveScales::DatumMode::caller
                                      : SolveScales::DatumMode::solver;
+        lopt.precond_cost_gate = np.precond_cost_gate;
 
         // A level can be restricted once there is a coarser level beneath it
         // to predict its contact from; the coarsest level always solves in
@@ -708,7 +813,8 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         if (use_active) {
             // restricted (active-set) solve on the candidate set built from
             // the coarse contact + gap; p_init/coarse_gap are consumed
-            const FourierPreconditioner* fpp = np.precond ? &fp : nullptr;
+            const StencilPreconditioner* spp = sp_ptr;
+            const FourierPreconditioner* fpp = fp_ptr;
             if (level_float) {
                 h2->build_single_caches();
                 // centre inside the cast: rounding a large offset first is
@@ -722,12 +828,12 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                 // the cast and only on the float path; the double path passes
                 // glvl straight through and must keep it alive.
                 if (!finest) gap[li].resize(0);
-                res = active_level<float>(*h2, fpp, g0f, p_bar, lvl_tol,
+                res = active_level<float>(*h2, fpp, spp, g0f, p_bar, lvl_tol,
                                            max_iter, use_pr, np, n, p_init,
                                            coarse_gap, record_history,
                                            light, g_ref, datum, 0.0);
             } else {
-                res = active_level<double>(*h2, fpp, glvl, p_bar, lvl_tol,
+                res = active_level<double>(*h2, fpp, spp, glvl, p_bar, lvl_tol,
                                             max_iter, use_pr, np, n, p_init,
                                             coarse_gap, record_history,
                                             light, g_ref, datum, datum);
@@ -758,11 +864,17 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
                 };
             }
             PrecondIntoT<float> pcf;
-            if (np.precond)
-                pcf = [&fp](const Eigen::VectorXf& g,
-                            const std::vector<std::uint8_t>& contact,
-                            Eigen::VectorXf& z) {
-                    fp.apply_single_into(g, contact, z);
+            if (sp_ptr)
+                pcf = [sp_ptr](const Eigen::VectorXf& g,
+                              const std::vector<std::uint8_t>& contact,
+                              Eigen::VectorXf& z) {
+                    sp_ptr->apply_single_into(g, contact, z);
+                };
+            else if (fp_ptr)
+                pcf = [fp_ptr](const Eigen::VectorXf& g,
+                              const std::vector<std::uint8_t>& contact,
+                              Eigen::VectorXf& z) {
+                    fp_ptr->apply_single_into(g, contact, z);
                 };
             Eigen::VectorXf g0f = (glvl.array() - datum).cast<float>();
             // free the coarse double gap once cast to float (the finest-level
@@ -817,6 +929,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             popt.scales.g_ref = g_ref;
             popt.scales.datum = datum;
             popt.scales.datum_mode = SolveScales::DatumMode::solver;
+            popt.precond_cost_gate = np.precond_cost_gate;
             const ContactResult before = res;
             res = solve_contact_impl<double>(mv, glvl, p_bar, popt, pc, &p_warm);
             record_stage("polish:" + std::to_string(n), "double", np.q, tol,

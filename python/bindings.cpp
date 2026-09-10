@@ -16,6 +16,7 @@
 #include "hmatrix.hpp"
 #include "nested_solve.hpp"
 #include "runtime_policy.hpp"
+#include "stencil_precond.hpp"
 #include "tangential_operator.hpp"
 
 #include <cstring>
@@ -185,14 +186,25 @@ public:
 
         hmc::Precond pc;
         if (precond == "fourier") {
-            auto fp = std::make_shared<hmc::FourierPreconditioner>(
-                Ns_);
+            // "fourier" now means the stencil: the same operator, applied as
+            // a 13-tap real-space disc on the contact set instead of two
+            // full-grid transforms
+            auto sp = std::make_shared<hmc::StencilPreconditioner>(Ns_, 2);
+            pc = [sp](const Eigen::VectorXd& g,
+                      const std::vector<std::uint8_t>& contact) {
+                Eigen::VectorXd z;
+                sp->apply_into(g, contact, z);
+                return z;
+            };
+        } else if (precond == "fourier-fft") {
+            auto fp = std::make_shared<hmc::FourierPreconditioner>(Ns_);
             pc = [fp](const Eigen::VectorXd& g,
                       const std::vector<std::uint8_t>& contact) {
                 return fp->apply(g, contact);
             };
         } else if (precond != "none" && !precond.empty()) {
-            throw std::invalid_argument("precond must be 'none' or 'fourier'");
+            throw std::invalid_argument(
+                "precond must be 'none', 'fourier' or 'fourier-fft'");
         }
 
         Eigen::VectorXd p0;
@@ -335,7 +347,10 @@ PyResult py_solve_nested(
     int grid_size,
     const py::array_t<double, py::array::c_style | py::array::forcecast>& gap,
     double p_nominal, double domain_size, double E_star, int coarsest, int q,
-    int leaf_side, bool precond, double tol, double coarse_tol, int max_iter,
+    int leaf_side, bool precond, const std::string& precond_engine,
+    int precond_radius, double precond_occupancy_max, double precond_cost_gate,
+    double tol,
+    double coarse_tol, int max_iter,
     bool use_pr, bool single_precision, const std::string& precision,
     double float_floor, bool allow_tolerance_relaxation, bool light_result,
     const std::string& backend, bool record_error_history, bool active_set,
@@ -357,6 +372,18 @@ PyResult py_solve_nested(
     np.q = q;
     np.leaf_side = leaf_side;
     np.precond = precond;
+    if (precond_engine == "stencil")
+        np.precond_engine = hmc::NestedParams::PrecondEngine::stencil;
+    else if (precond_engine == "fft")
+        np.precond_engine = hmc::NestedParams::PrecondEngine::fft;
+    else if (precond_engine == "auto")
+        np.precond_engine = hmc::NestedParams::PrecondEngine::automatic;
+    else
+        throw std::invalid_argument(
+            "precond_engine must be 'auto', 'stencil' or 'fft'");
+    np.precond_radius = precond_radius;
+    np.precond_occupancy_max = precond_occupancy_max;
+    np.precond_cost_gate = precond_cost_gate;
     np.coarse_tol = coarse_tol;
     np.single_precision = single_precision;
     if (precision == "double") np.precision = hmc::NestedParams::Precision::double_only;
@@ -692,6 +719,9 @@ PYBIND11_MODULE(aspher, m) {
         .def_property_readonly("returned_best",
                                [](const PyResult& s) { return s.r.returned_best; })
         .def_property_readonly(
+            "precond_dropped",
+            [](const PyResult& s) { return s.r.precond_dropped; })
+        .def_property_readonly(
             "stage_stats",
             [](const PyResult& s) {
                 py::list out;
@@ -708,6 +738,7 @@ PYBIND11_MODULE(aspher, m) {
                     d["status"] = std::string(hmc::to_string(st.status));
                     d["fw_error"] = st.fw_error;
                     d["penetration_error"] = st.penetration_error;
+                    d["precond_dropped"] = st.precond_dropped;
                     out.append(d);
                 }
                 return out;
@@ -774,7 +805,11 @@ PYBIND11_MODULE(aspher, m) {
              py::arg("precond") = "none", py::arg("p_init") = py::none(),
              "Solve the normal contact problem. use_pr=True (default) uses "
              "Polak-Ribiere+ beta. precond='fourier' enables the |q| spectral "
-             "preconditioner; p_init is an optional warm-start pressure field.")
+             "preconditioner, applied as a 13-tap real-space stencil on the "
+             "contact set (the default engine, O(taps*N_c), no grid "
+             "allocation); precond='fourier-fft' selects the historical "
+             "full-grid FFT transform of the same operator instead; "
+             "p_init is an optional warm-start pressure field.")
         .def("block_layout", &PyContactSolver::block_layout,
              "Return (N_blocks, 5) array [row_begin, row_size, col_begin, col_size, is_dense]")
         .def("recompress", &PyContactSolver::recompress, py::arg("svd_tol"),
@@ -786,6 +821,9 @@ PYBIND11_MODULE(aspher, m) {
           py::arg("gap"), py::arg("p_nominal"), py::arg("domain_size") = 1.0,
           py::arg("E_star") = 1.0, py::arg("coarsest") = 64, py::arg("q") = 6,
           py::arg("leaf_side") = 8, py::arg("precond") = true,
+          py::arg("precond_engine") = "auto", py::arg("precond_radius") = 2,
+          py::arg("precond_occupancy_max") = 0.4,
+          py::arg("precond_cost_gate") = 0.0,
           py::arg("tol") = 1e-8, py::arg("coarse_tol") = 1e-4,
           py::arg("max_iter") = 20000, py::arg("use_pr") = true,
           py::arg("single_precision") = false, py::arg("precision") = "",
@@ -802,6 +840,12 @@ PYBIND11_MODULE(aspher, m) {
           "each level with the prolonged coarse pressure. grid_size must equal "
           "coarsest * 2^k. Returns a ContactResult. backend='h2' (O(N) memory) "
           "or 'fft' (exact convolution, fastest at Ns<=8192). "
+          "precond_engine='auto' (default) picks per level from the previous "
+          "level's measured occupancy: the stencil below "
+          "precond_occupancy_max (default 0.4), else the historical full-grid "
+          "FFT transform (the regime where the truncated stencil kernel's "
+          "low-k error costs iterations). 'stencil' or 'fft' force that "
+          "engine at every level regardless of occupancy. "
           "precision='double' (default) | 'float' (== single_precision=True; "
           "cannot reach a tolerance below float_floor, and now reports "
           "'stagnated'/'precision_limit' rather than a relaxed success unless "
