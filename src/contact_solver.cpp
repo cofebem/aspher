@@ -103,6 +103,29 @@ inline ContactResult::Memory solve_memory(long long n, int real_bytes,
     return m;
 }
 
+// Shared cost gate (F1): after the first preconditioned iteration, compare
+// one apply against one matvec and drop the preconditioner if it is not
+// paying for itself. Restarting the direction (delta = 0) is required — the
+// conjugacy recurrence is only valid for a fixed M. Disabled by default
+// (opt.precond_cost_gate <= 0); see the SolveOptions::precond_cost_gate
+// comment for why it defaults off. Was duplicated verbatim between
+// solve_contact_impl and solve_contact_active_impl.
+template <class Real>
+inline void apply_cost_gate(const SolveOptions& opt, long long pcount,
+                            long long mv, double t_precond, double t_matvec,
+                            bool& precond_on, bool& precond_dropped,
+                            Real& delta) {
+    if (!precond_on || opt.precond_cost_gate <= 0.0) return;
+    if (pcount < 1 || mv < 1) return;
+    const double per_pc = t_precond / static_cast<double>(pcount);
+    const double per_mv = t_matvec / static_cast<double>(mv);
+    if (per_mv > 0.0 && per_pc > opt.precond_cost_gate * per_mv) {
+        precond_on = false;
+        precond_dropped = true;
+        delta = Real(0); // restart conjugacy: M changed
+    }
+}
+
 } // namespace
 
 // ── Full-grid Polonsky-Keer with certified termination ──────────────────────
@@ -206,22 +229,12 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
     double G_old = 1.0;
     Real delta = 0.0; // conjugation switch: 0 restarts the direction
 
-    // Cost gate: after the first preconditioned iteration, compare one apply
-    // against one matvec and drop the preconditioner if it is not paying for
-    // itself. Restarting the direction (delta = 0) is required -- the
-    // conjugacy recurrence is only valid for a fixed M.
+    // Cost gate (F1): shared helper, see its definition above.
     bool precond_on = static_cast<bool>(precond);
     bool precond_dropped = false;
     auto cost_gate = [&]() {
-        if (!precond_on || opt.precond_cost_gate <= 0.0) return;
-        if (pcount < 1 || mv < 1) return;
-        const double per_pc = t_precond / static_cast<double>(pcount);
-        const double per_mv = t_matvec / static_cast<double>(mv);
-        if (per_mv > 0.0 && per_pc > opt.precond_cost_gate * per_mv) {
-            precond_on = false;
-            precond_dropped = true;
-            delta = Real(0); // restart conjugacy: M changed
-        }
+        apply_cost_gate(opt, pcount, mv, t_precond, t_matvec, precond_on,
+                        precond_dropped, delta);
     };
 
     // Evaluate v = Sp + g0 from a *fresh* u, centre it, and recompute every
@@ -670,22 +683,12 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
     double G_old = 1.0;
     Real delta = 0.0;
 
-    // Cost gate: after the first preconditioned iteration, compare one apply
-    // against one matvec and drop the preconditioner if it is not paying for
-    // itself. Restarting the direction (delta = 0) is required -- the
-    // conjugacy recurrence is only valid for a fixed M.
+    // Cost gate (F1): shared helper, see its definition above.
     bool precond_on = static_cast<bool>(precond);
     bool precond_dropped = false;
     auto cost_gate = [&]() {
-        if (!precond_on || opt.precond_cost_gate <= 0.0) return;
-        if (pcount < 1 || mv < 1) return;
-        const double per_pc = t_precond / static_cast<double>(pcount);
-        const double per_mv = t_matvec / static_cast<double>(mv);
-        if (per_mv > 0.0 && per_pc > opt.precond_cost_gate * per_mv) {
-            precond_on = false;
-            precond_dropped = true;
-            delta = Real(0); // restart conjugacy: M changed
-        }
+        apply_cost_gate(opt, pcount, mv, t_precond, t_matvec, precond_on,
+                        precond_dropped, delta);
     };
 
     auto evaluate = [&](void) -> Diag {

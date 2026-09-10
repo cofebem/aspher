@@ -348,7 +348,8 @@ PyResult py_solve_nested(
     const py::array_t<double, py::array::c_style | py::array::forcecast>& gap,
     double p_nominal, double domain_size, double E_star, int coarsest, int q,
     int leaf_side, bool precond, const std::string& precond_engine,
-    int precond_radius, double precond_occupancy_max, double tol,
+    int precond_radius, double precond_occupancy_max, double precond_cost_gate,
+    double tol,
     double coarse_tol, int max_iter,
     bool use_pr, bool single_precision, const std::string& precision,
     double float_floor, bool allow_tolerance_relaxation, bool light_result,
@@ -382,6 +383,7 @@ PyResult py_solve_nested(
             "precond_engine must be 'auto', 'stencil' or 'fft'");
     np.precond_radius = precond_radius;
     np.precond_occupancy_max = precond_occupancy_max;
+    np.precond_cost_gate = precond_cost_gate;
     np.coarse_tol = coarse_tol;
     np.single_precision = single_precision;
     if (precision == "double") np.precision = hmc::NestedParams::Precision::double_only;
@@ -717,6 +719,9 @@ PYBIND11_MODULE(aspher, m) {
         .def_property_readonly("returned_best",
                                [](const PyResult& s) { return s.r.returned_best; })
         .def_property_readonly(
+            "precond_dropped",
+            [](const PyResult& s) { return s.r.precond_dropped; })
+        .def_property_readonly(
             "stage_stats",
             [](const PyResult& s) {
                 py::list out;
@@ -733,6 +738,7 @@ PYBIND11_MODULE(aspher, m) {
                     d["status"] = std::string(hmc::to_string(st.status));
                     d["fw_error"] = st.fw_error;
                     d["penetration_error"] = st.penetration_error;
+                    d["precond_dropped"] = st.precond_dropped;
                     out.append(d);
                 }
                 return out;
@@ -817,6 +823,7 @@ PYBIND11_MODULE(aspher, m) {
           py::arg("leaf_side") = 8, py::arg("precond") = true,
           py::arg("precond_engine") = "auto", py::arg("precond_radius") = 2,
           py::arg("precond_occupancy_max") = 0.4,
+          py::arg("precond_cost_gate") = 0.0,
           py::arg("tol") = 1e-8, py::arg("coarse_tol") = 1e-4,
           py::arg("max_iter") = 20000, py::arg("use_pr") = true,
           py::arg("single_precision") = false, py::arg("precision") = "",

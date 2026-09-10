@@ -33,9 +33,17 @@ struct StencilBlockLayout {
 // evaluated on the contact set is IDENTICAL to the full-grid convolution
 // sampled there; the only approximation anywhere is truncating w itself.
 //
-// Cost is O(taps * N_c) with no grid-sized allocation at all -- against the
-// FFT path's two Ns^2 transforms and four full-grid passes per apply, which at
-// Ns=16384 was 77-81% of the whole solve (spec §1).
+// Cost is O(taps * N_c) with no grid-sized allocation, for the compressed
+// active-set entry point actually used on the restricted path
+// (apply_into_blocked/StencilBlockLayout) -- against the FFT path's two Ns^2
+// transforms and four full-grid passes per apply, which at Ns=16384 was
+// 77-81% of the whole solve (spec §1). Two things are NOT O(N_c): the
+// full-grid apply_into (used off the active-set path, i.e. whenever a level
+// is not restricted) still scans all Ns^2 points to test contact[i], since it
+// has no compressed layout to iterate instead; and H2Operator::block_layout,
+// which builds a fresh StencilBlockLayout each active-set round, allocates
+// (Ns/leaf_side)^2 ints for block_slot. Both are still cheap in absolute
+// terms (no per-tap or per-Ns^2-transform cost), just not the claim above.
 //
 // Weights are normalised to w(0,0) = 1: the overall scale of M^-1 cancels in
 // CG, and the solver is scale-invariant by construction (A02).

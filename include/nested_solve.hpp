@@ -45,6 +45,10 @@ struct NestedParams {
     // active_occupancy_max by construction, but this is a SEPARATE knob:
     // disabling the active-set gate must not silently disable this one.
     double precond_occupancy_max = 0.4;
+    // Per-level SolveOptions::precond_cost_gate (F1). 0 (default) disables
+    // it, matching the SolveOptions default; see that field's comment for
+    // why. Opt-in only.
+    double precond_cost_gate = 0.0;
     double coarse_tol = 1e-4; // cascadic: looser tolerance on coarse levels
     // ── A09: precision policy ─────────────────────────────────────────────
     // `double_only`       every stage in double (default).

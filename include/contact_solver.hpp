@@ -107,6 +107,9 @@ struct ContactResult {
         double seconds = 0.0;
         SolveStatus status = SolveStatus::max_iterations;
         double fw_error = 0.0, penetration_error = 0.0;
+        // the cost gate fired and this stage finished unpreconditioned
+        // (spec §4.5; F1 — previously not populated per-stage at all).
+        bool precond_dropped = false;
     };
     std::vector<Stage> stage_stats;
 
@@ -158,12 +161,24 @@ struct SolveOptions {
     // Drop the preconditioner mid-solve when it stops paying for itself:
     // after the first iteration, if one apply costs more than
     // precond_cost_gate matvecs, the remaining iterations run unpreconditioned
-    // and the CG direction restarts. Measured (spec §3.1): running without
-    // the preconditioner wins exactly when that ratio exceeds m-1, where m is
-    // the iteration multiplier, itself 1.8-4.6 and growing with Ns; 1.5 fires
-    // on the cases that lose and not on the ones at parity. 0 disables.
-    // With the stencil engine the ratio is ~1e-3 and this never fires.
-    double precond_cost_gate = 1.5;
+    // and the CG direction restarts. 0 disables (default, 2026-09-10 —
+    // R10/F1). It was introduced to protect the FFT engine from ever being
+    // strictly worse than no preconditioner, but measurement on the
+    // active-set path showed the opposite: the restricted matvec is 1-2% of
+    // a full matvec there, so one full-grid FFT apply routinely exceeds
+    // 1.5x it and the gate fired on EVERY apply, silently disabling the FFT
+    // engine for the whole solve (`*-active-fft` ledger rows all show
+    // precond_count == 1). Worse, `FourierPreconditioner` lazily allocates
+    // its scratch on first use and that first apply runs on cold caches, so
+    // the one sample the gate takes lands at the most pessimistic possible
+    // moment: 2 of 8 fresh processes dropped the preconditioner and took 20
+    // iterations instead of 13 on IDENTICAL input, where the apply is 5x
+    // *cheaper* in steady state. A numerical trajectory should not depend on
+    // wall-clock timing. The gate remains available opt-in for the regime it
+    // was designed for (full-grid FFT precond, no active-set restriction);
+    // `precond_dropped` (below, and per-stage) reports whenever it fires so
+    // its effect on a run is never silently invisible again.
+    double precond_cost_gate = 0.0;
     // Success at an effective tolerance looser than the requested one is only
     // permitted when this is set; otherwise such a solve reports `stagnated`
     // with reason "precision_limit".

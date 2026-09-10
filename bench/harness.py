@@ -536,6 +536,11 @@ def worker(workload, Ns, variant, reps, tol, light, coarsest, max_iter):
         "matvec_count": int(res.matvec_count),
         "verification_matvec_count": int(res.verification_matvec_count),
         "precond_count": int(res.precond_count),
+        # F1: whether the cost gate fired and dropped the preconditioner
+        # mid-solve. Was in the ledger's blast radius all along (it changes
+        # precond_count) but nothing compared it -- a pair differing here is
+        # not an apples-to-apples timing comparison (see analyze.py).
+        "precond_dropped": bool(res.precond_dropped),
         "identification_steps": int(res.identification_steps),
         "requested_tol": res.requested_tol, "effective_tol": res.effective_tol,
         "validation_scope": res.validation_scope,

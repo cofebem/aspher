@@ -245,6 +245,7 @@ static ContactResult active_level(const H2Operator& h2,
         aopt.scales.g_ref = g_ref;
         aopt.scales.datum_mode = SolveScales::DatumMode::caller;
         aopt.scales.datum = datum;
+        aopt.precond_cost_gate = np.precond_cost_gate;
         RestrictedCertificate cert;
         res = solve_contact_active_impl<Real>(mv, g0c, static_cast<Real>(p_bar),
                                               aopt, pc, cidx, &p0, &cert);
@@ -443,6 +444,7 @@ static ContactResult active_level(const H2Operator& h2,
                                      ? SolveScales::DatumMode::solver
                                      : SolveScales::DatumMode::caller;
         fopt.scales.datum = datum;
+        fopt.precond_cost_gate = np.precond_cost_gate;
         res = solve_contact_impl<Real>(mvf, g0, static_cast<Real>(p_bar), fopt,
                                        pcf, &pf);
         it_total += res.iterations;
@@ -659,6 +661,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         st.status = r.status;
         st.fw_error = r.fw_error;
         st.penetration_error = r.penetration_error;
+        st.precond_dropped = r.precond_dropped;
         stages.push_back(std::move(st));
     };
 
@@ -792,6 +795,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         lopt.scales.datum_mode = level_float
                                      ? SolveScales::DatumMode::caller
                                      : SolveScales::DatumMode::solver;
+        lopt.precond_cost_gate = np.precond_cost_gate;
 
         // A level can be restricted once there is a coarser level beneath it
         // to predict its contact from; the coarsest level always solves in
@@ -925,6 +929,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             popt.scales.g_ref = g_ref;
             popt.scales.datum = datum;
             popt.scales.datum_mode = SolveScales::DatumMode::solver;
+            popt.precond_cost_gate = np.precond_cost_gate;
             const ContactResult before = res;
             res = solve_contact_impl<double>(mv, glvl, p_bar, popt, pc, &p_warm);
             record_stage("polish:" + std::to_string(n), "double", np.q, tol,

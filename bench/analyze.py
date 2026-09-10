@@ -47,9 +47,18 @@ def ok(r):
 
 
 def accuracy_key(r):
-    """What must match before two timings may be compared at all."""
+    """What must match before two timings may be compared at all.
+
+    precond_dropped is part of the contract, not just the accuracy: the F1/F2
+    incident was exactly a pair where the reference arm's cost gate silently
+    dropped the preconditioner mid-solve while the other arm's did not, so
+    "converged, same tolerance" alone still let a fundamentally different
+    solve (unpreconditioned vs preconditioned) get compared as if it were
+    the same one.
+    """
     return (r.get("status"), r.get("validation_scope"),
-            r.get("effective_tol"), r.get("requested_tol"))
+            r.get("effective_tol"), r.get("requested_tol"),
+            r.get("precond_dropped"))
 
 
 def bootstrap_ci(diffs, alpha=0.05, n=20000, seed=0):
