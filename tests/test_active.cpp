@@ -459,6 +459,53 @@ int main() {
         CHECK(std::abs(r7.contact_fraction - r0.contact_fraction) <= 1e-6);
     }
 
+    // ── F4 regression: the THIRD uncertified exit from the active-set loop ──
+    // The loop can leave the `while` unconverged three ways: (a) the round
+    // budget is exhausted after the violations branch reassigned p0 on a
+    // fresh layout, (b) the same violations branch mid-loop, or (c) the
+    // `nviol.load() == 0` break taken when the restricted solve itself did
+    // not converge but there is nothing outside C to expand into. On path
+    // (c), p0 was already CONSUMED by solve_contact_active_impl (moved into
+    // the iterate, then resized to 0), so scattering the fallback's warm
+    // start from p0 dereferences a freed, zero-sized buffer — an Eigen
+    // index assertion under a debug build, UB otherwise (only reproduces at
+    // OMP_NUM_THREADS>1, since the OpenMP-parallel scatter is what indexes
+    // past the end). A generous active_delta makes the candidate set cover
+    // essentially the whole grid (nviol == 0 from round 1), and a tiny
+    // max_iter guarantees the restricted CG does not converge in time, so
+    // the driver must fall back — and must not crash or corrupt the answer
+    // while doing so.
+    {
+        const int Ns3 = 256;
+        const double pbar3 = 0.005;
+        const Eigen::VectorXd gap3 = rough_gap(Ns3, 7);
+
+        hmc::NestedParams np_third;
+        np_third.coarsest = 64;
+        np_third.active_set = true;
+        np_third.active_delta = 1e9; // candidate set ~= whole grid: nviol==0
+        np_third.active_max_rounds = 5;
+        // max_iter = 2 starves the restricted CG (and, on this path, the
+        // fallback's own solve too) so it cannot converge before nviol==0
+        // forces the third exit; the point of this test is that the driver
+        // must not crash while taking it, not that it reaches tol=1e-8 in
+        // two iterations.
+        auto r8 = hmc::solve_contact_nested(Ns3, 1.0, 1.0, gap3, pbar3, 1e-8,
+                                            2, true, np_third);
+        // Must not crash (the historical bug: p0 was consumed by
+        // solve_contact_active_impl on this exit, so scattering the
+        // fallback's warm start from p0 dereferenced a freed, zero-sized
+        // buffer) and must produce a finite, correctly-shaped result.
+        CHECK(r8.active_fallback);
+        CHECK(r8.pressure.size() == Ns3 * Ns3);
+        CHECK(r8.pressure.allFinite());
+        CHECK((r8.pressure.array() >= 0).all());
+        std::printf("active third-exit fallback: fallback=%d status=%s "
+                    "mean_p err %.2e\n",
+                    int(r8.active_fallback), hmc::to_string(r8.status),
+                    std::abs(r8.pressure.mean() - pbar3) / pbar3);
+    }
+
     // ── T06: a restricted certificate is NOT a global one ───────────────────
     // A candidate set that excludes real contact lets the restricted solve
     // converge on its own subproblem while the true solution penetrates

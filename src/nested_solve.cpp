@@ -385,12 +385,44 @@ static ContactResult active_level(const H2Operator& h2,
                 else fp->apply_single_into(g, contact, z);
             };
         }
-        // scatter the last restricted solution (p0: the loop only exits
-        // uncertified through the violations branch, which reassigns p0 on
-        // the CURRENT slot layout) to the full grid.
+        // Scatter the last restricted solution to the full grid. Neither p0
+        // NOR res.pressure is unconditionally safe here — the loop has TWO
+        // uncertified exits and each leaves a DIFFERENT one of the two
+        // stale/invalid relative to the current (S, gi) layout:
+        //   (a) the round-budget exhausted right after the violations branch
+        //       dilated C and rebuilt (S, gi, p0) for a round that never
+        //       ran: p0 = std::move(pnew) is valid and already sized to the
+        //       CURRENT S (a legitimate warm start: old slots copied, new
+        //       ones zero); but `res` is still the PREVIOUS, smaller round's
+        //       result, so res.pressure has the previous (smaller) S.
+        //   (b) the `nviol.load() == 0` break, taken when the restricted
+        //       solve did not converge but there is nothing outside C left
+        //       to expand into: no rebuild happened after that solve, so
+        //       res.pressure IS sized to the current S — but p0 was
+        //       CONSUMED by solve_contact_active_impl for that same call
+        //       (moved into the iterate, then `p_init->resize(0)`'d), so
+        //       p0(k) would dereference a freed, zero-sized buffer.
+        // p0.size() == S exactly distinguishes the two: true only on path
+        // (a) (path (b) leaves p0 resized to 0). Use whichever of the two is
+        // actually sized S.
         Vec pf = Vec::Zero(N);
+        if (p0.size() == S) {
+            // path (a): p0 is the valid, current-layout warm start.
 #pragma omp parallel for schedule(static)
-        for (std::ptrdiff_t k = 0; k < S; ++k) pf(gi[k]) = p0(k);
+            for (std::ptrdiff_t k = 0; k < S; ++k) pf(gi[k]) = p0(k);
+        } else {
+            // path (b): res.pressure is the valid, current-layout solution.
+            Vec prf;
+            const Vec* psrcf;
+            if constexpr (is_double) {
+                psrcf = &res.pressure;
+            } else {
+                prf = res.pressure.template cast<Real>();
+                psrcf = &prf;
+            }
+#pragma omp parallel for schedule(static)
+            for (std::ptrdiff_t k = 0; k < S; ++k) pf(gi[k]) = (*psrcf)(k);
+        }
         p0.resize(0);
         // No violation seeding: the old code had to put pressure on the
         // penetrating points because the Σ p|g| metric was blind to
