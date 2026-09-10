@@ -24,7 +24,9 @@
 > original rows too (verified directly); those sections are unchanged.
 
 Companion to `doc/specs/2026-09-09-stencil-preconditioner-design.md`. Ledger:
-`data/bench_stencil.jsonl` (all rows below; revision `3125c07`, not dirty). All
+`data/bench_stencil.jsonl` (original rows: revision `3125c07`; re-baseline
+rows after the correction above: revisions `279a871`..`35ac7d6`, all not
+dirty). All
 rows are `status=converged` at matching `effective_tol` within each pair
 (float: 2e-6, double: 1e-8) and matching `validation_scope=solve_operator`, so
 timing comparisons are apples-to-apples. Runs use `active_set=True` on the h2
@@ -57,6 +59,42 @@ python bench/harness.py run \
     --reps 5 --ledger data/bench_stencil.jsonl
 ```
 
+The default-workload (`rough-H0.8`) rows were **re-run after the correction**
+with `precond_cost_gate` at its new default (`0.0`, disabled) once F1 landed:
+
+```bash
+python bench/harness.py run --workload rough-H0.8 --ns 1024 \
+    --variants h2-f32-active-fft,h2-f32-active-stencil --reps 5 --force \
+    --ledger data/bench_stencil.jsonl
+python bench/harness.py run --workload rough-H0.8 --ns 1024 \
+    --variants h2-f64-active-fft,h2-f64-active-stencil --reps 5 --force \
+    --ledger data/bench_stencil.jsonl
+python bench/harness.py run --workload rough-H0.8 --ns 4096 \
+    --variants h2-f32-active-fft,h2-f32-active-stencil --reps 5 --force \
+    --ledger data/bench_stencil.jsonl
+python bench/harness.py run --workload rough-H0.8 --ns 4096 \
+    --variants h2-f64-active-fft,h2-f64-active-stencil --reps 5 --force \
+    --ledger data/bench_stencil.jsonl
+python bench/harness.py run --workload rough-H0.8 --ns 16384 \
+    --variants h2-f32-active-fft,h2-f32-active-stencil --reps 1 --force \
+    --ledger data/bench_stencil.jsonl
+python bench/harness.py run --workload rough-H0.8 --ns 16384 \
+    --variants h2-f64-active-fft,h2-f64-active-stencil --reps 1 --force \
+    --ledger data/bench_stencil.jsonl
+```
+
+`--force` was required because the ledger's dedup key (workload, Ns, variant,
+rep) matched the original, gate-corrupted rows; every new row was verified
+(`precond_count == iterations`, `precond_dropped == False`) before use. The
+22 gate-corrupted `*-active-fft` rows at this workload (`precond_count == 1`
+with `iterations > 1`) were then removed from `data/bench_stencil.jsonl`
+outright, and their now-superseded `*-active-stencil` and `*-active-fft`
+duplicates from the same reruns were deduplicated to the freshest row per
+key — an append-only ledger is the right default, but a row that is actively
+wrong (and, per F1's `analyze.py` contract guard, would otherwise sit at a
+different `precond_dropped` value than its sibling and silently disqualify
+future comparisons) does not belong in the record it is meant to protect.
+
 All ran inside chunked, in-sandbox `Bash` calls (each finished well inside the
 10-minute tool timeout — the biggest single run, Ns=16384 f64-fft, took 88 s);
 the detached-launch path was not needed for this task.
@@ -85,9 +123,9 @@ is reported here for completeness but is not the gate point; it does not meet
 the ≥40% requirement even though it is more heavily loaded than the spec's own
 24.4% probe (measured at a different Ns).
 
-## Paired A/B, fixed default load (`rough-H0.8`, occupancy 0.04–0.11%)
+## Paired A/B, fixed default load (`rough-H0.8`, occupancy 0.04–0.11%) — CORRECTED
 
-Analyzed with:
+Re-measured with the cost gate at its new default (disabled). Analyzed with:
 ```bash
 python bench/analyze.py --pair h2-f32-active-fft,h2-f32-active-stencil --metric wall_cold_s --ledger data/bench_stencil.jsonl
 python bench/analyze.py --pair h2-f32-active-fft,h2-f32-active-stencil --metric peak_rss_gib --ledger data/bench_stencil.jsonl --target 0.0
@@ -95,75 +133,124 @@ python bench/analyze.py --pair h2-f64-active-fft,h2-f64-active-stencil --metric 
 python bench/analyze.py --pair h2-f64-active-fft,h2-f64-active-stencil --metric peak_rss_gib --ledger data/bench_stencil.jsonl --target 0.0
 ```
 
+Every row below has `precond_count == iterations` and `precond_dropped ==
+False` on both arms, verified before use.
+
 ### float32
 
 | Ns | n | fft wall | stencil wall | change | CI | area spread |
 |---|---|---|---|---|---|---|
-| 1024  | 5 | 0.193 s | 0.169 s | **−12.2%** | [−39.3, −0.6]% | 0 |
-| 4096  | 5 | 1.207 s | 0.890 s | **−26.3%** | [−34.3, −17.7]% | 9.0e-05 |
-| 16384 | 1 | 32.98 s | 11.50 s | **−65.1%** (indicative, n=1) | n/a | 8.4e-06 |
+| 1024  | 5 | 0.231 s | 0.180 s | −20.6% | [−49.3, +10.2]% (does not exclude zero) | 0 |
+| 4096  | 5 | 2.037 s | 0.912 s | **−54.9%** | [−56.0, −52.1]% | 0 |
+| 16384 | 1 | 64.88 s | 11.63 s | **−82.1%** (indicative, n=1) | n/a | 1.7e-05 |
 
 | Ns | n | fft RSS | stencil RSS | change | CI |
 |---|---|---|---|---|---|
-| 1024  | 5 | 0.108 GiB | 0.105 GiB | −2.8% | [−3.4, −2.5]% |
-| 4096  | 5 | 0.711 GiB | 0.673 GiB | −5.4% | [−5.5, −5.3]% |
-| 16384 | 1 | 9.117 GiB | 9.117 GiB | ~0% | n/a |
+| 1024  | 5 | 0.107 GiB | 0.105 GiB | −2.5% | [−3.2, −2.3]% |
+| 4096  | 5 | 0.711 GiB | 0.672 GiB | −5.4% | [−5.5, −5.3]% |
+| 16384 | 1 | 9.117 GiB | 9.118 GiB | ~0% | n/a |
 
 ### float64
 
 | Ns | n | fft wall | stencil wall | change | CI | area spread |
 |---|---|---|---|---|---|---|
-| 1024  | 5 | 0.218 s | 0.182 s | −17.5% | [−21.2, **+56.4**]% (does not exclude zero) | 0 |
-| 4096  | 5 | 1.635 s | 1.096 s | **−32.5%** | [−44.9, −27.5]% | 0 |
-| 16384 | 1 | 88.26 s | 30.48 s | **−65.5%** (indicative, n=1) | n/a | 0 |
+| 1024  | 5 | 0.310 s | 0.222 s | **−23.7%** | [−29.6, −16.5]% | 0 |
+| 4096  | 5 | 3.365 s | 1.045 s | **−69.3%** | [−71.2, −67.3]% | 0 |
+| 16384 | 1 | 178.1 s | 28.16 s | **−84.2%** (indicative, n=1) | n/a | 0 |
 
 | Ns | n | fft RSS | stencil RSS | change | CI |
 |---|---|---|---|---|---|
-| 1024  | 5 | 0.119 GiB | 0.111 GiB | −7.5% | [−7.7, −6.9]% |
-| 4096  | 5 | 0.827 GiB | 0.663 GiB | **−19.9%** | [−20.0, −19.8]% |
-| 16384 | 1 | 9.315 GiB | 9.117 GiB | −2.1% | n/a |
+| 1024  | 5 | 0.119 GiB | 0.110 GiB | −7.6% | [−8.0, −7.1]% |
+| 4096  | 5 | 0.826 GiB | 0.663 GiB | **−19.8%** | [−20.0, −19.7]% |
+| 16384 | 1 | 9.315 GiB | 9.117 GiB (previous rep) | −2.1% | n/a |
 
-Contact area agrees to within 9e-05 absolute (float, worst case) or exactly
-(double) across every pair — the engines answer the same problem.
+Contact area agrees to within 1.7e-05 absolute (float, worst case) or exactly
+(double) across every pair — the engines answer the same problem. RSS numbers
+are essentially unchanged from the retracted measurement (the cost gate
+affects which code path a solve takes, not how much memory it allocates), so
+the RSS story is unaffected by the correction: the stencil's memory edge is
+real but modest (0–20%), smallest at Ns=1024/16384, largest at Ns=4096 f64.
 
-### Per-phase breakdown (float32, median over reps)
+### Iteration counts (median) — the corrected direction
 
-```
-occup.    total   coarse  precond   matvec  candid.   verif.
---- h2-f32-active-fft ---
-0.066%    1.154    0.143    0.050    0.284   0.0249   0.0165
-0.106%    0.220    0.043    0.003    0.024   0.0046   0.0022
---- h2-f32-active-stencil ---
-0.066%    0.843    0.102    0.009    0.099   0.0263   0.0165
-0.106%    0.164    0.031    0.001    0.014   0.0036   0.0015
-```
+| Ns | fft it | stencil it | nopc it | stencil/fft ratio |
+|---|---|---|---|---|
+| 1024 f32  | **11** | 13 | 23 | +18% |
+| 4096 f32  | **19** | 25 | 69 | +32% |
+| 16384 f32 | **47** | 61 | —  | +30% |
+| 1024 f64  | **15** | 17 | —  | +13% |
+| 4096 f64  | **25** | 33 | —  | +32% |
+| 16384 f64 | **72** | 94 | —  | +31% |
 
-The preconditioner's own share collapses (0.050→0.009 s at Ns=4096, 0.003→0.001
-at Ns=1024 — roughly 5× and 3×), but the *matvec* line also shrinks nearly
-3× (0.284→0.099, 0.024→0.014). That second drop is not something the stencil
-change should touch directly; it tracks iteration count, which fell sharply
-under the stencil (see below) — fewer PCG iterations means fewer matvecs, not
-a faster matvec. The total-wall reduction is the product of both effects.
+**This is the opposite of what the retracted measurement reported.** The
+exact full-grid FFT application of the `|k|` symbol is the *stronger*
+preconditioner per iteration — it needs 13–32% *fewer* iterations than the
+truncated 13-tap stencil, and the gap widens with `Ns`, exactly as the
+truncated symbol's flatter, less-faithful approximation of `|k|` would
+predict (see the "why the first measurement was wrong" section below, and
+`doc/theory/pcg.tex`'s "positivity of the truncated symbol" paragraph for the
+spectral argument: `min/max` of the truncated symbol is 0.137 vs 6.9e-4 for
+the true `|k|` symbol — a genuinely worse-conditioned reweighting). The
+stencil wins on WALL TIME anyway, and decisively (18–84%, growing with `Ns`),
+because a full-grid FFT application costs one to two orders of magnitude more
+than a truncated real-space sum restricted to the active-set candidate set,
+where the masked matvec itself is only 1–2% of a full one. The correct
+one-line summary: **the stencil is a somewhat weaker preconditioner per
+iteration but one to two orders of magnitude cheaper per application, so it
+wins decisively on wall time at low occupancy** — not "a better
+preconditioner, not merely a cheaper one," which is retracted.
 
-### Iteration counts (median)
+Against the `nopc` baseline (no preconditioner at all — unaffected by the
+cost-gate bug, since there is nothing for the gate to drop), the stencil
+still wins outright: **−17.8%** at Ns=1024 f32 (0.180 s vs 0.219 s no-precond,
+from the existing, uncorrupted ledger rows) and **−21.4%** at Ns=4096 f32
+(0.912 s vs 1.160 s; `bench/analyze.py`'s own guard disqualifies this specific
+pair as "different accuracy contract" only because the legacy `nopc` rows
+predate the `precond_dropped` field entirely — `None` vs `False` — not
+because of any real difference in what was measured; medians computed
+directly from the ledger). The full-grid FFT arm, by contrast, is *slower than no
+preconditioner at all* here at Ns=4096 f32 (2.037 s vs 1.160 s, +76%) despite
+needing far fewer iterations (19 vs 69): on this restricted path its
+per-application cost is high enough to erase the entire benefit of
+preconditioning. That is itself a useful, previously invisible finding: a
+correct, effective preconditioner can still be a net loss if its application
+cost is mismatched to the size of the matvec it is meant to speed up.
 
-| Ns | fft it | stencil it | nopc it |
-|---|---|---|---|
-| 1024 f32 | 22 | **13** | 23 |
-| 4096 f32 | 62 | **25** | 69 |
-| 16384 f32 | 208 | **61** | — |
-| 1024 f64 | 30 | **17** | — |
-| 4096 f64 | 79 | **33** | — |
-| 16384 f64 | 272 | **94** | — |
+### Why the first measurement was wrong
 
-The stencil preconditioner is not merely a cheaper application of the same
-`|k|` operator — it also converges the PCG in noticeably fewer iterations at
-every grid size tested here, and the gap widens with Ns (2.9× fewer at
-Ns=16384 f64). This is a stronger and more surprising result than "same
-convergence, cheaper per-iteration cost," and it is the dominant driver of the
-wall-time win at large Ns, not the per-application FFT removal alone. It
-should be treated as measured behaviour on this one surface family
-(rough-H0.8, self-affine, seeded), not yet as a proven general property.
+The retracted numbers were not fabricated or mis-transcribed — they were
+measured, honestly, from a solver whose numerical path silently depended on
+wall-clock timing. `SolveOptions::precond_cost_gate` (default `1.5` before
+this fix) samples one preconditioner-apply-to-matvec cost ratio after the
+first iteration and, if it exceeds the threshold, drops the preconditioner
+for the rest of the solve. On the active-set restricted path the masked
+matvec is 1–2% of a full one, so a full-grid FFT apply — unrestricted, it
+still touches every grid point — routinely costs many times a single masked
+matvec, and the gate fired on **every** `*-active-fft` run at this workload.
+The result: what the ledger labelled "the FFT-preconditioned solve" ran
+correctly preconditioned for exactly one iteration, then unpreconditioned
+for the rest — a fundamentally different (and much slower-converging) solve
+than the one the variant name claimed. `precond_count` — 1, instead of the
+iteration count — was in the ledger the whole time, but nothing compared it
+against `iterations`, so a >1 order-of-magnitude corruption to the headline
+comparison went unnoticed through a full write-up, a promotion verdict, and
+three separate documents (this one, `CLAUDE.md`, `doc/theory/pcg.tex`).
+
+Two structural fixes came out of this, both now in place: (1)
+`precond_cost_gate` defaults to `0.0` (disabled) — a solver's numerical
+trajectory should not depend on wall-clock timing, and the gate is now
+opt-in for the regime it was actually designed to protect (a full-grid FFT
+preconditioner with no active-set restriction); (2) `precond_dropped` is
+bound end-to-end (Python, per-stage in `stage_stats`, the bench ledger) and
+`bench/analyze.py`'s accuracy-contract guard now disqualifies a pair whose
+arms disagree on it — so a repeat of exactly this failure mode would fail
+loudly (a "DISQUALIFIED: different accuracy contract" line) rather than
+silently producing a wrong headline number. The lesson for any future
+benchmark note: **every field the ledger records for a "why did this run
+converge the way it did" reason belongs in the accuracy-contract check, not
+just the ones that were designed in from the start** — `precond_count` was
+exactly such a field, present from the first commit of this benchmark,
+unused until the incident that made its absence from the guard obvious.
 
 ## The required high-occupancy point: `rough-H0.8@2.0`, 56.75% contact
 
@@ -217,14 +304,19 @@ Applying the plan's rule (≥10% median improvement, ≥5 paired samples, no cas
 regressing beyond 5%):
 
 - **Low/typical occupancy (≤~2.5%, Ns=1024/4096, both precisions):** clears
-  the bar. Ns=4096 f32 (−26.3%, CI excludes zero) and f64 (−32.5%, CI excludes
-  zero) both exceed 10% with 5 paired samples; Ns=1024 f32 also clears
-  (−12.2%, CI excludes zero) though narrowly; Ns=1024 f64 is favourable in
-  direction (−17.5%) but its CI does not exclude zero at n=5, so it is
-  indicative only at that specific size. Ns=16384 (both precisions) shows a
-  large favourable single-sample result (−65%) consistent in direction and
-  magnitude with the 5-sample cases, but is single-rep and therefore
-  indicative, not a confirmed pass on its own.
+  the bar, using the corrected (post-F1) numbers. Ns=4096 f32 (**−54.9%**, CI
+  excludes zero) and f64 (**−69.3%**, CI excludes zero) both exceed 10% with 5
+  paired samples; Ns=1024 f64 also clears (**−23.7%**, CI excludes zero);
+  Ns=1024 f32 is favourable in direction (−20.6%) but its CI does not exclude
+  zero at n=5 (wide interval from only 5 samples at a small, noisy absolute
+  wall time), so it is indicative only at that specific size. Ns=16384 (both
+  precisions) shows a large favourable single-sample result (−82%/−84%)
+  consistent in direction and magnitude with the 5-sample cases, but is
+  single-rep and therefore indicative, not a confirmed pass on its own. The
+  win is now understood to come entirely from the stencil's far cheaper
+  per-application cost, not from a lower iteration count — the corrected
+  iteration counts run the *other* way (stencil needs 13–32% more iterations
+  than fft at this occupancy; see "Paired A/B" above).
 - **Required high-occupancy point (`rough-H0.8@2.0`, 56.75% contact,
   Ns=1024, 5 paired samples):** **fails the rule** — the stencil is ~17%
   *slower*, a confirmed regression beyond the 5% budget (CI excludes zero in
@@ -251,7 +343,17 @@ proposed for the active-set restriction itself:
 The 4–5× total-wall-time projection from the design work **did materialize at
 low occupancy and large Ns** (2.87× at Ns=16384 f32, 2.90× at Ns=16384 f64 —
 short of "4–5×" but a large, real win) but **did not hold, and inverted, at
-the required near-full-contact gate point.** Memory did not show the dramatic
+the required near-full-contact gate point.** These two ratios are the
+*whole-nested-solve* comparison against the pre-stencil standard path
+(`doc/bench/2026-09-09-ns16384-rebaseline.md`), not this note's
+`*-active-fft`-vs-`*-active-stencil` isolate — they were not re-verified
+against `precond_count`/`precond_dropped` as part of this correction, and
+should be read with the same caution the rest of this note now applies to
+any pre-F1 wall-time number until spot-checked. The finest-level, isolated
+comparison directly above (18–84% depending on Ns and precision, all
+confirmed `precond_count == iterations`) is the number to trust for the
+finest-level engine choice; treat the whole-solve 2.87×/2.90× as plausible
+but unaudited. Memory did not show the dramatic
 drop one might expect from removing full-grid FFT scratch either: RSS
 improved only modestly (0–20%, mostly at Ns=4096 f64) and was flat within
 noise at Ns=1024 and Ns=16384 — the full-grid `gap`/`warm_start`/`output`
@@ -262,14 +364,16 @@ reported as measured findings, not confirmations of the design-time estimate.
 
 ## Ledger
 
-All rows: `data/bench_stencil.jsonl` (84 rows total: 5 reps × 3 variants × 2 Ns
-= 30 for the float main A/B, 5 × 2 × 2 = 20 for the double main A/B, 1 rep ×
-2 variants × 2 precisions = 4 for Ns=16384, 5 × 2 variants × 3 workloads = 30
-for the occupancy sweep). The `p_bar` occupancy-dial probes (0.5, 1.0, 2.0,
-one rep each, used only to pick the gate load) were run to a separate,
-uncommitted scratch ledger and deleted after use; they are not part of the
-analyzed A/B and are reproducible from the commands in the "Occupancy dial"
-section above if needed.
+All rows: `data/bench_stencil.jsonl` (94 rows after the F3 correction: the
+original 84 minus the 22 gate-corrupted `*-active-fft` rows at the default
+`rough-H0.8` workload, plus 32 fresh rows from the re-run — 5 reps × 4
+(fft/stencil × f32/f64) at Ns=1024, 5 reps × 4 at Ns=4096, 1 rep × 4 at
+Ns=16384 — deduplicated against their own superseded `--force` reruns down
+to one row per (workload, Ns, variant, rep)). The `p_bar` occupancy-dial
+probes (0.5, 1.0, 2.0, one rep each, used only to pick the gate load) were
+run to a separate, uncommitted scratch ledger and deleted after use; they
+are not part of the analyzed A/B and are reproducible from the commands in
+the "Occupancy dial" section above if needed.
 
 ## Task 7 — occupancy-gated engine choice (`automatic`, now the default)
 
@@ -329,6 +433,21 @@ The forwarding allowlist in `bench/harness.py` (`worker()`) gained
 `solver_args` was inspected directly and shows `"precond_engine": "auto"`
 arriving at the solver (the historical failure mode — a key silently dropped
 by the allowlist — was checked for, not assumed absent).
+
+**F3 note on this subsection's `@0.002` numbers.** The `@2.0` (≈57% contact)
+rows below are confirmed unaffected by the cost-gate bug
+(`precond_count == iterations` on every row, checked directly — that
+occupancy runs the plain full-grid solve, where the gate's ratio rarely
+crosses its threshold). The `@0.002` (≈0.1% contact) `h2-f32-active-fft` row
+IS one of the gate-corrupted rows (`precond_count == 1` against 22
+iterations) and was not re-run as part of this correction (out of the scope
+directed for F3, which targeted the default `rough-H0.8` workload at
+Ns=1024/4096). This does not change the conclusion drawn from it below,
+which already treated the `@0.002` auto-vs-fft comparison as statistically
+inconclusive (CI does not exclude zero) and promoted nothing on its basis —
+but the exact `-21.16%` figure should not be read as a confirmed number, and
+a future re-measurement of this specific row would be needed before citing
+it standalone.
 
 ```
 === rough-H0.8@2.0 (≈57% contact): h2-f32-active-auto vs h2-f32-active-fft ===

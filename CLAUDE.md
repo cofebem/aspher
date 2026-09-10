@@ -302,19 +302,36 @@ Default β formula: **Polak-Ribière+** (`use_pr=true`); Fletcher-Reeves availab
     at all, plus `precond_engine="auto"` (default) / `"stencil"` / `"fft"`
     for which application it uses, plus `precond_occupancy_max` (default
     0.4, see below) for where `"auto"` switches between them.
-  - **Measured result is stronger than "same convergence, cheaper
-    application": the stencil is a *better* preconditioner, not merely a
-    cheaper one.** Iteration counts (float32 unless noted, rough-H0.8):
-    Ns=1024 fft 22 / stencil **13** / no-precond 23; Ns=4096 fft 62 /
-    stencil **25** / no-precond 69; Ns=16384 fft 208 / stencil **61**;
-    Ns=4096 f64 fft 79 / stencil **33**; Ns=16384 f64 fft 272 / stencil
-    **94**. At Ns=1024 the full-grid `|q|` FFT preconditioner (22 it) is
-    barely earning its keep over no preconditioner at all (23 it), while the
-    truncated stencil (13 it) does markedly better — consistent with the
-    truncated symbol being far flatter, i.e. the long-range content the FFT
-    computes so expensively is largely irrelevant once contact is dilute.
-    Measured on one surface family (self-affine rough-H0.8, seeded) —
-    established behaviour on that family, not yet a proven general property.
+  - **RETRACTED CLAIM, corrected 2026-09-10 (final whole-branch review,
+    F1-F3).** This bullet used to claim "the stencil is a *better*
+    preconditioner, not merely a cheaper one," backed by iteration counts
+    showing the stencil converging in far fewer iterations than the
+    full-grid FFT (e.g. Ns=1024 fft 22 / stencil 13). Those FFT-arm numbers
+    were an artefact: a runtime "cost gate" (`SolveOptions::precond_cost_gate`,
+    then defaulting to `1.5`) sampled one apply-vs-matvec cost ratio after
+    the first iteration and, because a full-grid FFT apply routinely exceeds
+    that ratio against the cheap masked matvec on this active-set path,
+    silently dropped the FFT preconditioner after iteration 1 on every
+    affected run (ledger evidence: `precond_count == 1` on every
+    `*-active-fft` row at this workload, vs `precond_count == iterations` on
+    the stencil rows — present in the ledger throughout, never compared).
+    **The honest, corrected finding is the opposite direction**: the exact
+    full-grid FFT application is the *stronger* preconditioner per iteration
+    — it needs 13-32% *fewer* iterations than the truncated 13-tap stencil,
+    the gap widening with `Ns` (float32, rough-H0.8, active-set, gate now
+    disabled): Ns=1024 fft **11** / stencil 13 / no-precond 23; Ns=4096 fft
+    **19** / stencil 25 / no-precond 69; Ns=16384 fft **47** / stencil 61.
+    The stencil still wins decisively on WALL TIME (18-84%, growing with
+    `Ns`), because one full-grid FFT application costs one to two orders of
+    magnitude more than the truncated real-space sum on the restricted
+    candidate set. Correct one-line summary: **the stencil is a somewhat
+    weaker preconditioner per iteration but one to two orders of magnitude
+    cheaper per application, so it wins decisively on wall time at low
+    occupancy** — not "a better preconditioner, not merely a cheaper one."
+    The gate now defaults off (`precond_cost_gate = 0.0`); see
+    `doc/bench/2026-09-09-stencil-preconditioner.md`'s "Paired A/B ...
+    CORRECTED" and "Why the first measurement was wrong" sections for the
+    full re-measurement and post-mortem.
   - **Occupancy gate (`precond_occupancy_max`, default 0.4, separate knob
     from `active_occupancy_max`).** At 56.75% contact the stencil is
     **16.9% slower** than `fft` (CI[+9.4,+30.0]%, 5 paired samples; 625 vs
@@ -508,7 +525,8 @@ Fix: use plain `\begin{enumerate}` and `\begin{itemize}` without optional argume
 | Active-set vs standard, float, same session | 5.19× faster (647.0→124.7 s), 1.75× less memory (15.99→9.12 GiB), identical area |
 | Single precision on the ACTIVE path | 9.12 vs 9.31 GiB = **2% memory**, but 2.5× time. The `single_precision`-as-memory-lever advice holds for the STANDARD path only |
 | Certified stopping cost (std f32, same surface, vs the 2026-07-10 record) | 43 it / 647 s vs 25 it / 396 s — the price of certifying penetration + the FW gap instead of Σp\|g\| alone; the active path more than absorbs it (124.7 s certified vs 396 s uncertified) |
-| **Stencil preconditioner (2026-09-09)** — iteration counts, fft vs stencil, rough-H0.8, active-set | f32: Ns=1024 22→**13**, Ns=4096 62→**25**, Ns=16384 208→**61**; f64: Ns=1024 30→**17**, Ns=4096 79→**33**, Ns=16384 272→**94** (no-precond reference at Ns=1024/4096 f32: 23/69 — barely worse than the full-grid FFT preconditioner at Ns=1024) |
+| **Stencil preconditioner, RETRACTED then CORRECTED (2026-09-09 → 2026-09-10)** — iteration counts, fft vs stencil, rough-H0.8, active-set | ~~f32: Ns=1024 22→13, Ns=4096 62→25, Ns=16384 208→61; f64: ... 272→94~~ **retracted**: the fft-arm numbers were a cost-gate artefact (silently unpreconditioned after iteration 1). Corrected (gate off, `precond_count == iterations` verified on every row): f32 Ns=1024 fft **11**/stencil 13/none 23, Ns=4096 fft **19**/stencil 25/none 69, Ns=16384 fft **47**/stencil 61; f64 Ns=1024 fft **15**/stencil 17, Ns=4096 fft **25**/stencil 33, Ns=16384 fft **72**/stencil 94 — fft needs FEWER iterations (13-32% less), the opposite of the retracted claim; the stencil still wins on wall time (18-84%, growing with Ns) purely on per-application cost. See `doc/bench/2026-09-09-stencil-preconditioner.md` |
+| Stencil vs fft wall time, corrected (rough-H0.8, active-set, gate off, 5 reps at Ns<=4096, 1 rep at 16384) | f32: Ns=1024 −20.6% (CI does not exclude zero), Ns=4096 **−54.9%**, Ns=16384 −82.1% (indicative); f64: Ns=1024 **−23.7%**, Ns=4096 **−69.3%**, Ns=16384 −84.2% (indicative); vs no-precond (uncorrupted baseline): Ns=1024 f32 −17.8%, Ns=4096 f32 −21.4% — the full-grid fft arm is itself *slower than no preconditioner at all* at Ns=4096 f32 (+76%) on this restricted path, despite needing far fewer iterations |
 | Stencil paired A/B wall time (low occupancy 0.04–0.11%, 5 reps unless noted) | f32: Ns=1024 −12.2% CI[−39.3,−0.6]%, Ns=4096 **−26.3%** CI[−34.3,−17.7]%, Ns=16384 −65.1% (n=1, indicative); f64: Ns=1024 −17.5% (CI includes 0), Ns=4096 **−32.5%** CI[−44.9,−27.5]%, Ns=16384 −65.5% (n=1, indicative) |
 | Stencil peak RSS change (same pairs) | f32: −2.8%/−5.4%/~0% (Ns=1024/4096/16384); f64: −7.5%/**−19.9%**/−2.1% — modest, not dramatic; full-grid gap/warm-start/output buffers dominate peak RSS at these sizes, not preconditioner scratch |
 | Stencil vs fft at required ≥40% occupancy gate point (rough-H0.8@2.0, 56.75% contact, Ns=1024, 5 paired reps) | stencil **+16.9% slower** CI[+9.4,+30.0]% (625 vs 519 it) — genuine regression, not noise; occurs because above `active_occupancy_max` the active-set restriction is off and the finest level runs the plain full-grid solve, where the truncated symbol's low-`k` error costs conditioning |
