@@ -1,0 +1,65 @@
+data/bench_stencil_retracted.jsonl — quarantined rows, NOT an analysis input
+=============================================================================
+
+What these rows are
+--------------------
+22 rows removed from the live ledger `data/bench_stencil.jsonl` by commit
+`14d6920` ("bench: retract F3 artefact — remove gate-corrupted and duplicate
+rows"). Every row here is a `*-active-fft` variant with `precond_count == 1`
+while its own `iterations` field is 22–272 — i.e. the run's own record shows
+the FFT `|k|` preconditioner was applied exactly once and the remaining
+iterations ran unpreconditioned. That is the fingerprint of the
+`precond_cost_gate` bug on this branch: a runtime "cost gate"
+(`SolveOptions::precond_cost_gate`, default 1.5 at the time) took one
+wall-clock timing sample after the first preconditioner apply and, on the
+active-set restricted path (masked matvec = 1-2% of a full matvec), fired on
+every `fft`-arm run, silently disabling the preconditioner from iteration 2
+onward. The rows were real solver runs, not corrupted data files — the
+corruption is in what they measure (an accidentally-unpreconditioned `fft`
+arm), not in how they were recorded.
+
+Why they are kept, not deleted
+-------------------------------
+`bench/README.md` documents the live ledger as append-only, specifically so
+a reported number can be defended or refuted later from the raw
+measurements. Deleting these rows outright (as `14d6920` did) removes the
+only direct evidence that the cost gate fired on every `fft`-arm run at the
+default workload — the most valuable lesson on this branch. They are moved
+here, out of the analysis input, rather than restored to the live ledger,
+because they do NOT measure what their `variant` name claims (a
+preconditioned solve) and must never be picked up by `bench/analyze.py` or
+any other tool that treats `data/bench_stencil.jsonl` as ground truth.
+
+Provenance
+----------
+- Removed from the live ledger by commit `14d6920`
+  ("bench: retract F3 artefact — remove gate-corrupted and duplicate rows").
+- Recovered by diffing `git show 14d6920^:data/bench_stencil.jsonl` against
+  `git show 14d6920:data/bench_stencil.jsonl` (43 rows removed in total by
+  that commit).
+- IMPORTANT: only 22 of those 43 removed rows fit the gate-corruption
+  fingerprint (`*-active-fft` variant, `precond_count == 1`). The other 21
+  are `*-active-stencil` rows with `precond_count == iterations` (i.e. NOT
+  gate-corrupted) — legitimate but superseded/duplicate reps of the same
+  (workload, Ns, variant, rep) key, removed in the same commit for the
+  separate "duplicate rows" reason its own commit message names. Those 21
+  are NOT included here: a duplicate rep is evidence of nothing, and
+  resurrecting it would misrepresent this file's purpose. This file holds
+  only the 22 rows that carry the actual gate-corruption fingerprint.
+- A further, unrelated single duplicate row (`h2-f64-active-stencil`,
+  Ns=16384) was removed from the live ledger by commit `aa2a1d2`
+  ("bench: dedup duplicate Ns=16384 f64-stencil row"). That row is a true
+  duplicate, is not gate-corrupted, and is correctly left deleted — it is
+  not reproduced here either.
+
+What NOT to do with this file
+------------------------------
+- Do not feed it to `bench/analyze.py` or add it to any `--ledger` argument.
+- Do not use it to compute any wall-time or iteration-count ratio; the
+  numbers it contains are, by construction, measuring an unintentionally
+  unpreconditioned solve mislabeled as preconditioned.
+- Do not merge it back into `data/bench_stencil.jsonl`.
+
+See `doc/bench/2026-09-09-stencil-preconditioner.md` (the correction banner
+at the top, and the R11 correction in the "Promotion verdict" section) for
+the full narrative.

@@ -340,27 +340,62 @@ proposed for the active-set restriction itself:
 > been implemented or measured here — it is the concrete next step this note
 > recommends, not a completed change.
 
-The 4–5× total-wall-time projection from the design work **did materialize at
-low occupancy and large Ns** (2.87× at Ns=16384 f32, 2.90× at Ns=16384 f64 —
-short of "4–5×" but a large, real win) but **did not hold, and inverted, at
-the required near-full-contact gate point.** These two ratios are the
-*whole-nested-solve* comparison against the pre-stencil standard path
-(`doc/bench/2026-09-09-ns16384-rebaseline.md`), not this note's
-`*-active-fft`-vs-`*-active-stencil` isolate — they were not re-verified
-against `precond_count`/`precond_dropped` as part of this correction, and
-should be read with the same caution the rest of this note now applies to
-any pre-F1 wall-time number until spot-checked. The finest-level, isolated
-comparison directly above (18–84% depending on Ns and precision, all
-confirmed `precond_count == iterations`) is the number to trust for the
-finest-level engine choice; treat the whole-solve 2.87×/2.90× as plausible
-but unaudited. Memory did not show the dramatic
+> **SECOND CORRECTION (2026-09-10, re-review, R11).** The paragraph below
+> originally reported "2.87× at Ns=16384 f32, 2.90× at Ns=16384 f64 — short
+> of the projected 4–5×". Those two ratios were computed against the
+> **same gate-corrupted fft-arm row** the correction banner above is about
+> (32.98 s / 208 it, since removed from the live ledger — see
+> `data/bench_stencil_retracted.jsonl`), divided into an early stencil-arm
+> timing (11.50 s). A gate-disabled fft arm running 208 iterations after
+> being silently unpreconditioned past iteration 1 is, for wall-time
+> purposes, close to a genuinely unpreconditioned solve: 32.98 s / 208 it
+> tracks the independent unpreconditioned probe in `data/precond_probe.jsonl`
+> (35.03 s / 213 it), not the genuinely FFT-preconditioned probe recorded
+> before the cost gate existed (68.26 s / 47 it). This is the **isolated
+> finest-level engine A/B** (`*-active-fft` vs `*-active-stencil` at
+> Ns=16384) — the same comparison as the "Paired A/B" table above — and
+> **not** a whole-nested-solve comparison against the pre-stencil standard
+> path in `doc/bench/2026-09-09-ns16384-rebaseline.md`: that document
+> predates this branch and contains no stencil rows to compare against, so
+> no such comparison has been made anywhere in this note. The original text
+> conflated the two by describing the isolated A/B as if it were a
+> "whole-nested-solve" number; the corrected paragraph below removes that
+> conflation.
+
+Re-derived from the current, gate-off re-baseline rows in
+`data/bench_stencil.jsonl` — the same rows the "Paired A/B" section above
+already reports as −82.1%/−84.2% wall-time change:
+
+- f32: fft 64.88 s / 47 it vs stencil 11.63 s / 61 it → **5.58×**
+- f64: fft 178.15 s / 72 it vs stencil 28.16 s / 94 it → **6.33×**
+
+Both **exceed** the design work's 4–5× projection. Corrected verdict: at
+Ns=16384 the projection was **met and exceeded**, once the reference fft
+arm is genuinely preconditioned — not "a large win, short of the
+projection." The earlier "plausible but unaudited" hedge is retracted along
+with the numbers it hedged: this is now audited, against the same
+`precond_count == iterations` check used everywhere else in this note.
+
+This is a **second, independent artefact of the same cost-gate root
+cause** as the branch's main retraction — but it pointed the *opposite*
+way. The main retraction's artefact was flattering (a false "stencil is a
+better preconditioner" claim); this one was pessimistic (it understated a
+genuine win as a shortfall). A pessimistic artefact is exactly as much a
+correctness bug as an optimistic one, and is corrected here for the same
+reason the main claim was retracted rather than quietly left as
+"conservative." The original 43 gate-corrupted rows this artefact (and the
+main one) trace back to are preserved, not deleted, in
+`data/bench_stencil_retracted.jsonl` (see the "Ledger" section below).
+
+Memory did not show the dramatic
 drop one might expect from removing full-grid FFT scratch either: RSS
 improved only modestly (0–20%, mostly at Ns=4096 f64) and was flat within
 noise at Ns=1024 and Ns=16384 — the full-grid `gap`/`warm_start`/`output`
 buffers the preflight accounting lists dominate peak RSS at these sizes far
 more than the preconditioner's own scratch, so removing the FFT engine's
-buffers does not move the needle much on total peak memory. Both of these are
-reported as measured findings, not confirmations of the design-time estimate.
+buffers does not move the needle much on total peak memory. This memory
+finding is unaffected by the R11 correction above and is reported as a
+measured finding, not a confirmation of the design-time estimate.
 
 ## Ledger
 
@@ -374,6 +409,16 @@ probes (0.5, 1.0, 2.0, one rep each, used only to pick the gate load) were
 run to a separate, uncommitted scratch ledger and deleted after use; they
 are not part of the analyzed A/B and are reproducible from the commands in
 the "Occupancy dial" section above if needed.
+
+The 22 gate-corrupted `*-active-fft` rows removed by that correction are
+**not** gone: they are preserved, out of the analysis input, in
+`data/bench_stencil_retracted.jsonl` (see its companion
+`data/bench_stencil_retracted.README`) as the direct evidence that the cost
+gate fired on every `fft`-arm run at the default workload — the ledger is
+append-only precisely so a retracted number stays checkable. The separate
+single duplicate row removed by the later dedup commit (`h2-f64-active-stencil`
+at Ns=16384) is a true duplicate, not gate-corrupted, and is correctly left
+deleted rather than quarantined.
 
 ## Task 7 — occupancy-gated engine choice (`automatic`, now the default)
 

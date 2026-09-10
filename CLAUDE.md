@@ -345,9 +345,20 @@ Default β formula: **Polak-Ribière+** (`use_pr=true`); Fletcher-Reeves availab
     iteration-count cascade benefit from a marginally better coarsest-level
     warm start — not the double-digit "win" a first pass over the ledger
     suggested; see `doc/bench/2026-09-09-stencil-preconditioner.md`).
-  - **Projections that did not fully hold.** Total wall time at Ns=16384
-    improved 2.87–2.90× (float/double) — a large real win, short of the
-    design's projected 4–5×. Memory gains were 0–20%, modest rather than
+  - **Projection met and exceeded at Ns=16384 (corrected 2026-09-10, R11).**
+    The finest-level engine A/B (fft vs stencil, gate off) improved
+    **5.58×** f32 (64.88→11.63 s) / **6.33×** f64 (178.15→28.16 s) —
+    exceeding the design's projected 4–5×. The previously reported
+    2.87×/2.90× "short of projection" figures were a second, independent
+    artefact of the same cost-gate cause as the branch's main retraction:
+    they divided a gate-corrupted, effectively-unpreconditioned fft row
+    (32.98 s / 208 it, matching the unpreconditioned probe 35.03 s / 213 it)
+    instead of the genuinely preconditioned one (68.26 s / 47 it). Unlike
+    the main artefact this one understated the result rather than
+    flattering it; both are corrected the same way. See
+    `doc/bench/2026-09-09-stencil-preconditioner.md`'s R11 correction and
+    `data/bench_stencil_retracted.jsonl` for the retracted rows. Memory
+    gains were 0–20%, modest rather than
     dramatic: the full-grid gap/warm-start/output buffers dominate peak RSS
     at these sizes far more than the preconditioner's own scratch, so
     removing the FFT engine's buffers barely moves total peak memory.
@@ -531,7 +542,7 @@ Fix: use plain `\begin{enumerate}` and `\begin{itemize}` without optional argume
 | Stencil peak RSS change (same pairs) | f32: −2.8%/−5.4%/~0% (Ns=1024/4096/16384); f64: −7.5%/**−19.9%**/−2.1% — modest, not dramatic; full-grid gap/warm-start/output buffers dominate peak RSS at these sizes, not preconditioner scratch |
 | Stencil vs fft at required ≥40% occupancy gate point (rough-H0.8@2.0, 56.75% contact, Ns=1024, 5 paired reps) | stencil **+16.9% slower** CI[+9.4,+30.0]% (625 vs 519 it) — genuine regression, not noise; occurs because above `active_occupancy_max` the active-set restriction is off and the finest level runs the plain full-grid solve, where the truncated symbol's low-`k` error costs conditioning |
 | `automatic` engine at the gate point vs forced `fft` (same case) | parity, not a win: per-level median iterations automatic 36/51/103/192/516 vs fft 26/51/103/192/519 vs stencil 36/67/122/209/625 — automatic tracks fft everywhere except the unmeasured coarsest level; matvec wall time alone spans 13.82–15.64 s (fft reps) vs 10.67–13.42 s (auto reps), wider than the raw −16.57% paired gap, so that headline number is noise-dominated. Real effect: ~0.6% fewer finest-level iterations (516 vs 519, deterministic) from a marginally better coarsest-level warm start |
-| Total wall-time projection vs measured (Ns=16384, stencil default) | design projected 4–5×; measured **2.87×** (f32) / **2.90×** (f64) — a large real win, short of the projection |
+| Total wall-time projection vs measured, corrected R11 (Ns=16384, finest-level engine A/B, gate off) | design projected 4–5×; measured **5.58×** (f32: 64.88→11.63 s) / **6.33×** (f64: 178.15→28.16 s) — projection **met and exceeded**; the earlier 2.87×/2.90× "shortfall" was a second, opposite-direction cost-gate artefact (retracted, see `data/bench_stencil_retracted.jsonl`) |
 
 ---
 
