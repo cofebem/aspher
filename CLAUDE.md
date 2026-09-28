@@ -670,6 +670,42 @@ de Saxcé–Feng reference cross-check (slow; not for production).
 
 ---
 
+## Application Studies (`sims/`)
+
+Case studies built on ASPHER, each with its own generated `RESULTS*.md`.
+Start at **`sims/README.md`** — it carries the shared conventions (mm/MPa,
+E\* = 115 400 MPa, load control, padding rather than resampling) and which
+conda env each script needs.
+
+- **Toroidal indentation** (`sims/`) — R = 25 mm spindle torus on a measured
+  face-turned surface, 10 steps to 10 kN. A_c ∝ F with exponent 0.9997; the
+  load rides on discrete turning ridges (166/166/185 µm against a measured
+  167 µm feed pitch); the contact ring only closes circumferentially between
+  ~0.5 and ~1.6 kN. Smooth-torus validation matches Hertz to ≤ 1.1 %.
+- **`sims/benchmark_tamaas/`** — ASPHER vs Tamaas 2.8.1 at four grid sizes.
+  **Quote the single-threaded row** (10.6–13.8×): the installed Tamaas is a
+  serial `cpp` build, so the 20-thread figures (45–53×) partly measure that.
+  Memory 2.2–3.4× less. Contact areas agree to < 0.7 %.
+- **`sims/fine_scale/`** — SEM surface (Sq rescaled to 2 µm) + cylinder +
+  ReynoldsFlow leakage, liquid and gas. Transmissivity falls 9.5 orders of
+  magnitude and **seals at 21 % real contact** because the grooves run
+  perpendicular to transport. For gas, `div(g³∇p²) = 0` is the *same operator*
+  (verified to 0.000e+00), and rarefaction adds ×1.13→×92 without moving the
+  sealing pressure. `reynoldsflow` lives in the **`base`** env, not
+  `fenicsx-env`.
+
+Two caveats that apply to every number in these studies: contact area is **not**
+mesh-converged (it roughly halves per refinement) while the load–displacement
+curve is, and `p_max` always lands on an isolated single-node contact where
+elastic pressure diverges — use the median/p99.
+
+**Planned**: a nonlinear solver in ReynoldsFlow for higher Knudsen numbers. See
+`sims/fine_scale/README.md` § "Toward higher Knudsen numbers" — a
+pressure-dependent mean free path makes the conductivity depend on the unknown,
+which the current aperture-transform trick cannot express.
+
+---
+
 ## What Is Left To Do
 
 - **Larger grids (Ns > 512)**: ✅ largely solved by the `backend="h2"` operator — O(N) memory (5.3 MiB at Ns=512), so Ns=1024+ is now cheap. (H-matrix path still memory-bound; see below.)
