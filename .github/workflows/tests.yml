@@ -1,0 +1,51 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    env:
+      OMP_NUM_THREADS: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeigen3-dev
+          python -m pip install --upgrade pip
+          python -m pip install numpy pybind11 pytest
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DPython_EXECUTABLE="$(which python)" \
+            -DPYTHON_EXECUTABLE="$(which python)" \
+            -Dpybind11_DIR="$(python -m pybind11 --cmakedir)"
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: C++ tests
+        run: ctest --test-dir build --output-on-failure
+
+      # tamaas_test.py needs Tamaas (not on PyPI for these runners) and is
+      # run manually; every other Python test is self-contained.
+      - name: Python tests
+        run: |
+          python -m pytest -q tests/test_periodic_py.py \
+            tests/test_certification_py.py tests/test_friction_py.py \
+            tests/test_nested.py tests/test_h2.py

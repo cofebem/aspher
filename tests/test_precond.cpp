@@ -257,13 +257,18 @@ int main() {
     // ── the cost gate fires on a deliberately expensive preconditioner ────
     {
         hmc::FourierPreconditioner slow_fp(Ns);
+        Eigen::VectorXd burn;
         hmc::PrecondIntoT<double> slow =
-            [&slow_fp](const Eigen::VectorXd& g,
-                       const std::vector<std::uint8_t>& contact,
-                       Eigen::VectorXd& z) {
-                // same operator, applied 40 times: correct, just costly
-                for (int rep = 0; rep < 40; ++rep)
-                    slow_fp.apply_into(g, contact, z);
+            [&slow_fp, &S, &burn](const Eigen::VectorXd& g,
+                                  const std::vector<std::uint8_t>& contact,
+                                  Eigen::VectorXd& z) {
+                // correct apply, plus three matvecs of the very operator the
+                // gate compares against: the cost ratio is ~3 on any machine
+                // and thread count. (Repeating the 64^2 FFT instead only
+                // exceeded one dense matvec through OpenMP overhead at high
+                // thread counts, and failed at <= 4 threads.)
+                slow_fp.apply_into(g, contact, z);
+                for (int rep = 0; rep < 3; ++rep) burn.noalias() = S * g;
             };
         hmc::MatVecIntoT<double> opi = [&S](const Eigen::VectorXd& v,
                                             Eigen::VectorXd& out) {

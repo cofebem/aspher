@@ -5,6 +5,13 @@
 
 # ASPHER — Accelerated SPectral and HiERarchical contact solver
 
+<p align="center">
+  <a href="https://pypi.org/project/aspher/"><img src="https://img.shields.io/pypi/v/aspher?label=pypi&color=e05d28" alt="PyPI version"></a>
+  <a href="https://pypi.org/project/aspher/"><img src="https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-1f6fb2" alt="Python 3.10 | 3.11 | 3.12"></a>
+  <a href="https://github.com/cofebem/aspher/actions/workflows/tests.yml"><img src="https://img.shields.io/github/actions/workflow/status/cofebem/aspher/tests.yml?branch=main&label=tests&logo=github" alt="tests"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSD%203--Clause-1f6fb2" alt="License: BSD 3-Clause"></a>
+</p>
+
 *(pronounced "asper", as in **asper**ity — or as the Latin *asper*, "rough")*
 
 > ***ad astra per ASPHERa*** - through roughness, to the stars.
