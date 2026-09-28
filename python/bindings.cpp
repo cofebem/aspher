@@ -10,6 +10,7 @@
 #include "contact_solver.hpp"
 #include "fft_operator.hpp"
 #include "fourier_precond.hpp"
+#include "periodic_fft_operator.hpp"
 #include "friction_driver.hpp"
 #include "friction_model.hpp"
 #include "h2_operator.hpp"
@@ -139,6 +140,9 @@ public:
                                                               domain_size, E_star);
             fft_ = std::make_unique<hmc::FFTOperator>(*kernel_);
             fft_->build();
+        } else if (backend_ == "periodic") {
+            periodic_ = std::make_unique<hmc::PeriodicFFTOperator>(
+                grid_size, domain_size, E_star);
         } else if (backend_ == "hmatrix") {
             kernel_ = std::make_unique<hmc::BoussinesqKernel>(grid_size,
                                                               domain_size, E_star);
@@ -151,14 +155,16 @@ public:
                                                               domain_size, E_star);
             dense_ = kernel_->assemble_dense();
         } else {
-            throw std::invalid_argument("unknown backend: " + backend_ +
-                                        " (expected dense, hmatrix, h2, or fft)");
+            throw std::invalid_argument(
+                "unknown backend: " + backend_ +
+                " (expected dense, hmatrix, h2, fft, or periodic)");
         }
     }
 
     Eigen::VectorXd apply(const Eigen::VectorXd& p) const {
         if (backend_ == "h2") return h2_->matvec(p);
         if (backend_ == "fft") return fft_->matvec(p);
+        if (backend_ == "periodic") return periodic_->matvec(p);
         if (backend_ == "hmatrix") return hmat_->matvec(p);
         return dense_ * p;
     }
@@ -311,6 +317,15 @@ public:
                 double(s.bytes_total) / (8.0 * double(s.N) * double(s.N));
             return d;
         }
+        if (backend_ == "periodic") {
+            d["backend"] = "periodic";
+            d["n"] = Ns_ * Ns_;
+            d["periodic_x"] = true;
+            d["periodic_y"] = true;
+            d["bytes_scratch"] =
+                static_cast<long long>(periodic_->scratch_bytes());
+            return d;
+        }
         if (backend_ != "hmatrix") {
             d["dense"] = true;
             d["bytes"] = 8LL * Ns_ * Ns_ * Ns_ * Ns_;
@@ -338,6 +353,7 @@ private:
     std::unique_ptr<hmc::HMatrix> hmat_;
     std::unique_ptr<hmc::H2Operator> h2_;
     std::unique_ptr<hmc::FFTOperator> fft_;
+    std::unique_ptr<hmc::PeriodicFFTOperator> periodic_;
     Eigen::MatrixXd dense_;
 };
 
@@ -839,7 +855,8 @@ PYBIND11_MODULE(aspher, m) {
           "coarse->fine hierarchy and H2 operators internally and warm-starts "
           "each level with the prolonged coarse pressure. grid_size must equal "
           "coarsest * 2^k. Returns a ContactResult. backend='h2' (O(N) memory) "
-          "or 'fft' (exact convolution, fastest at Ns<=8192). "
+          "'fft' (exact free-space convolution), or 'periodic' (doubly "
+          "periodic spectral half-space compliance). "
           "precond_engine='auto' (default) picks per level from the previous "
           "level's measured occupancy: the stencil below "
           "precond_occupancy_max (default 0.4), else the historical full-grid "

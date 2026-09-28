@@ -79,7 +79,7 @@ struct NestedParams {
     // is a failure, not a silently relaxed success.
     bool allow_tolerance_relaxation = false;
     bool light_result = false;     // skip displacement/gap in the result (~2 N arrays)
-    std::string backend = "h2";    // per-level operator: "h2" or "fft"
+    std::string backend = "h2";    // "h2", "fft" (free-space), or "periodic"
     bool record_error_history = false; // finest-level per-iteration error trace
 
     // Active-set finest-level solve (requires backend "h2" and Ns > coarsest):

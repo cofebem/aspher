@@ -183,6 +183,23 @@ Matrix-free black-box FMM (Chebyshev interpolation, Fong & Darve 2009). **No blo
 ### FFT-convolution operator (`backend="fft"`) — exact, O(N log N)
 Exact zero-padded (Hockney) circular convolution of the pressure with the Love element table on a (2Ns)² grid (`fft_operator.hpp/.cpp`, shared square r2c/c2r engine in `src/fft_engine.hpp` — pocketfft default, FFTW3 under `-DASPHER_USE_FFTW=ON`). **Matches the dense matvec to roundoff** (rel L2 ~1e-15 double, ~1.4e-7 float; no interpolation, no Gibbs — that exactness is its main value), unlike H2's ~1e-4 (q=4) interpolation error. ~10 N reals double scratch (kernel half-spectrum 2N + padded grid 4N + complex half-spectrum work 4N), object-owned and reused; single-precision caches via `build_single_caches`/`matvec_single_into` (same contract as H2). The padded transforms skip structurally-zero forward lines and unread inverse lines (2026-07 perf commit). **Measured performance** (bench_fft.py, 20-core, desktop co-tenancy — ratios more reliable than absolutes): matvec modestly faster than H2 (q=6) at Ns ≤ 2048 (1.6×/1.5× at 1024/2048), ≈parity at Ns=4096 (337 vs 331 ms) — the padded transforms are bandwidth-bound, not flop-bound, so the spec's 2–3× estimate did not materialise. H2 remains preferred for very large Ns (O(N) vs O(N log N), ~5× smaller working set). Available as `ContactSolver(backend="fft")` and `hc.solve_nested(..., backend="fft")`. Spec: `doc/specs/2026-07-09-fft-convolution-backend-design.md`.
 
+### Doubly periodic operator (`backend="periodic"`, 2026-09, v0.1.2)
+`periodic_fft_operator.{hpp,cpp}`: spectral compliance `û(q) = 2p̂(q)/(E*|q|)`
+on the Ns×Ns torus (no padding), zero mode dropped (absorbed by the approach).
+Point-collocated spectral symbol — the Tamaas convention, **not** the Love
+element integral — so it matches Tamaas's default periodic PKR to 1e-10…1e-12
+(`compare_tamaas_periodic.py`, rough 0.2–77% contact, ν=0.3, L≠1) and the
+free-space `fft` backend only up to an O(h) floor for a localised contact
+(Hertz a≈12h: 4.2e-3, halving with h; identical contact sets). Any Ns ≥ 2
+(odd ok). Available in `ContactSolver` and `solve_nested` (not active-set).
+pocketfft path is one fused OpenMP region (rows from x → per 16-column block
+fwd c2c·symbol·inv c2c → rows into y): no grid buffer, no copies, symbol on
+the fly; scratch = 1 half spectrum (≈N reals) per precision, x/y may alias;
+1.2–1.35× faster than the unfused 4-region version at Ns ≥ 2048 (8 threads),
+up to 3× under oversubscription, outputs equal to 2e-16. Gates:
+`test_periodic` (modes, circulant/PSD, aliasing, Westergaard exact full
+contact 3e-15 + partial width) and `tests/test_periodic_py.py`.
+
 ### Frictional contact (in progress, spec doc/specs/2026-07-13-frictional-contact-design.md)
 - **M1 done**: `H2Operator` is kernel-agnostic — `H2Operator(Ns, h, FarKernelFn, NearKernelFn, params)` with fully-scaled `std::function` kernels called only at `build()` (matvec path untouched); the `BoussinesqKernel` constructor delegates and is **bit-for-bit** identical (gated by `test_functor_ctor` + `tests/ref_solve.py`).
 - **M2 done**: `cerruti_kernel.{hpp,cpp}` — element-integrated tangential kernels (Pohrt & Li 2014 eqs. (17)/(20); eq. (18)'s printed h² factors are a dimensional typo, correct corner form `R(k,n)−R(k,m)+R(l,m)−R(l,n)` verified by quadrature), `CerrutiKernel` offset tables (xx stored, yy = x↔y transpose, xy odd-parity signs restored at lookup), continuum symbol `Ĉ(k) = (2/(E*(1−ν)|k|))[I − ν kkᵀ/|k|²]` whose longitudinal eigenvalue equals the Love symbol `2/(E*|k|)`. Prefactor convention: `1/(2πG) = 1/(πE*(1−ν))`.

@@ -97,7 +97,8 @@ print(res.contact_area, res.iterations, res.converged)
 res = hc.solve_nested(grid_size=4096, gap=gap4k, p_nominal=0.005,
                       single_precision=True, light_result=True)
 
-# or the explicit operator interface (backend="h2" | "fft" | "hmatrix" | "dense")
+# or the explicit operator interface
+# backend="periodic" is doubly periodic; h2/fft/hmatrix/dense are free-space
 solver = hc.ContactSolver(grid_size=Ns, backend="h2", q=6)
 res = solver.solve(gap, p_nominal=0.005, tol=1e-8, precond="fourier")
 res.pressure        # (Ns, Ns), mean == p_nominal
@@ -138,6 +139,9 @@ PCG paths to the same solution).
   coefficients, not by ASPHER's operators; see
   [doc/tamaas_findings.md](doc/tamaas_findings.md) for the three Tamaas
   pitfalls anyone comparing against it should know.
+- `compare_tamaas_periodic.py` — validates the doubly periodic spectral
+  backend against Tamaas's default periodic operator (contact set and full
+  pressure field).
 - `python bench_h2.py`, `bench_h2_memory.py`, `bench_h2_cputime.py` — H² vs
   H-matrix and O(N) scaling sweeps up to Ns=16384.
 - `python bench_fft.py` — FFT-convolution backend vs H²: matvec sweep

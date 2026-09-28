@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "aspher"
-version = "0.1.0"
+version = "0.1.2"
 description = "ASPHER — Accelerated SPectral and HiERarchical contact solver: BEM normal contact on an elastic half-space (exact Love/Boussinesq kernel, H-matrix and matrix-free H2/FMM operators, FFTW |q| spectral preconditioner, nested-grid mixed-precision Polonsky–Keer CG)"
 readme = "README.md"
 license = { text = "BSD-3-Clause" }
@@ -40,7 +40,7 @@ cmake.version = ">=3.18"
 wheel.packages = []
 sdist.exclude = [
   "*.png", "*.jpg", "*.pdf", "*.npy",
-  "doc/", "data/", "experiments/", "build/", "dist/",
+  "doc/", "data/", "experiments/", "build*/", "dist/", "sims/", ".claude/",
   "Rough_contact_*", "bench_*.py", "compare_*.py", "visualize_*.py",
   "leaf_size_bench.py", "convergence_study.py", "curved_convergence_study.py",
   "tamaas_reference.py",

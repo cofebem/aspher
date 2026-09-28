@@ -3,6 +3,7 @@
 #include "boussinesq_kernel.hpp"
 #include "fft_operator.hpp"
 #include "fourier_precond.hpp"
+#include "periodic_fft_operator.hpp"
 #include "stencil_precond.hpp"
 #include "h2_operator.hpp"
 
@@ -600,9 +601,10 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
     if (levels.empty() || levels.back() != Ns)
         throw std::invalid_argument(
             "solve_contact_nested: Ns must equal coarsest * 2^k");
-    if (np.backend != "h2" && np.backend != "fft")
+    if (np.backend != "h2" && np.backend != "fft" &&
+        np.backend != "periodic")
         throw std::invalid_argument(
-            "solve_contact_nested: backend must be 'h2' or 'fft'");
+            "solve_contact_nested: backend must be 'h2', 'fft', or 'periodic'");
     if (np.active_set) {
         if (np.backend != "h2")
             throw std::invalid_argument(
@@ -675,6 +677,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         std::unique_ptr<BoussinesqKernel> kernel;
         std::unique_ptr<H2Operator> h2;
         std::unique_ptr<FFTOperator> fop;
+        std::unique_ptr<PeriodicFFTOperator> pop;
         MatVecIntoT<double> mv;
         if (np.backend == "fft") {
             kernel = std::make_unique<BoussinesqKernel>(n, L, E_star);
@@ -682,6 +685,11 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             fop->build();
             mv = [&fop](const Eigen::VectorXd& v, Eigen::VectorXd& out) {
                 fop->matvec_into(v, out);
+            };
+        } else if (np.backend == "periodic") {
+            pop = std::make_unique<PeriodicFFTOperator>(n, L, E_star);
+            mv = [&pop](const Eigen::VectorXd& v, Eigen::VectorXd& out) {
+                pop->matvec_into(v, out);
             };
         } else {
             h2 = make_boussinesq_h2(n, L, E_star,
@@ -852,7 +860,12 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             res.requested_tol = lopt.requested_tol;
         } else if (level_float) {
             MatVecIntoT<float> mvf;
-            if (fop) {
+            if (pop) {
+                pop->build_single_caches();
+                mvf = [&pop](const Eigen::VectorXf& v, Eigen::VectorXf& out) {
+                    pop->matvec_single_into(v, out);
+                };
+            } else if (fop) {
                 fop->build_single_caches();
                 mvf = [&fop](const Eigen::VectorXf& v, Eigen::VectorXf& out) {
                     fop->matvec_single_into(v, out);
@@ -916,6 +929,7 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
             // a precision it has finished with.
             if (h2) h2->release_single_caches();
             if (fop) fop->release_single_caches();
+            if (pop) pop->release_single_caches();
             Eigen::VectorXd p_warm = std::move(res.pressure);
             SolveOptions popt;
             popt.tol = tol;
