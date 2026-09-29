@@ -100,6 +100,42 @@ build/test_hmatrix
 build/test_contact
 ```
 
+
+## Release to PyPI
+
+Sdist-only releases (PyPI rejects plain `linux_x86_64` wheels; manylinux
+wheels would need `cibuildwheel` + `auditwheel`, a later step). The sdist is
+all-BSD (bundled pocketfft).
+
+1. Bump `version` in `pyproject.toml` and `CITATION.cff` (+ the BibTeX
+   `version` in README "Citing"), commit. **Review README.md: it is the PyPI
+   project page** (`readme = "README.md"`), and an uploaded version can never
+   be replaced — a docs-only fix needs a new version (use `X.Y.Z.postN`).
+2. Build the sdist **from a clean export of the commit**, never from the
+   working tree: scikit-build-core packs every file git does not ignore, and
+   a working-tree build once produced a 525 MB sdist with local notes,
+   `build-fftw/`, `sims/`, `.claude/` and dotfiles.
+   ```bash
+   conda activate base                # build + twine live here, not in fenicsx-env
+   rm -rf /tmp/aspher-release && mkdir /tmp/aspher-release
+   git archive HEAD | tar x -C /tmp/aspher-release
+   (cd /tmp && PYTHONPATH= python -m build --sdist -o "$OLDPWD/dist" /tmp/aspher-release)
+   PYTHONPATH= twine check dist/aspher-X.Y.Z.tar.gz
+   tar tzf dist/aspher-X.Y.Z.tar.gz | awk -F/ '{print $2}' | sort | uniq -c   # sanity: tracked files only (~300 KB)
+   ```
+   Run `build` from outside the checkout with `PYTHONPATH=` empty: the
+   shell's PYTHONPATH starts with `:` (= cwd), so the repo's `build/`
+   directory shadows the `build` package ("No module named build.__main__").
+3. Verify a wheel built FROM the sdist, then run the Python tests against it
+   (`fenicsx-env`; conda gcc breaks pybind11, see Build Commands):
+   ```bash
+   CMAKE_ARGS="-DCMAKE_CXX_COMPILER=/usr/bin/g++ -DEigen3_DIR=$CONDA_PREFIX/share/eigen3/cmake" \
+     PYTHONPATH= python -m pip wheel dist/aspher-X.Y.Z.tar.gz -w /tmp/wh --no-deps
+   ```
+4. Upload (the maintainer does this): `twine upload dist/aspher-X.Y.Z.tar.gz`.
+   Optionally tag the commit the sdist was built from and make a GitHub
+   release (`git tag -a vX.Y.Z <sha>`), which Zenodo can archive for a DOI.
+
 ---
 
 ## Theory Summary

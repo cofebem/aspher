@@ -84,29 +84,6 @@ cmake --build build -j && ctest --test-dir build
 
 The Python module `aspher*.so` is placed in `python/`.
 
-### Release to PyPI (maintainers)
-
-Bump `version` in `pyproject.toml` and `CITATION.cff` and commit, then build
-the sdist **from a clean export of the commit** — scikit-build-core packs
-every file in the directory that git does not ignore, so building in a
-working tree also ships untracked notes, local build directories and data:
-
-```bash
-python -m pip install -U build twine
-rm -rf /tmp/aspher-release && mkdir /tmp/aspher-release
-git archive HEAD | tar x -C /tmp/aspher-release
-(cd /tmp && python -m build --sdist -o "$OLDPWD/dist" /tmp/aspher-release)
-python -m twine check dist/aspher-X.Y.Z.tar.gz
-python -m twine upload dist/aspher-X.Y.Z.tar.gz  # sdist only: PyPI rejects
-                                                 # non-manylinux binary wheels
-```
-
-(`python -m build` is run from outside the checkout because the local
-`build/` directory would shadow the `build` package.) The README is the PyPI
-project page, so review it before each release. The sdist is all-BSD
-(bundled pocketfft); binary wheels would need `cibuildwheel` (manylinux +
-`auditwheel`) and are a later step.
-
 ## Quick start
 
 ```python
