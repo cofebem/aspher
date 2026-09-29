@@ -67,6 +67,23 @@ def test_nested_matches_single_level_and_precisions():
         assert np.linalg.norm(p - ref) / np.linalg.norm(ref) < bound, prec
 
 
+def test_auto_engine_is_fft_on_periodic():
+    """precond_engine='auto' must follow the FFT engine exactly on the
+    periodic backend (the stencil costs 2.8-6.5x the wall time there)."""
+    ns = 256
+    g = _periodic_rough(ns)
+    runs = {e: hc.solve_nested(grid_size=ns, gap=g, p_nominal=0.02, coarsest=32,
+                               backend="periodic", tol=1e-10, precond_engine=e)
+            for e in ("auto", "fft", "stencil")}
+    assert runs["auto"].iterations == runs["fft"].iterations
+    assert runs["auto"].matvec_count == runs["fft"].matvec_count
+    # same path; only OpenMP reduction order may differ (~1e-15)
+    np.testing.assert_allclose(np.asarray(runs["auto"].pressure),
+                               np.asarray(runs["fft"].pressure),
+                               rtol=0, atol=1e-12)
+    assert runs["stencil"].iterations > runs["fft"].iterations
+
+
 def test_matvec_is_the_periodic_symbol():
     ns, L, Es = 32, 2.0, 1.7
     s = hc.ContactSolver(ns, domain_size=L, E_star=Es, backend="periodic")

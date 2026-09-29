@@ -708,9 +708,19 @@ ContactResult solve_contact_nested(int Ns, double L, double E_star,
         // discovered mid-solve inside a GIL-released CG loop).
         const int r_lvl = std::min(
             {np.precond_radius, std::max(1, n / 4), np.leaf_side});
+        // On the periodic backend `automatic` means the FFT engine: its
+        // symbol is the exact inverse of the operator's, and every matvec is
+        // itself a full-grid transform, so the stencil's cheaper apply never
+        // pays for its extra iterations. Measured at Ns=4096 (20 threads,
+        // tol 1e-11): 1.7% contact 134 it / 23.8 s (stencil) vs 33 it /
+        // 8.5 s (fft); 28% contact 657 it / 131.8 s vs 81 it / 20.1 s.
+        const NestedParams::PrecondEngine engine =
+            (np.backend == "periodic" &&
+             np.precond_engine == NestedParams::PrecondEngine::automatic)
+                ? NestedParams::PrecondEngine::fft
+                : np.precond_engine;
         const bool use_stencil = stencil_for_level(
-            np.precond_engine, np.precond, prev_occupancy,
-            np.precond_occupancy_max);
+            engine, np.precond, prev_occupancy, np.precond_occupancy_max);
         // Construct only the engine that will actually be used this level.
         // FourierPreconditioner's constructor EAGERLY allocates its
         // half-spectrum symbol table ((Ns/2+1)*Ns floats, ~512 MiB at
