@@ -19,11 +19,13 @@
 + **Author:** Claude Fable (foundation), Claude Opus 4.8, chatGPT 5.5 (initial theory)
 + **Coordinator:** V.A. Yastrebov
 
-C++17 boundary-integral solver for frictionless normal
-contact of an elastic half-space: exact Love/Boussinesq influence coefficients
-applied through hierarchical operators (H-matrix ACA and a matrix-free
-H²/bbFMM), a |q| spectral preconditioner, nested-grid continuation and
-a mixed-precision Polonsky–Keer CG, with a Python interface.
+C++17 boundary-integral solver for normal and frictional (tangential)
+contact of an elastic half-space — free-space or doubly periodic: exact
+Love/Boussinesq and Cerruti influence coefficients applied through
+hierarchical and spectral operators (H-matrix ACA, a matrix-free H²/bbFMM,
+exact FFT convolution), a |q| spectral preconditioner, nested-grid
+continuation and a mixed-precision Polonsky–Keer CG with certified
+stopping, with a Python interface.
 
 The design combines an *exact* kernel with *fast, matrix-free* operators:
 
@@ -38,19 +40,29 @@ The design combines an *exact* kernel with *fast, matrix-free* operators:
   operator** (`backend="fft"`, zero-padded Love-kernel convolution) equals
   the dense matvec to roundoff (~10⁻¹⁵ rel L2) and is modestly faster than
   H² at Ns ≤ 2048 (~1.5×), ≈parity at Ns=4096; H² remains preferred for
-  very large Ns. A classical H-matrix (ACA) backend and a dense backend
-  are kept for validation and small grids.
+  very large Ns. A **doubly periodic** operator (`backend="periodic"`,
+  spectral compliance 2/(E\*|q|) on the Ns×Ns torus) solves periodic
+  problems; it matches Tamaas's periodic solver to ~10⁻⁹. A classical
+  H-matrix (ACA) backend and a dense backend are kept for validation and
+  small grids.
 - **Solver**: Polonsky & Keer (1999) projected CG with overlap correction,
-  accelerated by a |q| spectral preconditioner (half-spectrum real FFT),
-  nested-grid (cascadic/FMG) continuation, warm starts, and an optional
-  single-precision mode with double-accumulated reductions — up to ~15×
-  faster than the cold double solve at equal contact-area accuracy.
+  accelerated by a |q| spectral preconditioner (a 13-tap real-space stencil
+  on the contact set by default, or full-grid FFT), nested-grid
+  (cascadic/FMG) continuation, an active-set mode that restricts the work to
+  candidate contact points, warm starts, and an optional single-precision
+  mode with double-accumulated reductions — up to ~15× faster than the cold
+  double solve at equal contact-area accuracy. Convergence is certified on
+  the returned pressure (Frank–Wolfe gap, penetration and load), and a solve
+  that stagnates is reported as such, never as converged.
+- **Friction**: Coulomb, Tresca or user-defined laws via Cerruti kernels, a
+  projected CG for the tangential problem with force or displacement
+  control, and a load-history driver (`FrictionSolver`).
 
 ## Install
 
 ```bash
-pip install aspher            # once published on PyPI
-# or from a checkout / the sdist:
+pip install aspher            # from PyPI (builds from the sdist)
+# or from a checkout:
 pip install .
 ```
 
@@ -64,7 +76,8 @@ Wheels are built without `-march=native` (portable); local dev builds keep it.
 Development build (see `CLAUDE.md` for the environment specifics):
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+      -Dpybind11_DIR=$(python -m pybind11 --cmakedir)
 cmake --build build -j && ctest --test-dir build
 ```
 
@@ -73,35 +86,55 @@ import alias is kept for existing scripts).
 
 ### Release to PyPI (maintainers)
 
+Bump `version` in `pyproject.toml` and `CITATION.cff` and commit, then build
+the sdist **from a clean export of the commit** — scikit-build-core packs
+every file in the directory that git does not ignore, so building in a
+working tree also ships untracked notes, local build directories and data:
+
 ```bash
 python -m pip install -U build twine
-python -m build --sdist          # -> dist/aspher-X.Y.Z.tar.gz
-python -m twine check dist/*
-python -m twine upload dist/aspher-*.tar.gz   # sdist only: PyPI rejects
-                                              # non-manylinux binary wheels
+rm -rf /tmp/aspher-release && mkdir /tmp/aspher-release
+git archive HEAD | tar x -C /tmp/aspher-release
+(cd /tmp && python -m build --sdist -o "$OLDPWD/dist" /tmp/aspher-release)
+python -m twine check dist/aspher-X.Y.Z.tar.gz
+python -m twine upload dist/aspher-X.Y.Z.tar.gz  # sdist only: PyPI rejects
+                                                 # non-manylinux binary wheels
 ```
 
-Bump `version` in `pyproject.toml` and `CITATION.cff` before releasing. The
-sdist is all-BSD (bundled pocketfft); binary wheels would need `cibuildwheel`
-(manylinux + `auditwheel`) and are a later step.
+(`python -m build` is run from outside the checkout because the local
+`build/` directory would shadow the `build` package.) The README is the PyPI
+project page, so review it before each release. The sdist is all-BSD
+(bundled pocketfft); binary wheels would need `cibuildwheel` (manylinux +
+`auditwheel`) and are a later step.
 
 ## Quick start
 
 ```python
-import numpy as np, sys; sys.path.insert(0, "python")
-import aspher as hc   # `import hmatrix_contact` still works (alias)
+import numpy as np
+import aspher as hc   # from a dev build: sys.path.insert(0, "python") first;
+                      # `import hmatrix_contact` still works (alias)
+
+def rough_surface(Ns, H=0.8, k_low=4, k_high=64, rms=0.002, seed=0):
+    """Self-affine height field on the unit square (periodic by construction)."""
+    rng = np.random.default_rng(seed)
+    k = np.fft.fftfreq(Ns, 1.0 / Ns)
+    kk = np.hypot(k[:, None], k[None, :]); kk[0, 0] = 1.0
+    amp = np.where((kk >= k_low) & (kk <= k_high), kk ** -(1 + H), 0.0)
+    h = np.fft.ifft2(amp * np.exp(2j * np.pi * rng.random((Ns, Ns)))).real
+    return h * rms / h.std()
 
 # a rigid rough indenter pressed onto an elastic half-space: gap0 = -height
-Ns = 1024                       # power of two for the H2 operator
-gap = -surface.ravel()          # your (Ns, Ns) height field
+Ns = 1024                              # power of two for the H2 operator
+gap = -rough_surface(Ns).ravel()
 
 # one-call nested-grid solve (coarse -> fine, preconditioned, warm-started)
 res = hc.solve_nested(grid_size=Ns, gap=gap, p_nominal=0.005,
                       coarsest=64, q=6)
-print(res.contact_area, res.iterations, res.converged)
+print(res.status, res.contact_area, res.iterations)
 
-# large grids: single precision + light result (~half the memory, ~3x faster)
-res = hc.solve_nested(grid_size=4096, gap=gap4k, p_nominal=0.005,
+# large grids: active set + single precision + light result
+res = hc.solve_nested(grid_size=4096, gap=-rough_surface(4096).ravel(),
+                      p_nominal=0.005, active_set=True,
                       single_precision=True, light_result=True)
 
 # or the explicit operator interface
@@ -110,10 +143,27 @@ solver = hc.ContactSolver(grid_size=Ns, backend="h2", q=6)
 res = solver.solve(gap, p_nominal=0.005, tol=1e-8, precond="fourier")
 res.pressure        # (Ns, Ns), mean == p_nominal
 res.contact_area    # Ac/A
+res.fw_error, res.penetration_error   # the certified quantities (<= tol)
+
+# doubly periodic contact (same API, also in solve_nested(backend="periodic"))
+per = hc.ContactSolver(grid_size=Ns, backend="periodic")
+res = per.solve(gap, p_nominal=0.005, tol=1e-8, precond="fourier-fft")
+```
+
+Frictional contact:
+
+```python
+fs = hc.FrictionSolver(grid_size=256, E_star=1.0, nu=0.3,
+                       model=hc.CoulombFriction(mu=0.3))
+fs.set_gap(-rough_surface(256))
+fs.step(p_bar=0.05)                    # normal load
+r = fs.step(q_bar=(0.01, 0.0), dt=1.0) # tangential force (total)
+print(r.n_stick, r.n_slip, r.dissipation)
 ```
 
 `python example_rough_contact.py` runs an end-to-end rough-surface demo
-(self-affine surface → applied pressure → contact map).
+(self-affine surface → applied pressure → contact map);
+`python example_friction.py` a Cattaneo–Mindlin partial-slip demo.
 
 ## Performance highlights
 
@@ -126,7 +176,9 @@ Measured on a 20-core workstation (fixed-band self-affine roughness):
 | Nested solve Ns=1024, double, tol 1e-8 | 1.2 s |
 | Nested solve Ns=4096, double, tol 1e-8 | ~40 s (50 it) |
 | Nested solve Ns=4096, float + light result | ~11 s (18 it, area matches double to 0.2%) |
-| Ns=16384 (2.7×10⁸ DOFs), float, 32 GiB node | ~25 GiB peak |
+| Ns=16384 (2.7×10⁸ DOFs), float, 32 GiB node | ~25 GiB peak (standard path) |
+| Ns=16384, active-set, float / double | 125 s, 9.1 GiB / 315 s, 9.3 GiB (same contact area) |
+| Periodic vs Tamaas 2.9.0, Ns=8192, 8% contact, 1 thread | 161 s vs 2229 s (13.8×), pressures agree to 1×10⁻⁹† |
 | FFT matvec vs dense (rel L2, double / float) | ~1×10⁻¹⁵ / ~1.4×10⁻⁷ (exact operator) |
 | Matvec fft vs H² (q=6), Ns=1024 / 2048 / 4096 | 17 / 73 / 337 ms vs 27 / 110 / 331 ms (1.60× / 1.50× / 0.98×)* |
 | Nested solve Ns=4096, p̄=0.002, fft vs h2, double | 251 s (110 it) vs 177 s (91 it), areas agree to ~10⁻⁶* |
@@ -135,20 +187,28 @@ Measured on a 20-core workstation (fixed-band self-affine roughness):
 \* `bench_fft.py`, measured under desktop co-tenancy; ratios more reliable
 than absolutes. The fft/h2 nested iteration counts differ (both are valid
 PCG paths to the same solution).
+† `backend="periodic"` nested solve vs Tamaas's native periodic PKR at
+matched accuracy; the speed-up grows with Ns and contact fraction (up to
+27× at 10 threads), and Tamaas did not converge the 28 %-contact case at
+Ns=8192 within 10 000 iterations.
 
 ## Tests and benchmarks
 
 - `ctest --test-dir build` — kernel vs analytics, H/H² matvec vs dense,
-  Hertz contact vs theory, preconditioner and mixed-precision consistency.
+  Hertz and Westergaard contact vs theory, preconditioner symmetry and
+  mixed-precision consistency, friction benchmarks (Cattaneo–Mindlin,
+  Ciavarella–Jäger).
+- `python -m pytest tests/*_py.py tests/test_nested.py tests/test_h2.py` —
+  the Python API; both suites run in CI on Python 3.10–3.12.
 - `python compare_tamaas.py` / `compare_tamaas_h2.py` — benchmark against
   [Tamaas](https://gitlab.com/tamaas/tamaas): contact fractions agree to
   0.0005, pressure fields to ~3.3% L2 — a bound set by Tamaas's dcfft
   coefficients, not by ASPHER's operators; see
   [doc/tamaas_findings.md](doc/tamaas_findings.md) for the three Tamaas
   pitfalls anyone comparing against it should know.
-- `compare_tamaas_periodic.py` — validates the doubly periodic spectral
-  backend against Tamaas's default periodic operator (contact set and full
-  pressure field).
+- `python compare_tamaas_periodic.py` — validates the doubly periodic
+  backend against Tamaas's default periodic operator (identical contact set,
+  pressure to ~10⁻¹⁰).
 - `python bench_h2.py`, `bench_h2_memory.py`, `bench_h2_cputime.py` — H² vs
   H-matrix and O(N) scaling sweeps up to Ns=16384.
 - `python bench_fft.py` — FFT-convolution backend vs H²: matvec sweep
@@ -189,6 +249,13 @@ The methods implemented here are described in:
   problems based on the multi-level multi-summation and conjugate gradient
   techniques", *Wear* 231 (1999) 206–219 — the projected CG with overlap
   correction.
+- R. Pohrt, Q. Li, "Complete boundary element formulation for normal and
+  tangential contact problems", *Phys. Mesomech.* 17(4) (2014) 334–340 —
+  the Cerruti element integrals for frictional contact.
+- G. de Saxcé, Z.-Q. Feng, "The bipotential method: a constructive approach
+  to design the complete contact law with friction and improved numerical
+  algorithms", *Math. Comput. Model.* 28(4–8) (1998) 225–245 — the
+  reference solver for frictional contact.
 - W. Fong, E. Darve, "The black-box fast multipole method", *J. Comput.
   Phys.* 228 (2009) 8712–8725 — the Chebyshev H²/FMM operator.
 - M. Bebendorf, *Hierarchical Matrices*, Springer, 2008; W. Hackbusch,
@@ -205,7 +272,8 @@ The methods implemented here are described in:
 
 Solver theory (projected CG, spectral preconditioning, finite-precision
 implementation) is documented in `doc/theory/pcg.tex`; the H²/FMM operator in
-`doc/theory/h2_fmm_detailed.tex`.
+`doc/theory/h2_fmm_detailed.tex`; frictional contact in
+`doc/theory/friction.tex`.
 
 ## Citing
 
@@ -217,7 +285,7 @@ If ASPHER contributes to your research, please cite it (see also
   author  = {Yastrebov, Vladislav A. and {Claude (Anthropic)}},
   title   = {{ASPHER}: Accelerated {SP}ectral and {H}i{ER}archical contact solver},
   url     = {https://github.com/cofebem/aspher},
-  version = {0.1.0},
+  version = {0.1.3},
   year    = {2026},
 }
 ```
@@ -225,11 +293,13 @@ If ASPHER contributes to your research, please cite it (see also
 ## Layout
 
 ```
-include/, src/       kernel, cluster tree, H-matrix, H2/FMM operator,
-                     spectral preconditioner, nested solve, contact solver
+include/, src/       kernels (Love, Cerruti), cluster tree, H-matrix, H2/FMM,
+                     FFT and periodic operators, preconditioners, nested and
+                     active-set solves, contact and friction solvers
 python/bindings.cpp  pybind11 module `aspher` (+ `hmatrix_contact` alias)
 third_party/         bundled pocketfft (BSD-3-Clause)
-tests/               C++ unit/integration tests (CTest) + tamaas_test.py
-doc/theory/          PCG and H2/FMM theory references (LaTeX)
+tests/               C++ tests (CTest), Python tests (pytest), tamaas_test.py
+.github/workflows/   CI: build + both test suites on Python 3.10-3.12
+doc/theory/          PCG, H2/FMM and friction theory (LaTeX)
 doc/tamaas_findings.md  Tamaas 2.8.1 pitfalls for non-periodic comparisons
 ```

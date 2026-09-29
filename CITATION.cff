@@ -2,11 +2,13 @@ cff-version: 1.2.0
 message: "If you use ASPHER in your research, please cite it as below."
 title: "ASPHER: Accelerated SPectral and HiERarchical contact solver"
 abstract: >-
-  Boundary-element solver for frictionless normal contact of rough elastic
-  half-spaces: exact Love/Boussinesq influence coefficients applied through
-  hierarchical operators (H-matrix ACA and a matrix-free H2/bbFMM), an FFTW
-  |q| spectral preconditioner, nested-grid continuation and a mixed-precision
-  Polonsky-Keer projected conjugate gradient.
+  Boundary-element solver for normal and frictional contact of rough elastic
+  half-spaces, free-space or doubly periodic: exact Love/Boussinesq and
+  Cerruti influence coefficients applied through hierarchical and spectral
+  operators (H-matrix ACA, a matrix-free H2/bbFMM, exact FFT convolution),
+  a |q| spectral preconditioner, nested-grid continuation and a
+  mixed-precision Polonsky-Keer projected conjugate gradient with certified
+  stopping.
 authors:
   - family-names: Yastrebov
     given-names: Vladislav A.
