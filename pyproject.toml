@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "aspher"
-version = "0.1.3"
+version = "0.1.3.post1"
 description = "ASPHER — Accelerated SPectral and HiERarchical contact solver: BEM normal and tangential contact on an elastic localized and periodic half-space."
 readme = "README.md"
 license = { text = "BSD-3-Clause" }
