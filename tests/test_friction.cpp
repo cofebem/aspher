@@ -214,11 +214,16 @@ static int test_kkt_force() {
     C.matvec_into(res.q, u);
     // High-slip vector problems (40% slip here) have a shallower inner
     // metric floor than the displacement test's 1e-4 gate: slip DIRECTIONS
-    // keep rotating and every clamp perturbs the CG geometry. Measured floor
-    // on this problem: stick 1.2e-3 / align 4.9e-3 relative. Gate at 1e-2;
-    // the sharp force-control physics gates live in the Cattaneo-Mindlin and
-    // Ciavarella-Jager tests (nu=0: directions do not rotate, floor deep).
-    if (int rc = check_kkt(res, s, u, res.delta_t, res.delta_t.norm(), 1e-2))
+    // keep rotating and every clamp perturbs the CG geometry, and WHERE the
+    // iteration stops depends on rounding (thread count, CPU, compiler).
+    // Measured align/|delta| on this problem: 0.07e-2 (1 thread), 0.46e-2
+    // (4 threads), 0.49e-2 (original measurement), 1.004e-2 on a GitHub
+    // runner (Python-3.12 job, 2026-09-29), which failed the former 1e-2
+    // gate. Gate at 3e-2, 3x the worst observed. This is a coarse KKT gate;
+    // the sharp force-control physics gates live in the Cattaneo-Mindlin
+    // and Ciavarella-Jager tests (nu=0: directions do not rotate, floor
+    // deep).
+    if (int rc = check_kkt(res, s, u, res.delta_t, res.delta_t.norm(), 3e-2))
         return rc;
     return 0;
 }
