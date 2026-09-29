@@ -69,6 +69,15 @@ void apply_full(int Ns, const std::vector<int>& dx, const std::vector<int>& dy,
     const int N = Ns * Ns;
     if (z.size() != N) z.resize(N);
 
+    // centre the input on the contact set (see FourierPreconditioner: the
+    // operator must be Pi_C W Pi_C, blind to a uniform offset on C)
+    double gsum = 0.0;
+    long ng = 0;
+#pragma omp parallel for schedule(static) reduction(+ : gsum, ng)
+    for (int i = 0; i < N; ++i)
+        if (contact[i]) { gsum += static_cast<double>(g(i)); ++ng; }
+    const double gmean = ng ? gsum / static_cast<double>(ng) : 0.0;
+
     double zsum = 0.0;
     long nc = 0;
 #pragma omp parallel for schedule(static) reduction(+ : zsum, nc)
@@ -83,7 +92,8 @@ void apply_full(int Ns, const std::vector<int>& dx, const std::vector<int>& dy,
                     if (jy < 0) jy += Ns; else if (jy >= Ns) jy -= Ns;
                     const std::ptrdiff_t j =
                         static_cast<std::ptrdiff_t>(jy) * Ns + jx;
-                    return contact[j] ? static_cast<double>(g(j)) : 0.0;
+                    return contact[j] ? static_cast<double>(g(j)) - gmean
+                                      : 0.0;
                 });
             z(i) = static_cast<S>(acc);
             zsum += acc;
@@ -120,6 +130,13 @@ void apply_blocked(int R, const std::vector<int>& dx,
         static_cast<std::ptrdiff_t>(L.nslots) * ls2;
     if (zc.size() != S_total) zc.resize(S_total);
 
+    double gsum = 0.0;
+    long ng = 0;
+#pragma omp parallel for schedule(static) reduction(+ : gsum, ng)
+    for (std::ptrdiff_t k = 0; k < S_total; ++k)
+        if (contact_c[k]) { gsum += static_cast<double>(gc(k)); ++ng; }
+    const double gmean = ng ? gsum / static_cast<double>(ng) : 0.0;
+
     double zsum = 0.0;
     long nc = 0;
 #pragma omp parallel reduction(+ : zsum, nc)
@@ -142,7 +159,8 @@ void apply_blocked(int R, const std::vector<int>& dx,
                     if (ss >= 0) {
                         const std::ptrdiff_t k =
                             static_cast<std::ptrdiff_t>(ss) * ls2 + wy * ls + wx;
-                        if (contact_c[k]) v = static_cast<double>(gc(k));
+                        if (contact_c[k])
+                            v = static_cast<double>(gc(k)) - gmean;
                     }
                     buf[static_cast<std::size_t>(ty) * tile + tx] = v;
                 }

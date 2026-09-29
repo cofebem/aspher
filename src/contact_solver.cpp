@@ -80,6 +80,24 @@ struct Diag {
     bool finite = true;
 };
 
+// Second pass of a two-pass contact mean. alpha = sum_C v / n_C is summed
+// over up to ~2e7 same-sign values of size |v|; a serial sum of such terms
+// carries a relative error ~ n eps (measured: 3.6e-14 absolute on one thread
+// at N = 4096^2, 10x less with OpenMP partial sums). That error biased the
+// penetration certificate by delta/g_ref (2.5e-12 there, ~3.5e-11 at
+// 8192^2), a floor the solver could not get under. gcs = sum_C (v - alpha)
+// is a sum of values of the size of the gap SPREAD, so its rounding is
+// negligible, and gcs / n_C is the correction. v - min v, hence G and fw,
+// is unaffected; g keeps the one-pass centring (offset <= delta): every
+// consumer of g is offset-invariant (the preconditioners centre their
+// input, CG directions are zero-sum on C).
+inline void refine_contact_mean(Diag& d, double gcs) {
+    if (d.nc <= 0) return;
+    const double delta = gcs / d.nc;
+    d.alpha += delta;
+    d.gmin -= delta;
+}
+
 inline double default_load_tol(bool is_double) {
     return is_double ? 1e-12 : 5e-7;
 }
@@ -258,18 +276,20 @@ ContactResult solve_contact_impl(const MatVecIntoT<Real>& S,
         d.gmin = vmin - d.alpha;
         const Real alpha = static_cast<Real>(d.alpha);
         const Real gmin = static_cast<Real>(d.gmin);
-        double e = 0.0, Gc = 0.0, psum = 0.0, pv = 0.0;
-#pragma omp parallel for schedule(static) reduction(+ : e, Gc, psum, pv)
+        double e = 0.0, Gc = 0.0, psum = 0.0, pv = 0.0, gcs = 0.0;
+#pragma omp parallel for schedule(static) reduction(+ : e, Gc, psum, pv, gcs)
         for (int i = 0; i < N; ++i) {
             const double pi = static_cast<double>(p(i));
             pv += pi * static_cast<double>(g(i));
             g(i) -= alpha;
             const double gi = static_cast<double>(g(i));
+            if (pi > 0.0) gcs += gi;
             e += pi * std::abs(gi);
             // non-negative summands: g(i) - gmin >= 0 by construction
             Gc += pi * static_cast<double>(g(i) - gmin);
             psum += pi;
         }
+        refine_contact_mean(d, gcs);
         d.pk = e / (P_total * g_ref);
         d.G = Gc;
         d.fw = Gc / (P_total * g_ref);
@@ -711,18 +731,20 @@ ContactResult solve_contact_active_impl(const MatVecIntoT<Real>& S,
         d.gmin = vmin - d.alpha;
         const Real alpha = static_cast<Real>(d.alpha);
         const Real gmin = static_cast<Real>(d.gmin);
-        double e = 0.0, Gc = 0.0, psum = 0.0, pv = 0.0;
-#pragma omp parallel for schedule(static) reduction(+ : e, Gc, psum, pv)
+        double e = 0.0, Gc = 0.0, psum = 0.0, pv = 0.0, gcs = 0.0;
+#pragma omp parallel for schedule(static) reduction(+ : e, Gc, psum, pv, gcs)
         for (int j = 0; j < Nc; ++j) {
             const int i = idx[j];
             const double pi = static_cast<double>(p(i));
             pv += pi * static_cast<double>(g(i));
             g(i) -= alpha;
             const double gi = static_cast<double>(g(i));
+            if (pi > 0.0) gcs += gi;
             e += pi * std::abs(gi);
             Gc += pi * static_cast<double>(g(i) - gmin);
             psum += pi;
         }
+        refine_contact_mean(d, gcs);
         d.pk = e / (P_total * g_ref);
         d.G = Gc;
         d.fw = Gc / (P_total * g_ref);

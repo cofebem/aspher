@@ -5,6 +5,7 @@
 #include "stencil_precond.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 
 #define CHECK(cond)                                                        \
     do {                                                                   \
@@ -15,6 +16,55 @@
     } while (0)
 
 int main() {
+    // ── Both preconditioners act on the zero-sum subspace of the contact set:
+    // M^-1 = Pi_C W Pi_C (Pi_C removes the contact mean). Offset invariance
+    // and symmetry must hold for any contact set and residual. Without
+    // centring the INPUT, a uniform offset on C (the rounding error of the
+    // contact-mean gap alpha, ~1e-14 at N=4096^2 on one thread) leaks into
+    // z through the contact-set edges; once the true residual is below it,
+    // g.z changes sign and PCG locks into a 2-cycle (stall found in the
+    // periodic Tamaas benchmark, sims/benchmark_tamaas_periodic).
+    {
+        const int Ns = 32, N = Ns * Ns;
+        std::srand(7);
+        std::vector<std::uint8_t> contact(N);
+        for (int i = 0; i < N; ++i) contact[i] = (std::rand() % 5 < 2) ? 1 : 0;
+        Eigen::VectorXd chi(N);
+        for (int i = 0; i < N; ++i) chi(i) = contact[i] ? 1.0 : 0.0;
+        const Eigen::VectorXd g = Eigen::VectorXd::Random(N);
+        const Eigen::VectorXd x = Eigen::VectorXd::Random(N);
+        const Eigen::VectorXd y = Eigen::VectorXd::Random(N);
+        hmc::FourierPreconditioner fp(Ns);
+        hmc::StencilPreconditioner sp(Ns, 2);
+        auto check = [&](const char* name, auto apply) -> int {
+            Eigen::VectorXd z0, z1, mx, my;
+            apply(g, z0);
+            apply(Eigen::VectorXd(g + 0.37 * chi), z1);
+            const double off = (z1 - z0).cwiseAbs().maxCoeff() /
+                               z0.cwiseAbs().maxCoeff();
+            apply(x, mx);
+            apply(y, my);
+            // compare on the contact set (both are zero off it)
+            double xmy = 0.0, ymx = 0.0;
+            for (int i = 0; i < N; ++i)
+                if (contact[i]) { xmy += x(i) * my(i); ymx += y(i) * mx(i); }
+            const double sym = std::abs(xmy - ymx) /
+                               (std::abs(xmy) + std::abs(ymx));
+            std::printf("%s: offset leak %.2e, asymmetry %.2e\n", name, off, sym);
+            CHECK(off < 1e-12);
+            CHECK(sym < 1e-12);
+            return 0;
+        };
+        if (int rc = check("fourier", [&](const Eigen::VectorXd& v,
+                                          Eigen::VectorXd& z) {
+                fp.apply_into(v, contact, z); }))
+            return rc;
+        if (int rc = check("stencil", [&](const Eigen::VectorXd& v,
+                                          Eigen::VectorXd& z) {
+                sp.apply_into(v, contact, z); }))
+            return rc;
+    }
+
     // ── Task 7: stencil_for_level decision table (exhaustive) ──────────────
     {
         using Engine = hmc::NestedParams::PrecondEngine;

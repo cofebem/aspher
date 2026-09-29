@@ -379,6 +379,28 @@ Default β formula: **Polak-Ribière+** (`use_pr=true`); Fletcher-Reeves availab
     dramatic: the full-grid gap/warm-start/output buffers dominate peak RSS
     at these sizes far more than the preconditioner's own scratch, so
     removing the FFT engine's buffers barely moves total peak memory.
+- **Preconditioner symmetry + two-pass contact mean (2026-09-29).** Both
+  preconditioner engines (FFT full/indexed, stencil full/blocked) now centre
+  their INPUT on the contact set as well as their output, so the applied
+  operator is `Π_C W Π_C` (symmetric, blind to a uniform offset on C) instead
+  of `Π_C W P_C`. Root cause of the 1-thread stalls in the periodic Tamaas
+  benchmark: the contact-mean gap α is a sum of ~10⁶–10⁷ same-sign terms, its
+  rounding (3.6e-14 absolute at 4096² on one thread, ~10× less with OpenMP
+  partial sums) is a uniform offset on C, the old operator leaked it into z
+  through the contact-set edges, and once the true residual fell below it
+  `g·z` changed sign and PCG locked into a 2-cycle (frozen at 1.6e-11,
+  870 it, "stagnated"). Second, `evaluate()` refines α with a two-pass mean
+  (`refine_contact_mean`), removing the δα/g_ref bias of the penetration
+  certificate (2.5e-12 at 4096², ~3.5e-11 at 8192²). Result at Ns=4096,
+  p̄=0.005: 1 thread reaches 8.8e-16 (10 threads 9.6e-16) in 83 it, where it
+  used to stall at 1.6e-11; iteration counts on ordinary solves unchanged
+  (12 benchmark cases, identical counts and certificates). Ns=8192, p̄=0.02,
+  1 thread, tol 1e-11: single 142 it / 567 s, nested 112 it / 518 s (both
+  used to stall even at 2e-11). **Not periodic-specific**: free-space `fft`
+  and `h2` at Ns=2048, tol 1e-14, 10 threads — old build: all five variants
+  (fft/h2 × FFT/stencil engine, nested h2) hit the 400-it cap at
+  4e-14…3e-13; fixed: all converge to 7–9e-15 in 103–262 it.
+  Gate: the offset-invariance + symmetry block at the top of `test_precond`.
 - **Warm start** (`p_init=`): start PCG from a given pressure (renormalised to the load).
 - **Nested-grid (cascadic/FMG) continuation** — single C++ entry point `hc.solve_nested(grid_size, gap, p_nominal, coarsest=64, q=6, ...)` (`nested_solve.hpp`): builds the coarse→fine hierarchy and per-level H2 operators internally, restricts the gap (2×2 average), and warm-starts each level by injecting the prolonged coarse pressure (sharp contact boundary; injection beats bilinear). `grid_size` must be `coarsest·2^k`. Combined with the preconditioner → up to 4× fewer iterations at Ns=1024 (180→45), full solve cheaper than one cold solve. Prototypes in `experiments/`; design in `doc/specs/2026-06-30-spectral-preconditioner-design.md`.
 - **Precision policy (2026-09, A09)** — `hc.solve_nested(..., precision=...)`:

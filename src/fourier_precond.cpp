@@ -31,12 +31,19 @@ FourierPreconditioner::~FourierPreconditioner() = default;
 
 // Scalar-templated preconditioner apply. The grid field G is laid out
 // G(ix, iy) with ix contiguous:
-//   1. scatter the contact-masked residual into G
+//   1. scatter the contact-masked residual, minus its contact mean, into G
 //   2. 2-D r2c: C(kx, ky), kx ∈ [0, Ns/2]  (half spectrum)
 //   3. multiply by the |k|/Ns² symbol (real and even → consistent with the
 //      omitted Hermitian half)
 //   4. 2-D c2r back into G
 //   5. gather on the contact set, remove the contact mean
+// Centring on BOTH sides makes the applied operator Pi_C W Pi_C: symmetric
+// and blind to a uniform offset on the contact set. Centring only the output
+// (as before 2026-09-29) left Pi_C W P_C, which is not symmetric: the
+// rounding error of the solver's contact-mean gap (a uniform offset, ~1e-14
+// at N = 4096^2 on one thread) then leaked into z through the contact-set
+// edges, g.z changed sign once the true residual fell below it, and PCG
+// locked into a 2-cycle (stalls at ~1e-11 in the periodic Tamaas benchmark).
 // The mask passes are OpenMP-parallel; the transforms are engine-threaded.
 // G and C are object-owned state reused across iterations, so the per-call
 // footprint is one N-vector (the result).
@@ -58,14 +65,21 @@ apply_t(int Ns, int nh, const Eigen::MatrixXf& wh,
     }
     if (z.size() != N) z.resize(N);
 
-    // scatter the masked residual; column iy of G is the contiguous g-range
-    // [iy*Ns, (iy+1)*Ns) (i = iy*Ns + ix).
+    double gsum = 0.0;
+    long ng = 0;
+#pragma omp parallel for schedule(static) reduction(+ : gsum, ng)
+    for (int i = 0; i < N; ++i)
+        if (contact[i]) { gsum += static_cast<double>(g(i)); ++ng; }
+    const S gmean = ng ? static_cast<S>(gsum / static_cast<double>(ng)) : S(0);
+
+    // scatter the centred masked residual; column iy of G is the contiguous
+    // g-range [iy*Ns, (iy+1)*Ns) (i = iy*Ns + ix).
 #pragma omp parallel for schedule(static)
     for (int iy = 0; iy < Ns; ++iy) {
         S* col = G.data() + static_cast<std::ptrdiff_t>(iy) * Ns;
         const S* gi = g.data() + static_cast<std::ptrdiff_t>(iy) * Ns;
         const std::uint8_t* ci = contact.data() + static_cast<std::ptrdiff_t>(iy) * Ns;
-        for (int ix = 0; ix < Ns; ++ix) col[ix] = ci[ix] ? gi[ix] : S(0);
+        for (int ix = 0; ix < Ns; ++ix) col[ix] = ci[ix] ? gi[ix] - gmean : S(0);
     }
 
     eng->fwd();
@@ -123,11 +137,18 @@ apply_indexed_t(int Ns, int nh, const Eigen::MatrixXf& wh,
     }
     if (zc.size() != nc) zc.resize(nc);
 
+    double gsum = 0.0;
+    long ng = 0;
+#pragma omp parallel for schedule(static) reduction(+ : gsum, ng)
+    for (std::ptrdiff_t k = 0; k < nc; ++k)
+        if (contact_c[k]) { gsum += static_cast<double>(gc(k)); ++ng; }
+    const S gmean = ng ? static_cast<S>(gsum / static_cast<double>(ng)) : S(0);
+
     G.setZero();
     S* Gd = G.data(); // G(ix, iy) at flat grid index iy*Ns + ix
 #pragma omp parallel for schedule(static)
     for (std::ptrdiff_t k = 0; k < nc; ++k)
-        if (contact_c[k]) Gd[grid_index[k]] = gc(k);
+        if (contact_c[k]) Gd[grid_index[k]] = gc(k) - gmean; // centred, as apply_t
 
     eng->fwd();
 #pragma omp parallel for schedule(static)
