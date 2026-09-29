@@ -19,6 +19,7 @@ __pycache__/
 
 # local figures
 /*.png
+illustrations/
 
 # generated example / benchmark output
 example_rough_contact.png
