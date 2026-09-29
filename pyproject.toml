@@ -4,8 +4,8 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "aspher"
-version = "0.1.2"
-description = "ASPHER — Accelerated SPectral and HiERarchical contact solver: BEM normal contact on an elastic half-space (exact Love/Boussinesq kernel, H-matrix and matrix-free H2/FMM operators, FFTW |q| spectral preconditioner, nested-grid mixed-precision Polonsky–Keer CG)"
+version = "0.1.3"
+description = "ASPHER — Accelerated SPectral and HiERarchical contact solver: BEM normal and tangential contact on an elastic localized and periodic half-space."
 readme = "README.md"
 license = { text = "BSD-3-Clause" }
 authors = [
@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = [
   "contact mechanics", "rough surfaces", "boundary element method",
-  "H-matrix", "fast multipole method", "tribology", "elasticity",
+  "H-matrix", "H2-matrix", "fast multipole method", "tribology", "elasticity", "friction"
 ]
 requires-python = ">=3.9"
 dependencies = ["numpy>=1.22"]
