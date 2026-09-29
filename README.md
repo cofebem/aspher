@@ -1,6 +1,6 @@
 <p align="center">
   <img src="https://raw.githubusercontent.com/cofebem/aspher/main/extras/logo.png"
-       alt="ASPHER logo: through roughness, toward the star" width="180">
+       alt="ASPHER logo: through roughness, toward the star" width="250">
 </p>
 
 # ASPHER — Accelerated SPectral and HiERarchical contact solver
@@ -34,13 +34,14 @@ The design combines an *exact* kernel with *fast, matrix-free* operators:
   served from an O(N) lookup table (translation invariance).
 - **Operator (default): matrix-free H²/FMM** — black-box fast multipole
   method with Chebyshev interpolation (Fong & Darve 2009), all transfer and
-  coupling operators cached by translation invariance. **O(N) memory and
-  matvec**: 5.3 MiB at 512², ~13 B/DOF asymptotically; grids up to 16384²
-  (2.7×10⁸ DOFs) run on a 32 GiB workstation. An **exact FFT-convolution
-  operator** (`backend="fft"`, zero-padded Love-kernel convolution) equals
+  coupling operators cached by translation invariance. 
+- **O(N) memory and matvec**: 5.3 MiB at 512², ~13 B/DOF asymptotically; grids up to 16384²
+  (2.7×10⁸ DOFs) run on a 32 GiB workstation. 
+- An **exact FFT-convolution operator** (`backend="fft"`, zero-padded Love-kernel convolution) equals
   the dense matvec to roundoff (~10⁻¹⁵ rel L2) and is modestly faster than
   H² at Ns ≤ 2048 (~1.5×), ≈parity at Ns=4096; H² remains preferred for
-  very large Ns. A **doubly periodic** operator (`backend="periodic"`,
+  very large Ns. 
+- A **doubly periodic** operator (`backend="periodic"`,
   spectral compliance 2/(E\*|q|) on the Ns×Ns torus) solves periodic
   problems, validated against the exact Westergaard solution. A classical
   H-matrix (ACA) backend and a dense backend are kept for validation and
@@ -81,8 +82,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 cmake --build build -j && ctest --test-dir build
 ```
 
-The Python module `aspher*.so` is placed in `python/` (an `hmatrix_contact`
-import alias is kept for existing scripts).
+The Python module `aspher*.so` is placed in `python/`.
 
 ### Release to PyPI (maintainers)
 
@@ -111,8 +111,8 @@ project page, so review it before each release. The sdist is all-BSD
 
 ```python
 import numpy as np
-import rfgen          # pip install rfgen: random rough surfaces
-import aspher as hc   # `import hmatrix_contact` still works (alias)
+import rfgen          # random rough surfaces (installed with aspher)
+import aspher as hc
 
 def surface(N, rms=0.002):   # self-affine rough surface, Hurst 0.8
     h = rfgen.selfaffine_field(N=N, Hurst=0.8, k_low=4 / N, k_high=64 / N)
@@ -274,7 +274,7 @@ If ASPHER contributes to your research, please cite it (see also
 include/, src/       kernels (Love, Cerruti), cluster tree, H-matrix, H2/FMM,
                      FFT and periodic operators, preconditioners, nested and
                      active-set solves, contact and friction solvers
-python/bindings.cpp  pybind11 module `aspher` (+ `hmatrix_contact` alias)
+python/bindings.cpp  pybind11 module `aspher`
 third_party/         bundled pocketfft (BSD-3-Clause)
 tests/               C++ tests (CTest) and Python tests (pytest)
 .github/workflows/   CI: build + both test suites on Python 3.10-3.12

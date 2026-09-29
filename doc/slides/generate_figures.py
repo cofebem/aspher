@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate all PDF figures for the Beamer slides.
 
-Run from Hcontact/doc/slides/:
+Run from doc/slides/:
     conda activate fenicsx-env
     python generate_figures.py
 """
@@ -20,9 +20,9 @@ import warnings
 warnings.filterwarnings('ignore')
 
 HERE    = Path(__file__).resolve().parent
-ROOT    = HERE.parent.parent          # Hcontact/
+ROOT    = HERE.parent.parent          # repository root
 sys.path.insert(0, str(ROOT / 'python'))
-import hmatrix_contact as hmc
+import aspher as hmc
 
 FIGDIR   = HERE / 'figures'
 CACHEDIR = HERE / 'cache'

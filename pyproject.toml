@@ -17,7 +17,7 @@ keywords = [
   "H-matrix", "H2-matrix", "fast multipole method", "tribology", "elasticity", "friction"
 ]
 requires-python = ">=3.9"
-dependencies = ["numpy>=1.22"]
+dependencies = ["numpy>=1.22", "rfgen>=0.2"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Science/Research",
